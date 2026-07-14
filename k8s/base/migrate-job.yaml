@@ -1,0 +1,23 @@
+# Jobs are immutable once created. To re-run after a new migration:
+#   kubectl delete job/migrate -n study-app --ignore-not-found
+#   kubectl apply -k k8s/overlays/dev
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+  namespace: study-app
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: ghcr.io/kimmj6079/react-python-backend:latest
+          imagePullPolicy: IfNotPresent
+          command: ["alembic", "upgrade", "head"]
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: app-secret

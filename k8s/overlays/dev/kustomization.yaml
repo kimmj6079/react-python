@@ -1,0 +1,22 @@
+# Dev overlay: local images (built + `minikube image load`'ed / `kind load
+# docker-image`'ed under these exact names), single replica each so a
+# laptop-sized cluster doesn't struggle.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+images:
+  - name: ghcr.io/kimmj6079/react-python-backend
+    newName: backend
+    newTag: local
+  - name: ghcr.io/kimmj6079/react-python-frontend
+    newName: frontend
+    newTag: local
+
+replicas:
+  - name: backend
+    count: 1
+  - name: frontend
+    count: 1

@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: study-app
+data:
+  POSTGRES_DB: app
+  # Same-origin via Ingress in k8s, so CORS isn't actually exercised there;
+  # kept for parity with the docker-compose/local setup.
+  BACKEND_CORS_ORIGINS: "http://app.127.0.0.1.nip.io"

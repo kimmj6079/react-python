@@ -1,0 +1,30 @@
+# nip.io resolves *.127.0.0.1.nip.io to 127.0.0.1, so this works against
+# `minikube tunnel` / port-forward without editing /etc/hosts.
+#
+# No rewrite-target: the full path (e.g. /api/v1/items) is forwarded
+# unchanged, matching the backend's actual route (api_v1_prefix=/api/v1).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app-ingress
+  namespace: study-app
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: app.127.0.0.1.nip.io
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 8000
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80

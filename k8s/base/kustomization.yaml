@@ -1,0 +1,18 @@
+# Before applying: cp secret.yaml.example secret.yaml and fill in real
+# values. secret.yaml is gitignored and does not exist in a fresh clone.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: study-app
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - secret.yaml
+  - postgres-statefulset.yaml
+  - postgres-service.yaml
+  - backend-deployment.yaml
+  - backend-service.yaml
+  - frontend-deployment.yaml
+  - frontend-service.yaml
+  - ingress.yaml

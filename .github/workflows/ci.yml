@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: app
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+
+      - name: Apply migrations against a real Postgres
+        env:
+          DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/app
+        run: uv run alembic upgrade head
+
+      - run: uv run pytest -v
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run test -- --run
+      - run: npm run build
+
+  docker-build:
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t backend:ci ./backend
+      - run: docker build --target production -t frontend:ci ./frontend
+
+  k8s-manifest-check:
+    needs: [docker-build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: docker build -t backend:local ./backend
+      - run: docker build --target production -t frontend:local ./frontend
+
+      # GitHub-hosted runners can't reach a developer's local minikube, so
+      # this spins up a throwaway kind cluster purely to prove the
+      # Kustomize manifests are valid and deployable — not a real deploy.
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: ci
+
+      - run: kind load docker-image backend:local frontend:local --name ci
+
+      - name: Create dummy secret for manifest validation
+        run: cp k8s/base/secret.yaml.example k8s/base/secret.yaml
+
+      - run: kubectl apply -k k8s/overlays/dev
+      - run: kubectl apply -f k8s/base/migrate-job.yaml -n study-app
+      - run: kubectl wait --for=condition=complete job/migrate -n study-app --timeout=120s
+      - run: kubectl wait --for=condition=available deployment/backend -n study-app --timeout=120s
+      - run: kubectl wait --for=condition=available deployment/frontend -n study-app --timeout=120s
+
+      - name: Smoke test backend through a port-forward
+        run: |
+          kubectl port-forward -n study-app svc/backend 8000:8000 &
+          sleep 3
+          curl -sf http://localhost:8000/health/ready

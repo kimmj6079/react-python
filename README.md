@@ -2,6 +2,45 @@
 
 FastAPI + React(TypeScript/Vite) + PostgreSQL 풀스택 스터디 프로젝트. 개발 → 테스트 → Docker → Kubernetes → CI/CD까지 실무 흐름을 학습한다. 전체 아키텍처와 명령어 레퍼런스는 [CLAUDE.md](./CLAUDE.md) 참고.
 
+## 사전 준비 (초기 셋팅)
+
+### 1) 저장소 클론
+
+```bash
+git clone https://github.com/kimmj6079/react-python.git
+cd react-python
+```
+
+### 2) 필요한 프로그램 설치
+
+어떤 방식으로 실행할지에 따라 필요한 게 다르다.
+
+| 실행 방식 | 필요한 프로그램 |
+|---|---|
+| **Docker로만 실행** (`docker compose up --build`) | [Docker Desktop](https://www.docker.com/products/docker-desktop/) 하나만 있으면 됨 |
+| **로컬 프로세스로 실행** (`uv run`, `npm run dev` 직접 실행, hot-reload용) | Docker Desktop(DB용) + [uv](https://docs.astral.sh/uv/getting-started/installation/)(Python 패키지 매니저, Python 인터프리터도 같이 관리해줌) + [Node.js 22+](https://nodejs.org/)(npm 포함) |
+| **Kubernetes 배포까지 해볼 경우** | 위에 더해 `kubectl`, [minikube](https://minikube.sigs.k8s.io/docs/start/) 또는 kind |
+
+설치 확인:
+```bash
+docker --version
+docker compose version
+uv --version        # 로컬 프로세스로 백엔드 돌릴 경우
+node --version       # 로컬 프로세스로 프론트엔드 돌릴 경우
+npm --version
+```
+
+### 3) 환경변수 파일 준비 (로컬 프로세스로 실행할 경우만 필요)
+
+Docker로만 실행할 거면 이 단계는 건너뛰어도 된다 (`docker-compose.yml`에 필요한 값이 이미 다 들어있음). `uv run`/`npm run dev`로 직접 띄울 거면 각 폴더의 예시 파일을 복사해서 실제 설정 파일을 만들어야 한다:
+
+```bash
+cp backend/.env.example backend/.env
+cp frontend/.env.example frontend/.env
+```
+
+`.env`는 사람/환경마다 값이 다를 수 있어서 `.gitignore`에 등록돼 있고, 저장소에는 `.env.example`(템플릿)만 커밋된다. 기본값 그대로도 아래 "로컬 개발 시작하기" 흐름과 맞게 세팅돼 있어 값을 바꾸지 않아도 동작한다.
+
 ## 로컬 개발 시작하기
 
 전체 흐름은 "DB를 띄운다 → 백엔드가 그 DB에 연결해서 API 서버로 뜬다 → 프론트엔드가 그 API를 호출하는 화면을 띄운다" 순서다. 아래 1) → 2) → 3) 순서를 지켜야 한다 (백엔드가 DB보다 먼저 뜨면 접속에 실패하고, 프론트엔드는 백엔드가 없어도 켜지긴 하지만 화면에 데이터가 뜨지 않는다).

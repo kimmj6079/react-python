@@ -93,10 +93,28 @@ jobs:
         run: cp k8s/base/secret.yaml.example k8s/base/secret.yaml
 
       - run: kubectl apply -k k8s/overlays/dev
-      - run: kubectl apply -f k8s/base/migrate-job.yaml -n study-app
+
+      # migrate-job.yaml is intentionally excluded from overlays/dev's
+      # resources (Jobs are immutable, so it's applied separately) — which
+      # also means the overlay's images: transform never touches it. Without
+      # this substitution it still points at the GHCR tag instead of the
+      # image just loaded into kind, and kubelet tries to pull it over the
+      # network instead of using the local image.
+      - name: Apply migrate Job (pointed at the locally-loaded image)
+        run: |
+          sed 's|ghcr.io/kimmj6079/react-python-backend:latest|backend:local|' \
+            k8s/base/migrate-job.yaml | kubectl apply -n study-app -f -
+
       - run: kubectl wait --for=condition=complete job/migrate -n study-app --timeout=120s
       - run: kubectl wait --for=condition=available deployment/backend -n study-app --timeout=120s
       - run: kubectl wait --for=condition=available deployment/frontend -n study-app --timeout=120s
+
+      - name: Debug migrate Job on failure
+        if: failure()
+        run: |
+          kubectl get pods,jobs -n study-app
+          kubectl describe job/migrate -n study-app
+          kubectl logs -n study-app -l job-name=migrate --all-containers --tail=200 || true
 
       - name: Smoke test backend through a port-forward
         run: |

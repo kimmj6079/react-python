@@ -22,7 +22,11 @@ kubectl apply -k k8s/overlays/dev
 
 echo "==> Running migrations"
 kubectl delete job/migrate -n study-app --ignore-not-found
-kubectl apply -f k8s/base/migrate-job.yaml
+# migrate-job.yaml is outside overlays/dev's resources (Jobs are immutable,
+# applied separately), so the dev overlay's images: transform never touches
+# it -- substitute it here too, or it'll try to pull the GHCR tag instead of
+# the image just loaded into minikube.
+sed 's/ghcr.io\/kimmj6079\/react-python-backend:latest/backend:local/' k8s/base/migrate-job.yaml | kubectl apply -f -
 kubectl wait --for=condition=complete job/migrate -n study-app --timeout=120s
 
 kubectl wait --for=condition=available deployment/backend -n study-app --timeout=120s

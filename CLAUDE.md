@@ -6,14 +6,36 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 FastAPI(백엔드) + React/TypeScript/Vite(프론트엔드) + PostgreSQL 풀스택 스터디 프로젝트. 로컬 개발 → 테스트 → Docker → Kubernetes(minikube/kind) → GitHub Actions CI/CD까지 실무 표준에 가까운 흐름을 학습하는 것이 목적이다. 예제 도메인은 간단한 `items` CRUD 하나뿐이다.
 
+## 전체 흐름 한눈에 보기
+
+### 로컬 (개발 · 검증)
+
+| 단계 | 무엇을 하는가 | 실행 명령 |
+|---|---|---|
+| **1. 최초 셋팅** | 저장소 클론, 의존성 설치 | `git clone` → `uv sync` / `npm install` → `cp *.env.example *.env` |
+| **2. 로컬 개발** (hot-reload) | DB → 백엔드 → 프론트 순서로 기동 | `docker compose up -d db` → `uv run uvicorn app.main:app --reload` / `npm run dev` |
+| **3. docker-compose 통합 검증** | 전체를 컨테이너로 한 번에 띄워 확인 | `docker compose up --build` |
+| **4. k8s 로컬 배포** (minikube/kind) | 로컬 쿠버네티스에 배포해보기 | `minikube start` → `secret.yaml` 준비 → `./scripts/deploy-local.sh` |
+
+### 운영 (CI/CD → 클라우드 VM 배포)
+
+| 단계 | 무엇을 하는가 | 실행 명령 |
+|---|---|---|
+| **5. GitHub push (main)** | CI/CD 트리거 | `git push origin main` |
+| **6. CI** (`ci.yml`) | push/PR마다 자동 검증 | lint · pytest · vitest · docker build · kind manifest check |
+| **7. CD** (`cd.yml`) | main 푸시 시 이미지 배포 | GHCR에 backend/frontend 이미지 push |
+| **8. 클라우드 VM 실배포** (k3s) | 최초 1회 프로비저닝 후 반복 배포 | `./scripts/provision-vm.sh`(최초) → `secret.yaml` 실값 준비 → `./scripts/deploy-prod.sh` |
+
+배포 완료 후 접속: `http://app.<VM_PUBLIC_IP>.nip.io`. 각 단계의 상세 명령어는 아래 "자주 쓰는 명령어" 절 참고.
+
 ## 저장소 구조
 
 ```
 backend/    FastAPI 앱 (app/), Alembic 마이그레이션, pytest
 frontend/   React + TS + Vite, Vitest
-k8s/        Kustomize 매니페스트 (base/ + overlays/dev/)
+k8s/        Kustomize 매니페스트 (base/ + overlays/dev, prod/)
 .github/workflows/  ci.yml, cd.yml
-scripts/    로컬 minikube 배포 스크립트 (.sh / .ps1)
+scripts/    minikube 배포(deploy-local) + 클라우드 VM 배포(provision-vm, deploy-prod) 스크립트 (.sh / .ps1)
 docker-compose.yml  로컬 통합 개발 환경
 ```
 
@@ -73,9 +95,25 @@ kubectl delete job/migrate -n study-app --ignore-not-found
 kubectl apply -f k8s/base/migrate-job.yaml
 ```
 
+### Kubernetes (클라우드 VM, k3s 실제 배포)
+
+SSH로 접속 가능한 공인 IP를 가진 VM에 k3s를 직접 설치해 배포한다. TLS/도메인 없이 IP + nip.io로 시작하는 범위이며, GitHub Actions가 자동으로 원격 배포하지는 않는다(수동 스크립트).
+
+최초 1회(VM당):
+1. 클라우드 콘솔에서 방화벽/보안그룹에 22, 80 인바운드 허용.
+2. GitHub → Packages에서 `react-python-backend`/`react-python-frontend` 패키지를 Public으로 전환(익명 pull 허용 — private로 유지하려면 `imagePullSecrets` 별도 구성 필요).
+3. `./scripts/provision-vm.sh <user>@<VM_PUBLIC_IP>` — k3s(Traefik 비활성화) + ingress-nginx 설치. 6443(k8s API)은 외부에 열 필요 없음, kubectl은 항상 SSH 세션 안에서만 실행된다.
+4. `cp k8s/base/secret.yaml.example k8s/base/secret.yaml` 후 실제 강한 값으로 수정(로컬, gitignore됨).
+
+이후 반복 배포(코드 변경 → `main` 푸시로 CI가 GHCR에 새 `:latest` 푸시 후):
+```bash
+./scripts/deploy-prod.sh <user>@<VM_PUBLIC_IP>   # 또는 deploy-prod.ps1 (Windows)
+```
+`k8s/overlays/prod`(base 상속, ingress host/CORS만 VM IP로 patch)를 로컬에서 `kubectl kustomize`로 렌더링해 SSH 파이프로 원격 `kubectl apply -f -`에 전달한다. `:latest` + `imagePullPolicy: IfNotPresent` 조합은 레지스트리 pull 환경에서 재배포해도 새 이미지를 받아오지 않으므로, 배포 시점에 `imagePullPolicy: Always`로 치환하고 `kubectl rollout restart`로 최신 이미지 수신을 강제한다. 완료 후 `http://app.<VM_PUBLIC_IP>.nip.io`로 접속.
+
 ## 아키텍처
 
-**요청 흐름 (k8s/prod 경로)**: 브라우저 → Ingress(`app.127.0.0.1.nip.io`) → `/` 경로는 frontend(nginx, 정적 빌드) / `/api` 경로는 backend(FastAPI) → Postgres(StatefulSet).
+**요청 흐름 (k8s 경로, Ingress 경유)**: 브라우저 → Ingress(dev: `app.127.0.0.1.nip.io`, 클라우드 VM 실배포: `app.<VM_PUBLIC_IP>.nip.io`) → `/` 경로는 frontend(nginx, 정적 빌드) / `/api` 경로는 backend(FastAPI) → Postgres(StatefulSet).
 
 **요청 흐름 (로컬 dev 경로)**: 브라우저 → Vite dev server(`:5173`, CORS 필요) → FastAPI(`:8000`, `--reload`) → Postgres(`:5432`).
 
@@ -95,5 +133,6 @@ kubectl apply -f k8s/base/migrate-job.yaml
 ## CI/CD
 
 - **`ci.yml`**: backend(ruff+실제 Postgres에 마이그레이션 적용+pytest) / frontend(lint+test+build) / docker-build(두 이미지 빌드 검증) / k8s-manifest-check(kind로 임시 클러스터를 띄워 `kubectl apply -k` + 마이그레이션 Job + `/health` 확인 후 클러스터 삭제 — 실제 배포가 아니라 매니페스트 정합성 검증용).
-- **`cd.yml`**: `main` 푸시 시 두 이미지를 GHCR(`ghcr.io/<owner>/react-python-backend|frontend`)에 빌드+푸시. **GitHub 호스팅 러너는 개발자의 로컬 minikube에 접근할 수 없으므로** 실제 클러스터 반영은 `scripts/deploy-local.*`를 로컬에서 수동 실행하는 것으로 마무리한다.
+- **`cd.yml`**: `main` 푸시 시 두 이미지를 GHCR(`ghcr.io/<owner>/react-python-backend|frontend`)에 빌드+푸시. **GitHub 호스팅 러너는 개발자의 로컬 minikube나 클라우드 VM에 접근할 수 없으므로** 실제 클러스터 반영은 `scripts/deploy-local.*`(로컬) 또는 `scripts/deploy-prod.*`(클라우드 VM)를 로컬에서 수동 실행하는 것으로 마무리한다.
 - 실제 시크릿은 `k8s/base/secret.yaml`(gitignore됨)에만 두고, 커밋되는 것은 `secret.yaml.example`(더미 값) 뿐이다.
+- 클라우드 VM 배포 시 GHCR 패키지가 private면 새 노드의 익명 pull이 `ErrImagePull`로 실패한다 — Public 전환 필요 (자세한 내용은 위 "Kubernetes (클라우드 VM, k3s 실제 배포)" 참고).

@@ -1,0 +1,26 @@
+# Prod overlay: images/replicas는 base 기본값 그대로(이미 GHCR :latest,
+# replicas 2). 이 오버레이는 ingress host + CORS origin만 VM 공인 IP로
+# 바꾼다.
+#
+# __VM_PUBLIC_IP__는 실제 값이 아닌 플레이스홀더다. scripts/deploy-prod.*가
+# `kubectl kustomize` 결과를 치환한 뒤 적용하므로, 실제 IP는 이 저장소에
+# 절대 커밋되지 않는다.
+#
+# 주의: 이 오버레이를 `kubectl apply -k`로 직접 적용하지 말 것 —
+# 플레이스홀더 host는 실제로 존재하지 않는 도메인이다. 반드시
+# scripts/deploy-prod.sh(.ps1)를 통해 배포한다.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+patches:
+  - path: ingress-host-patch.yaml
+    target:
+      kind: Ingress
+      name: app-ingress
+  - path: configmap-patch.yaml
+    target:
+      kind: ConfigMap
+      name: app-config

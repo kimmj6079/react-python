@@ -2,6 +2,30 @@
 
 FastAPI + React(TypeScript/Vite) + PostgreSQL 풀스택 스터디 프로젝트. 개발 → 테스트 → Docker → Kubernetes → CI/CD까지 실무 흐름을 학습한다. 전체 아키텍처와 명령어 레퍼런스는 [CLAUDE.md](./CLAUDE.md) 참고.
 
+## 전체 흐름 한눈에 보기
+
+### 로컬 (개발 · 검증)
+
+| 단계 | 무엇을 하는가 | 실행 명령 |
+|---|---|---|
+| **1. 최초 셋팅** | 저장소 클론, 의존성 설치 | `git clone` → `uv sync` / `npm install` → `cp *.env.example *.env` |
+| **2. 로컬 개발** (hot-reload) | DB → 백엔드 → 프론트 순서로 기동 | `docker compose up -d db` → `uv run uvicorn app.main:app --reload` / `npm run dev` |
+| **3. docker-compose 통합 검증** | 전체를 컨테이너로 한 번에 띄워 확인 | `docker compose up --build` |
+| **4. k8s 로컬 배포** (minikube/kind) | 로컬 쿠버네티스에 배포해보기 | `minikube start` → `secret.yaml` 준비 → `./scripts/deploy-local.sh` |
+
+로컬 단계는 이 문서 아래 "사전 준비"~"로컬 개발 시작하기"에서 자세히 다룬다.
+
+### 운영 (CI/CD → 클라우드 VM 배포)
+
+| 단계 | 무엇을 하는가 | 실행 명령 |
+|---|---|---|
+| **5. GitHub push (main)** | CI/CD 트리거 | `git push origin main` |
+| **6. CI** (`ci.yml`) | push/PR마다 자동 검증 | lint · pytest · vitest · docker build · kind manifest check |
+| **7. CD** (`cd.yml`) | main 푸시 시 이미지 배포 | GHCR에 backend/frontend 이미지 push |
+| **8. 클라우드 VM 실배포** (k3s) | 최초 1회 프로비저닝 후 반복 배포 | `./scripts/provision-vm.sh`(최초) → `secret.yaml` 실값 준비 → `./scripts/deploy-prod.sh` |
+
+배포 완료 후 접속: `http://app.<VM_PUBLIC_IP>.nip.io`. 운영 단계 상세는 [CLAUDE.md](./CLAUDE.md)의 "CI/CD", "Kubernetes (클라우드 VM, k3s 실제 배포)" 절 참고.
+
 ## 사전 준비 (초기 셋팅)
 
 ### 1) 저장소 클론

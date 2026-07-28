@@ -1,0 +1,3 @@
+- op: replace
+  path: /data/BACKEND_CORS_ORIGINS
+  value: http://app.__VM_PUBLIC_IP__.nip.io

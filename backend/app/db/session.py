@@ -1,4 +1,3 @@
-# DB 연결(엔진)과, 요청마다 하나씩 만들어 쓰는 세션(Session)을 정의하는 파일.
 from collections.abc import Generator
 
 from sqlalchemy import create_engine
@@ -6,16 +5,34 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import settings
 
-# engine: DB와의 실제 커넥션 풀을 관리하는 객체. 앱 실행 중 한 번만 생성한다.
-engine = create_engine(settings.database_url)
-# SessionLocal: 이 팩토리를 호출할 때마다(SessionLocal()) 새 세션(작업 단위)이 만들어진다.
+engine = create_engine(
+    settings.database_url,
+    # 1. 풀에서 사용 가능한 커넥션을 기다리는 시간(초) (기본값: 30)
+    pool_timeout=30,
+    
+    # 2. 풀의 커넥션을 재사용하기 전에 연결 상태를 자동으로 확인
+    pool_pre_ping=True,
+    
+    # 3. 일정 시간(초) 동안 idle 상태였던 커넥션을 자동으로 재연결 (DB 서버의 timeout 방지)
+    pool_recycle=1800,
+    
+    # 4. DB 드라이버 레벨 타임아웃 (connect_args)
+    connect_args={
+        # PostgreSQL (psycopg2) 예시:
+        "connect_timeout": 10,       # DB 연결 시도 타임아웃 (초)
+        "options": "-c statement_timeout=5000"  # 쿼리 실행 타임아웃 (밀리초 단위, 5000ms = 5s)
+        
+        # MySQL (pymysql) 사용 시 예시:
+        # "connect_timeout": 10,
+        # "read_timeout": 10,
+        # "write_timeout": 10,
+    }
+)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
 def get_db() -> Generator[Session, None, None]:
-    # FastAPI의 Depends(get_db)로 쓰이는 "의존성 함수".
-    # yield 이전은 요청 시작 시, yield 이후(finally)는 요청이 끝난 뒤 실행된다.
-    # 즉 요청마다 세션을 새로 열고, 응답 후 반드시 닫아 커넥션이 새지 않게 한다.
     db = SessionLocal()
     try:
         yield db

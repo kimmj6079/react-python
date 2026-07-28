@@ -1,10 +1,14 @@
+# postgres StatefulSet 앞단의 headless Service (clusterIP: None). 부하분산용
+# 단일 가상 IP를 주는 대신 각 Pod에 개별 DNS 레코드를 만들어주는, StatefulSet과
+# 짝을 이루는 표준 패턴이다. backend/migrate Job은 그냥 서비스명 `postgres`로
+# 접속하면 된다 (DATABASE_URL 참고).
 apiVersion: v1
 kind: Service
 metadata:
   name: postgres
   namespace: study-app
 spec:
-  clusterIP: None
+  clusterIP: None   # 이 값이 "headless"라는 뜻 (가상 IP를 할당하지 않음)
   selector:
     app: postgres
   ports:

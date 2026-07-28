@@ -1,3 +1,5 @@
+# JSON6902 patch: base Ingress의 host를 VM 공인 IP 기반 nip.io 주소로 바꾼다.
+# __VM_PUBLIC_IP__는 scripts/deploy-prod.*가 실행 시점에 sed/치환으로 실제 값을 채워 넣는다.
 - op: replace
   path: /spec/rules/0/host
   value: app.__VM_PUBLIC_IP__.nip.io

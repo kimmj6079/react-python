@@ -1,5 +1,10 @@
+# CI 워크플로우: backend/frontend 코드 검증 + 이미지 빌드 검증 + k8s 매니페스트
+# 배포 가능 여부 검증까지 한 번에 수행한다. 4개 job이 순서대로 의존한다:
+# backend, frontend(병렬) -> docker-build -> k8s-manifest-check.
+# 실제 운영 서비스 배포는 여기서 하지 않는다 (그건 cd.yml + scripts/deploy-*.sh의 몫).
 name: CI
 
+# main으로 직접 push되거나, main을 대상으로 하는 PR이 열리거나 갱신될 때마다 자동 실행된다.
 on:
   push:
     branches: [main]
@@ -7,8 +12,11 @@ on:
     branches: [main]
 
 jobs:
+  # 백엔드(FastAPI) 검증: 린트 -> 실제 Postgres에 마이그레이션 적용 -> pytest
   backend:
     runs-on: ubuntu-latest
+    # 이 job 전용 임시 Postgres 컨테이너. 러너와 같은 네트워크에 떠서
+    # localhost:5432로 바로 접근 가능하다 (docker-compose의 서비스명 접근과는 다름).
     services:
       postgres:
         image: postgres:16-alpine
@@ -18,32 +26,36 @@ jobs:
           POSTGRES_DB: app
         ports:
           - 5432:5432
+        # health-cmd로 pg_isready를 반복 확인해서, postgres가 완전히 뜨기 전에
+        # 이후 스텝(마이그레이션 등)이 먼저 실행되어 접속 실패하는 걸 막는다.
         options: >-
           --health-cmd "pg_isready -U postgres"
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
+    # 이 job의 모든 run: 스텝을 backend/ 디렉토리 안에서 실행하도록 기본 지정
     defaults:
       run:
         working-directory: backend
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4   # 저장소 코드를 러너로 체크아웃
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v5   # uv(파이썬 패키지 매니저) 설치 + 의존성 캐시 설정
         with:
           enable-cache: true
           cache-dependency-glob: backend/uv.lock
 
-      - run: uv sync --frozen
-      - run: uv run ruff check .
+      - run: uv sync --frozen        # uv.lock 그대로 의존성 설치 (lock과 어긋나면 실패)
+      - run: uv run ruff check .     # 린트 검사
 
-      - name: Apply migrations against a real Postgres
+      - name: Apply migrations against a real Postgres   # 실제 Postgres 대상으로 마이그레이션 적용
         env:
           DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/app
         run: uv run alembic upgrade head
 
-      - run: uv run pytest -v
+      - run: uv run pytest -v        # 전체 테스트 실행 (SQLite 인메모리 DB, tests/conftest.py 참고)
 
+  # 프론트엔드(React/Vite) 검증: 린트 -> 테스트 -> 빌드
   frontend:
     runs-on: ubuntu-latest
     defaults:
@@ -52,46 +64,67 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4   # Node.js 22 설치 + npm 캐시 설정
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
-      - run: npm ci
-      - run: npm run lint
-      - run: npm run test -- --run
-      - run: npm run build
+      - run: npm ci                   # package-lock.json 그대로 의존성 설치
+      - run: npm run lint             # oxlint
+      - run: npm run test -- --run    # Vitest 1회 실행 (watch 모드 아님)
+      - run: npm run build            # tsc -b && vite build (타입/빌드 에러가 여기서 잡힘)
 
+  # 두 이미지가 실제로 "빌드는 되는지"만 확인하는 job. backend/frontend 검증이
+  # 끝난 뒤에 실행된다 (needs로 의존 관계 지정).
   docker-build:
     needs: [backend, frontend]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -t backend:ci ./backend
-      - run: docker build --target production -t frontend:ci ./frontend
+      - run: docker build -t backend:ci ./backend                       # backend/Dockerfile 빌드
+      - run: docker build --target production -t frontend:ci ./frontend # frontend/Dockerfile의 production 스테이지(nginx) 빌드
 
+  # k8s 매니페스트가 실제로 "배포 가능한지" 검증하는 job. 진짜 운영 배포가 아니라,
+  # 이번 커밋의 코드/매니페스트가 클러스터에 정상적으로 올라가는지 확인하는
+  # 1회성 리허설이다. job이 끝나면 아래서 만든 클러스터 자체가 통째로 사라진다.
   k8s-manifest-check:
     needs: [docker-build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      # docker-build job과는 별개의 러너라 그 job의 빌드 결과물이 여기 남아있지
+      # 않다 -- 그래서 다시 빌드한다. 이번엔 태그를 backend:local/frontend:local로
+      # 지정하는데, 이 태그가 로컬 개발(scripts/deploy-local.sh)에서 쓰는 태그와
+      # 같아서 아래 dev 오버레이가 그대로 참조할 수 있다.
       - run: docker build -t backend:local ./backend
       - run: docker build --target production -t frontend:local ./frontend
 
       # GitHub-hosted runners can't reach a developer's local minikube, so
       # this spins up a throwaway kind cluster purely to prove the
       # Kustomize manifests are valid and deployable — not a real deploy.
+      # (한글) GitHub이 제공하는 러너는 개발자의 로컬 minikube에 접근할 수 없다.
+      # 그래서 러너 안에 kind(Kubernetes IN Docker)로 실제 쿠버네티스와 똑같이
+      # 동작하는 "장난감" 클러스터를 새로 하나 띄운다 -- 매니페스트가 유효하고
+      # 배포 가능한지 증명하기 위해서일 뿐, 진짜 배포는 아니다.
       - uses: helm/kind-action@v1
         with:
           cluster_name: ci
 
+      # 방금 로컬에서 빌드한 이미지 2개를 레지스트리를 거치지 않고 kind 클러스터
+      # 노드 안으로 바로 밀어넣는다 (minikube의 `minikube image load`와 같은 역할).
       - run: kind load docker-image backend:local frontend:local --name ci
 
-      - name: Create dummy secret for manifest validation
+      - name: Create dummy secret for manifest validation   # 매니페스트 검증용 더미 시크릿 생성
+        # k8s/base/secret.yaml은 실제 값이 들어가는 파일이라 gitignore돼 있어
+        # 저장소엔 없다. kustomize가 이 파일을 resources로 요구하므로, CI에서는
+        # example 템플릿(더미 값)을 그대로 복사해 통과시킨다.
         run: cp k8s/base/secret.yaml.example k8s/base/secret.yaml
 
+      # 이 job의 핵심 검증. dev 오버레이(base + 이미지 치환 + replicas 조정)를
+      # kustomize로 렌더링해서 클러스터에 적용해본다. 매니페스트에 문법/참조
+      # 오류가 있으면 바로 여기서 실패한다.
       - run: kubectl apply -k k8s/overlays/dev
 
       # migrate-job.yaml is intentionally excluded from overlays/dev's
@@ -100,23 +133,36 @@ jobs:
       # this substitution it still points at the GHCR tag instead of the
       # image just loaded into kind, and kubelet tries to pull it over the
       # network instead of using the local image.
+      # (한글) migrate-job.yaml은 k8s Job의 spec이 불변(수정 불가)이라 일부러
+      # overlays/dev의 resources 목록에서 뺐다. 그런데 그 결과로 dev 오버레이가
+      # 다른 리소스에 해주는 "GHCR 이미지 -> 로컬 이미지" 치환도 같이 못 받는다.
+      # 그래서 kubectl apply 전에 sed로 직접 치환해준다 -- 안 그러면 방금
+      # 클러스터에 넣어둔 로컬 이미지 대신, 존재하지도 않는 GHCR 태그를
+      # 네트워크로 pull하려다 실패(또는 지연)한다.
       - name: Apply migrate Job (pointed at the locally-loaded image)
         run: |
           sed 's|ghcr.io/kimmj6079/react-python-backend:latest|backend:local|' \
             k8s/base/migrate-job.yaml | kubectl apply -n study-app -f -
 
+      # 세 가지를 순서대로 기다린다: 마이그레이션 Job 완료 -> backend Deployment
+      # Ready -> frontend Deployment Ready. 각각 120초 안에 조건이 안 되면 실패.
       - run: kubectl wait --for=condition=complete job/migrate -n study-app --timeout=120s
       - run: kubectl wait --for=condition=available deployment/backend -n study-app --timeout=120s
       - run: kubectl wait --for=condition=available deployment/frontend -n study-app --timeout=120s
 
-      - name: Debug migrate Job on failure
+      - name: Debug migrate Job on failure   # 위 wait 스텝 중 하나라도 실패했을 때만 실행
         if: failure()
+        # Job/Pod 상태와 로그를 CI 로그에 바로 출력한다. "timeout"이라는
+        # 정보량 낮은 에러 대신, 실제 원인(이미지 pull 실패, 마이그레이션 에러 등)을
+        # 바로 확인할 수 있게 하기 위한 디버그 전용 스텝.
         run: |
           kubectl get pods,jobs -n study-app
           kubectl describe job/migrate -n study-app
           kubectl logs -n study-app -l job-name=migrate --all-containers --tail=200 || true
 
-      - name: Smoke test backend through a port-forward
+      - name: Smoke test backend through a port-forward   # 마지막 확인: 실제로 요청에 응답하는지
+        # 클러스터 밖(러너)에서 backend Service로 포트포워딩을 열고,
+        # /health/ready에 curl을 보내 정상 응답(HTTP 2xx)이 오는지 확인한다.
         run: |
           kubectl port-forward -n study-app svc/backend 8000:8000 &
           sleep 3

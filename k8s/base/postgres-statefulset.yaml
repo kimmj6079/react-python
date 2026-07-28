@@ -1,11 +1,14 @@
+# Postgres를 StatefulSet으로 띄운다 (Deployment가 아님). StatefulSet은 Pod마다
+# 고유하고 안정적인 이름/스토리지를 보장해줘서, DB처럼 "재시작해도 같은 데이터를
+# 다시 붙잡아야 하는" 워크로드에 적합하다.
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: postgres
   namespace: study-app
 spec:
-  serviceName: postgres
-  replicas: 1
+  serviceName: postgres   # 같은 이름의 headless Service(postgres-service.yaml)와 짝을 이뤄야 함
+  replicas: 1   # 학습용 단일 인스턴스. 여러 개로 늘리려면 복제/샤딩을 직접 구성해야 해서 범위 밖
   selector:
     matchLabels:
       app: postgres
@@ -16,7 +19,7 @@ spec:
     spec:
       containers:
         - name: postgres
-          image: postgres:16-alpine
+          image: postgres:16-alpine   # 공식 이미지를 그대로 사용 (커스텀 Dockerfile 없음)
           ports:
             - containerPort: 5432
           envFrom:
@@ -26,30 +29,31 @@ spec:
                 name: app-secret
           volumeMounts:
             - name: postgres-data
-              mountPath: /var/lib/postgresql/data
-              subPath: postgres
+              mountPath: /var/lib/postgresql/data   # postgres가 실제 데이터 파일을 저장하는 경로
+              subPath: postgres   # 볼륨 루트 대신 하위 디렉토리에 저장 (기타 시스템 파일과 안 섞이게)
           readinessProbe:
             exec:
-              command: ["pg_isready", "-U", "postgres"]
+              command: ["pg_isready", "-U", "postgres"]   # 통과해야 Service 엔드포인트에 포함됨
             initialDelaySeconds: 5
             periodSeconds: 5
           livenessProbe:
             exec:
-              command: ["pg_isready", "-U", "postgres"]
+              command: ["pg_isready", "-U", "postgres"]   # 계속 실패하면 컨테이너를 강제 재시작함
             initialDelaySeconds: 15
             periodSeconds: 10
           resources:
-            requests:
+            requests:   # 스케줄링 시 최소한 이만큼은 확보해달라는 요청량
               cpu: 100m
               memory: 128Mi
-            limits:
+            limits:   # 이 이상 쓰면 CPU는 스로틀링, 메모리는 OOMKill 대상이 되는 상한선
               cpu: 500m
               memory: 512Mi
-  volumeClaimTemplates:
+  volumeClaimTemplates:   # StatefulSet 전용 기능: Pod마다 자기만의 PVC를 자동으로 만들어줌
     - metadata:
         name: postgres-data
       spec:
-        accessModes: ["ReadWriteOnce"]
+        accessModes: ["ReadWriteOnce"]   # 한 번에 한 노드에서만 마운트 가능 (DB 용도로는 충분)
         resources:
           requests:
-            storage: 1Gi
+            storage: 1Gi   # storageClassName 미지정 -> 클러스터 기본 StorageClass 사용
+                            # (minikube/k3s 모두 기본 제공 프로비저너가 있어 별도 설정 불필요)

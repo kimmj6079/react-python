@@ -4,7 +4,7 @@ metadata:
   name: frontend
   namespace: study-app
 spec:
-  replicas: 2
+  replicas: 2   # overlays/dev는 이 값을 1로 낮춤
   selector:
     matchLabels:
       app: frontend
@@ -15,13 +15,15 @@ spec:
     spec:
       containers:
         - name: frontend
+          # frontend/Dockerfile의 production 스테이지(nginx)로 빌드된 이미지.
+          # base 기본값은 GHCR. overlays/dev가 frontend:local로 치환한다.
           image: ghcr.io/kimmj6079/react-python-frontend:latest
           imagePullPolicy: IfNotPresent
           ports:
-            - containerPort: 80
+            - containerPort: 80   # nginx가 듣는 포트 (frontend/nginx.conf 참고)
           readinessProbe:
             httpGet:
-              path: /
+              path: /   # 정적 파일 서버라 별도 헬스체크 엔드포인트 없이 루트로 확인
               port: 80
             initialDelaySeconds: 3
             periodSeconds: 10
@@ -32,7 +34,7 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 15
           resources:
-            requests:
+            requests:   # 정적 파일 서빙이라 backend보다 훨씬 가볍게 잡음
               cpu: 50m
               memory: 64Mi
             limits:

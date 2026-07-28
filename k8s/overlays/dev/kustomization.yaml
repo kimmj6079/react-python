@@ -1,12 +1,18 @@
 # Dev overlay: local images (built + `minikube image load`'ed / `kind load
 # docker-image`'ed under these exact names), single replica each so a
 # laptop-sized cluster doesn't struggle.
+# (한글) 로컬 개발용 오버레이. `minikube image load`나 `kind load docker-image`로
+# 미리 넣어둔 backend:local/frontend:local 이미지를 그대로 참조하도록 바꾸고,
+# 노트북 사양의 클러스터가 버거워하지 않도록 replica를 1개씩으로 줄인다.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
-  - ../../base
+  - ../../base   # base의 모든 리소스를 그대로 상속
 
+# base 매니페스트의 image: 필드에서 이름이 일치하는 것을 찾아 이름/태그를
+# 통째로 바꿔치기한다. migrate-job.yaml은 base의 resources 목록에 없어서
+# 이 치환을 못 받는다 -- scripts/deploy-local.*와 ci.yml이 별도로 sed 치환함.
 images:
   - name: ghcr.io/kimmj6079/react-python-backend
     newName: backend
@@ -15,6 +21,7 @@ images:
     newName: frontend
     newTag: local
 
+# base의 replicas: 2를 로컬 개발용으로 1개씩 낮춘다.
 replicas:
   - name: backend
     count: 1

@@ -26,6 +26,30 @@ FastAPI + React(TypeScript/Vite) + PostgreSQL 풀스택 스터디 프로젝트. 
 
 배포 완료 후 접속: `http://app.<VM_PUBLIC_IP>.nip.io`. 운영 단계 상세는 [CLAUDE.md](./CLAUDE.md)의 "CI/CD", "Kubernetes (클라우드 VM, k3s 실제 배포)" 절 참고.
 
+### 8단계 상세: 클라우드 VM(서버)에서 실제로 처리되는 일
+
+`provision-vm.sh`/`deploy-prod.sh`는 전부 **로컬 컴퓨터에서 실행하는 스크립트**다 — 서버로 파일을 옮길 필요가 없다. 대신 스크립트 안에서 SSH로 서버에 접속해 명령을 원격 실행한다. "서버 쪽에서" 처리되는 일만 정리하면:
+
+**사람이 클라우드 콘솔에서 직접 처리해야 하는 것 (스크립트로 자동화 안 됨, 최초 1회)**
+- 방화벽/보안그룹에 인바운드 22(SSH), 80(HTTP) 포트 허용 (AWS는 보안 그룹, GCP는 방화벽 규칙, 오라클 클라우드는 시큐리티 리스트 등 이름은 다르지만 개념은 동일)
+- 그 VM에 SSH로 접속 가능한 계정(키 페어 등록 완료) 준비 — 클라우드에서 VM을 만들 때 보통 같이 설정됨
+
+**`provision-vm.sh` 실행 시 서버 안에서 벌어지는 일 (최초 1회)**
+1. k3s(경량 쿠버네티스 배포판) 설치 — 이미 설치돼 있으면 건너뜀
+2. 설치 시 Traefik(k3s 기본 내장 ingress controller)은 비활성화 — 이 프로젝트 매니페스트가 기대하는 `ingress-nginx`와 종류를 맞추기 위함
+3. kubeconfig를 서버의 사용자 홈 디렉토리(`~/.kube/config`)로 복사 — 이후 SSH 세션에서 `sudo` 없이 `kubectl`을 바로 쓸 수 있게 함
+4. `local-path` StorageClass(k3s 기본 제공)가 있는지 확인 — Postgres가 쓸 스토리지를 자동으로 만들어주는 부품
+5. `ingress-nginx` 설치 후, controller Pod과 admission webhook이 준비될 때까지 대기
+
+**`deploy-prod.sh` 실행 시 서버 안에서 벌어지는 일 (배포/재배포마다)**
+1. 로컬에서 렌더링해 SSH로 흘려보낸 매니페스트를 서버의 `kubectl apply -f -`가 받아서 적용
+2. backend/frontend Deployment가 GHCR에서 이미지를 pull해 Pod을 새로 띄움
+3. `kubectl rollout restart`로 기존 Pod을 내리고 새 이미지로 다시 띄움 (최신 이미지 강제 반영)
+4. migrate Job이 서버 안에서 실행되어 Postgres에 스키마 마이그레이션 적용
+5. `ingress-nginx`가 80번 포트로 들어오는 실제 요청을 backend/frontend Service로 라우팅하기 시작
+
+즉 서버에 직접 뭔가를 설치하거나 파일을 복사해두는 작업은 사실상 없고(2번 섹션의 최초 프로비저닝 제외), 이후로는 로컬에서 스크립트 한 줄 실행하는 것으로 서버 쪽 상태가 전부 갱신된다.
+
 ## 사전 준비 (초기 셋팅)
 
 ### 1) 저장소 클론

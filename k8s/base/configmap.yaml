@@ -1,10 +1,17 @@
+# 민감하지 않은 설정값 모음. Secret(app-secret)과 짝을 이뤄 backend/postgres
+# 컨테이너에 envFrom으로 통째로 주입된다 (각 Deployment/StatefulSet의
+# configMapRef 참고).
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: app-config
   namespace: study-app
 data:
-  POSTGRES_DB: app
+  POSTGRES_DB: app   # postgres 컨테이너와 backend의 DATABASE_URL이 함께 참조하는 DB 이름
   # Same-origin via Ingress in k8s, so CORS isn't actually exercised there;
   # kept for parity with the docker-compose/local setup.
+  # (한글) k8s에서는 Ingress를 거쳐 프론트/백엔드가 같은 origin으로 나가서
+  # CORS가 실제로 발동하지는 않는다. docker-compose/로컬 설정과 값 형태를
+  # 맞춰두기 위해 남겨둔 것. overlays/prod는 이 값을 VM 공인 IP 기반
+  # 주소로 patch한다.
   BACKEND_CORS_ORIGINS: "http://app.127.0.0.1.nip.io"

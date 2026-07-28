@@ -1,21 +1,28 @@
 # Jobs are immutable once created. To re-run after a new migration:
 #   kubectl delete job/migrate -n study-app --ignore-not-found
 #   kubectl apply -k k8s/overlays/dev
+# (한글) k8s Job은 한 번 만들어지면 spec을 수정할 수 없다(불변). 새 마이그레이션이
+# 추가된 뒤 다시 실행하려면 위 두 줄처럼 기존 Job을 지우고 새로 만들어야 한다.
+# 이 파일이 k8s/base/kustomization.yaml의 resources 목록에 없는 것도 같은
+# 이유 -- 목록에 있으면 재실행 시 `kubectl apply -k`가 불변 필드 수정 에러로 실패한다.
 apiVersion: batch/v1
 kind: Job
 metadata:
   name: migrate
   namespace: study-app
 spec:
-  backoffLimit: 2
+  backoffLimit: 2   # Pod이 실패하면 최대 2번까지 더 재시도 (총 3번) 후 Job을 Failed로 표시
   template:
     spec:
-      restartPolicy: Never
+      restartPolicy: Never   # Job Pod의 정석 설정: 실패해도 Pod 자체를 재시작하지 않고 새 Pod을 만듦
       containers:
         - name: migrate
+          # resources:에 없어 overlays/dev·prod의 images: 트랜스폼을 못 받는다.
+          # 그래서 scripts/deploy-local.*와 ci.yml이 kubectl apply 전에 sed로
+          # 이 태그를 직접 치환한다 (CLAUDE.md 참고).
           image: ghcr.io/kimmj6079/react-python-backend:latest
           imagePullPolicy: IfNotPresent
-          command: ["alembic", "upgrade", "head"]
+          command: ["alembic", "upgrade", "head"]   # backend 이미지 안의 alembic으로 스키마를 최신으로 맞춤
           envFrom:
             - configMapRef:
                 name: app-config

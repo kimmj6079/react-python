@@ -1,3 +1,6 @@
+# backend Deployment 앞단의 (기본 타입인) ClusterIP Service. 클러스터 내부의
+# 다른 리소스(Ingress, migrate Job 등)가 "backend"라는 이름 하나로 접근할 수
+# 있게 해준다 -- Pod IP는 재시작될 때마다 바뀌지만 Service 이름/IP는 고정.
 apiVersion: v1
 kind: Service
 metadata:
@@ -5,7 +8,7 @@ metadata:
   namespace: study-app
 spec:
   selector:
-    app: backend
+    app: backend   # 이 라벨을 가진 Pod들에게 트래픽을 자동으로 분산시킴
   ports:
-    - port: 8000
-      targetPort: 8000
+    - port: 8000       # Service 자체의 포트 (다른 리소스가 이 번호로 접근)
+      targetPort: 8000 # 실제로 전달되는 컨테이너 포트

@@ -1,3 +1,5 @@
+# JSON6902 patch: base ConfigMap의 BACKEND_CORS_ORIGINS도 같은 방식으로
+# VM 공인 IP 기반 주소로 맞춰준다 (ingress-host-patch.yaml과 짝을 이룸).
 - op: replace
   path: /data/BACKEND_CORS_ORIGINS
   value: http://app.__VM_PUBLIC_IP__.nip.io

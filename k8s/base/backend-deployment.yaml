@@ -4,7 +4,7 @@ metadata:
   name: backend
   namespace: study-app
 spec:
-  replicas: 2
+  replicas: 2   # 무중단 배포/기본 이중화를 위해 2개. overlays/dev는 이 값을 1로 낮춤
   selector:
     matchLabels:
       app: backend
@@ -15,31 +15,34 @@ spec:
     spec:
       containers:
         - name: backend
+          # base 기본값은 GHCR 이미지. overlays/dev가 images: 트랜스폼으로
+          # backend:local로 바꾸고, deploy-prod.sh는 실행 시점에 imagePullPolicy만
+          # Always로 sed 치환한다 (이 image: 값 자체는 그대로 둠).
           image: ghcr.io/kimmj6079/react-python-backend:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: IfNotPresent   # 노드에 이미 있는 이미지면 재다운로드하지 않음
           ports:
             - containerPort: 8000
-          envFrom:
+          envFrom:   # ConfigMap/Secret의 키-값을 통째로 환경변수로 주입 (app/core/config.py의 Settings가 읽음)
             - configMapRef:
                 name: app-config
             - secretRef:
                 name: app-secret
-          readinessProbe:
+          readinessProbe:   # 통과해야 backend-service.yaml이 이 Pod로 트래픽을 보냄
             httpGet:
               path: /health/ready
               port: 8000
             initialDelaySeconds: 5
             periodSeconds: 10
-          livenessProbe:
+          livenessProbe:   # 계속 실패하면 kubelet이 컨테이너를 강제 재시작함
             httpGet:
               path: /health
               port: 8000
             initialDelaySeconds: 10
             periodSeconds: 15
           resources:
-            requests:
+            requests:   # 스케줄링 시 최소한 이만큼은 확보해달라는 요청량
               cpu: 100m
               memory: 128Mi
-            limits:
+            limits:   # 이 이상 쓰면 CPU는 스로틀링, 메모리는 OOMKill 대상이 되는 상한선
               cpu: 500m
               memory: 256Mi

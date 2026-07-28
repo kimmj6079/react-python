@@ -1,10 +1,17 @@
 # Before applying: cp secret.yaml.example secret.yaml and fill in real
 # values. secret.yaml is gitignored and does not exist in a fresh clone.
+# (한글) 적용 전에: secret.yaml.example을 secret.yaml로 복사하고 실제 값으로
+# 채워라. secret.yaml은 gitignore돼 있어서 새로 클론했을 땐 존재하지 않는다.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-namespace: study-app
+namespace: study-app   # 여기 나열된 모든 리소스에 이 네임스페이스가 자동 적용됨
 
+# 이 목록에 있는 리소스만 kustomize의 대상이 된다 -- overlays/dev, overlays/prod의
+# images:/replicas:/patches: 트랜스폼도 이 목록에 있는 리소스에만 적용된다.
+# migrate-job.yaml이 없는 이유: k8s Job의 spec은 불변이라 여기 포함시키면
+# 재실행할 때 `kubectl apply -k`가 실패한다. 그래서 delete 후 별도로
+# `kubectl apply -f`하는 방식으로 관리한다 (CLAUDE.md, scripts/deploy-*.* 참고).
 resources:
   - namespace.yaml
   - configmap.yaml

@@ -16,6 +16,10 @@ frontend/.vite/
 backend/.env
 frontend/.env
 k8s/base/secret.yaml
+.env.prod
+nginx-proxy/ssl/*.pem
+nginx-proxy/ssl/*.key
+nginx-proxy/ssl/*.crt
 
 # --- Editors / OS ---
 .vscode/

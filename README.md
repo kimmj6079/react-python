@@ -23,8 +23,9 @@ FastAPI + React(TypeScript/Vite) + PostgreSQL 풀스택 스터디 프로젝트. 
 | **6. CI** (`ci.yml`) | push/PR마다 자동 검증 | lint · pytest · vitest · docker build · kind manifest check |
 | **7. CD** (`cd.yml`) | main 푸시 시 이미지 배포 | GHCR에 backend/frontend 이미지 push |
 | **8. 클라우드 VM 실배포** (k3s) | 최초 1회 프로비저닝 후 반복 배포 | `./scripts/provision-vm.sh`(최초) → `secret.yaml` 실값 준비 → `./scripts/deploy-prod.sh` |
+| **8-B. 클라우드 VM 실배포** (docker-compose, k3s 불필요) | Docker + Compose만 설치된 서버용 대안 경로 | `.env.prod` 실값 준비 → `./scripts/deploy-prod-compose.sh` |
 
-배포 완료 후 접속: `http://app.<VM_PUBLIC_IP>.nip.io`. 운영 단계 상세는 [CLAUDE.md](./CLAUDE.md)의 "CI/CD", "Kubernetes (클라우드 VM, k3s 실제 배포)" 절 참고.
+8단계는 k3s가 설치된 서버용, 8-B는 Docker/Compose만 있는 서버용 대안 경로다 — 서버 환경에 맞는 쪽 하나만 쓰면 된다. 배포 완료 후 접속: 두 경로 모두 `http://app.<VM_PUBLIC_IP>.nip.io`. 운영 단계 상세는 [CLAUDE.md](./CLAUDE.md)의 "CI/CD", "Kubernetes (클라우드 VM, k3s 실제 배포)", "Docker Compose (클라우드 VM, k3s 없이 실제 배포)" 절 참고.
 
 ### 8단계 상세: 클라우드 VM(서버)에서 실제로 처리되는 일
 
@@ -49,6 +50,39 @@ FastAPI + React(TypeScript/Vite) + PostgreSQL 풀스택 스터디 프로젝트. 
 5. `ingress-nginx`가 80번 포트로 들어오는 실제 요청을 backend/frontend Service로 라우팅하기 시작
 
 즉 서버에 직접 뭔가를 설치하거나 파일을 복사해두는 작업은 사실상 없고(2번 섹션의 최초 프로비저닝 제외), 이후로는 로컬에서 스크립트 한 줄 실행하는 것으로 서버 쪽 상태가 전부 갱신된다.
+
+### 8-B단계 상세: k3s 없이 docker-compose로 배포할 때 서버 안에서 벌어지는 일
+
+서버에 k3s/kubernetes를 설치할 수 없거나(회사 정책, 리소스 부족 등) 원하지 않는 경우를 위한 대안 경로다. `deploy-prod-compose.sh`도 8단계와 마찬가지로 **로컬 컴퓨터에서 실행하는 스크립트**이고, 서버에는 `docker-compose.prod.yml` / `.env.prod` / `nginx-proxy/conf.d/*.conf` 몇 개 파일만 전송된다 — git clone도, 소스 코드 체크아웃도 서버에서 필요 없다(애플리케이션 코드는 GHCR에 이미 빌드되어 있는 이미지 안에 들어있다).
+
+이 경로는 이 앱 하나만 올린다고 가정하지 않는다 — 같은 VM에 다른 앱(예: Spring Boot)을 나중에 추가로 올릴 수 있도록, 호스트의 80번 포트는 `docker-compose.prod.yml`의 공유 `nginx` 서비스 하나만 잡고 각 앱(`frontend`, `backend`)은 이 서비스를 통해서만 도달 가능한 내부 전용 컨테이너로 둔다. `nginx`가 어떤 요청을 어떤 앱으로 보낼지는 `nginx-proxy/conf.d/`에 마운트된 설정 파일이 결정한다(이미지 재빌드 불필요, conf 파일만 추가/수정).
+
+**사람이 클라우드 콘솔에서 직접 처리해야 하는 것 (최초 1회)**
+- 방화벽/보안그룹에 인바운드 22(SSH), 80(HTTP) 포트 허용(SSL을 쓸 계획이면 443도 함께) — k3s 경로와 동일, 6443은 애초에 안 씀
+- 그 VM에 SSH로 접속 가능한 계정 준비 (k3s 경로와 동일)
+- 서버에 Docker + Docker Compose 플러그인 설치 (`docker compose version`으로 확인 가능하면 준비 끝, k3s 설치 불필요)
+- GHCR 패키지(`react-python-backend`/`react-python-frontend`) 접근 방식 결정 — 둘 중 하나
+  - Public으로 전환 (GitHub → Packages): 별도 인증 없이 서버가 익명으로 이미지를 pull할 수 있음
+  - Private로 유지: `.env.prod`의 `GHCR_USERNAME`/`GHCR_TOKEN`(read:packages 권한만 있는 PAT)을 채워두면, 아래 스크립트가 pull 직전에 서버에서 로그인을 자동으로 처리해준다
+- 도메인: 지금 당장은 필요 없다(`.env.prod`의 `DOMAIN`을 비워두면 `app.<VM_PUBLIC_IP>.nip.io`를 자동으로 씀). 나중에 실제 도메인을 구매하면 그때 `DOMAIN`에 채우면 된다.
+
+**`deploy-prod-compose.sh` 실행 시 서버 안에서 벌어지는 일 (배포/재배포마다)**
+1. 로컬에서 `.env.prod`의 `DOMAIN`(비어있으면 `app.<VM_PUBLIC_IP>.nip.io`로 자동 계산)을 계산해 `nginx-proxy/conf.d/*.conf`의 `__APP_DOMAIN__` 플레이스홀더를 치환한 뒤, `docker-compose.prod.yml` / `.env.prod` / 렌더링된 conf 파일들을 scp로 서버의 `~/react-python-deploy/`에 저장 (`.env.prod`는 비밀번호가 들어있어 `chmod 600`으로 다른 사용자가 못 읽게 처리)
+2. `nginx-proxy/ssl/`에 SSL 인증서 파일이 있으면(아래 "SSL/실제 도메인으로 전환하려면" 참고) 함께 전송하고 개인키를 `chmod 600` 처리 — 아직 없으면(지금 상태) 조용히 건너뜀
+3. `.env.prod`에 GHCR 토큰이 채워져 있으면 `docker login ghcr.io` 실행 (토큰은 SSH stdin으로만 전달되고 명령줄에 노출되지 않음)
+4. `docker compose pull`로 GHCR에서 최신 backend/frontend 이미지를 받아옴
+5. `docker compose up -d`로 db(postgres)·backend·frontend·nginx 컨테이너를 기동/갱신 — 이 중 `nginx`만 호스트 80/443번 포트를 잡고, `nginx-proxy/conf.d/app.conf`가 `server_name __APP_DOMAIN__` 기준으로 `/`는 frontend, `/api`는 backend로 프록시함(k3s 경로의 Ingress 역할을 이 공유 컨테이너가 대신함)
+6. `docker compose run --rm backend alembic upgrade head`로 마이그레이션 적용 (멱등적이라 매번 실행해도 안전 — k3s 경로처럼 Job을 지웠다 다시 만드는 절차가 필요 없음)
+
+즉 8단계와 마찬가지로 서버에 뭔가를 미리 설치해둘 필요가 없고(최초 Docker/Compose 설치 제외), 로컬에서 스크립트 한 줄로 서버 쪽 상태가 전부 갱신된다. 완료 후 접속 주소는 `http://app.<VM_PUBLIC_IP>.nip.io`다(k3s 경로와 동일하게 host 기반, 실제 도메인/SSL 전환 후에는 해당 도메인 + https).
+
+**나중에 이 VM에 다른 앱(예: Spring Boot)을 추가로 올리려면**: `docker-compose.prod.yml`에 서비스 블록 하나 추가 + `nginx-proxy/conf.d/`에 `server_name <이름>.__APP_DOMAIN__`로 그 서비스에 프록시하는 conf 파일 하나만 추가하면 된다. 기존 `app.conf`/`frontend`/`backend`는 전혀 건드릴 필요가 없다 — 공유 `nginx` 서비스가 Host 헤더를 보고 어느 앱으로 보낼지 알아서 나눠주기 때문이다.
+
+**SSL/실제 도메인으로 전환하려면** (지금은 HTTP + nip.io 테스트 단계):
+1. 도메인 구매 후 `.env.prod`의 `DOMAIN=`에 채운다(예: `DOMAIN=myapp.com`).
+2. `nginx-proxy/ssl/`에 `fullchain.pem`/`privkey.pem`을 배치한다(`nginx-proxy/ssl/README.md` 참고 — 실제 파일은 git에 커밋되지 않음).
+3. `nginx-proxy/conf.d/app.conf`를 열어 지금 활성 상태인 "HTTP" 블록을 지우거나 주석 처리하고, 이미 파일 안에 준비된 "HTTP → HTTPS 리다이렉트"와 "HTTPS" 두 블록의 주석을 해제한다.
+4. `deploy-prod-compose.sh`(또는 `.ps1`)를 다시 실행하면 SSL 파일과 새 설정이 함께 반영된다. `docker-compose.prod.yml`의 `nginx` 서비스는 이미 443 포트 + `nginx-proxy/ssl` 마운트가 준비돼 있어(인증서가 없어도 무해) 이 파일은 따로 안 건드려도 된다.
 
 ## 사전 준비 (초기 셋팅)
 

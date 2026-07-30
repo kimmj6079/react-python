@@ -51,6 +51,8 @@ COPY nginx.conf /etc/nginx/conf.d/default.conf
 # nginx 기본 포트 노출
 EXPOSE 80
 # 헬스체크 정의: 30초 간격, 3초 타임아웃, 시작 후 5초 유예
-# 루트 경로 응답 여부로 정상 동작 확인
+# 루트 경로 응답 여부로 정상 동작 확인. localhost 대신 127.0.0.1을 명시하는 이유:
+# 일부 환경(IPv6 루프백은 있지만 nginx가 IPv4만 리스닝하는 컨테이너 네트워크)에서
+# "localhost"가 ::1로 먼저 해석되어 연결이 거부되는 경우가 있다.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \
-    CMD wget -qO- http://localhost/ >/dev/null || exit 1
+    CMD wget -qO- http://127.0.0.1/ >/dev/null || exit 1

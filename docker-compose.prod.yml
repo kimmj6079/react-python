@@ -1,0 +1,66 @@
+# 운영(prod) 배포용 docker-compose. k8s 없이 Docker + Compose만 설치된
+# 서버에서 사용한다. 로컬 docker-compose.yml(개발용, 소스 바인드 마운트 +
+# --reload)과 달리 이 파일은 아무것도 빌드하지 않고 cd.yml이 GHCR에 이미
+# 푸시해둔 이미지를 pull만 한다.
+#
+# 사용법: scripts/deploy-prod-compose.sh (또는 .ps1) 참고. 직접 실행할 때는
+#   cp .env.prod.example .env.prod   # 최초 1회, 실제 강한 값으로 수정
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod pull
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod run --rm backend alembic upgrade head
+services:	# 이 파일에서 정의할 컨테이너 서비스 목록 시작
+  db:	# PostgreSQL 데이터베이스 서비스 (커스텀 빌드 없이 공식 이미지 그대로 사용)
+    image: postgres:16-alpine	# k8s/base/postgres-statefulset.yaml과 동일한 베이스 이미지
+    environment:	# 컨테이너 내부에 주입할 환경변수
+      POSTGRES_USER: ${POSTGRES_USER}	# .env.prod에서 주입
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}	# .env.prod에서 주입 (반드시 강한 값)
+      POSTGRES_DB: ${POSTGRES_DB}	# .env.prod에서 주입
+    healthcheck:	# postgres/Dockerfile을 안 쓰므로 헬스체크를 여기서 직접 정의
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]	# 공식 이미지에 내장된 pg_isready 사용
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:	# 데이터 영속화를 위한 볼륨 마운트
+      - db-data:/var/lib/postgresql/data	# 명명된 볼륨을 postgres 데이터 디렉토리에 연결
+    restart: unless-stopped	# 운영 환경이므로 컨테이너가 죽으면 자동 재시작
+
+  backend:	# FastAPI 백엔드 서비스 (GHCR 이미지 pull, 로컬 빌드 없음)
+    image: ghcr.io/kimmj6079/react-python-backend:latest	# cd.yml이 main 푸시 시 이미 푸시해둔 이미지
+    environment:	# 백엔드에 주입할 환경변수
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}	# host는 compose 서비스명 db
+      BACKEND_CORS_ORIGINS: http://${DOMAIN:-app.${APP_HOST}.nip.io}	# DOMAIN 비어있으면 nip.io 자동 계산, 채워지면 실제 도메인 사용(k8s configmap과 동일 형식)
+    depends_on:	# 시작 순서 의존성
+      db:	# db 서비스가 준비된 후 시작
+        condition: service_healthy	# db의 헬스체크가 통과해야 시작
+    # 호스트에 포트를 노출하지 않는다 - 공유 nginx 서비스를 통해서만 도달 가능
+    # (k8s에서 backend Service가 Ingress 없이는 클러스터 밖에 노출되지 않는 것과 동일한 특성)
+    restart: unless-stopped	# 운영 환경이므로 컨테이너가 죽으면 자동 재시작
+
+  frontend:	# React/Vite 프론트엔드 서비스 (GHCR 이미지 pull, 로컬 빌드 없음)
+    image: ghcr.io/kimmj6079/react-python-frontend:latest	# cd.yml이 target: production으로 빌드해 푸시해둔 이미지
+    # 호스트에 포트를 노출하지 않는다 - 내부 전용, 공유 nginx 서비스만 이 컨테이너에 도달한다
+    # (VM에 다른 앱도 함께 올릴 수 있도록 80번 포트는 nginx 서비스 하나만 잡는다)
+    restart: unless-stopped	# 운영 환경이므로 컨테이너가 죽으면 자동 재시작
+
+  nginx:	# 공유 리버스 프록시 - 이 VM에 올라가는 모든 앱의 유일한 진입점(80/443번 포트)
+    image: nginx:1.27-alpine	# 커스텀 빌드 없이 공식 이미지 그대로 사용
+    ports:	# 이 스택에서 호스트에 노출하는 유일한 포트들
+      - "80:80"	# 호스트 80번 포트를 nginx 컨테이너 80번 포트에 연결
+      - "443:443"	# SSL 인증서 설치 전에는 아무 서버 블록도 리스닝하지 않아 무해함(nginx-proxy/conf.d/app.conf 참고)
+    volumes:	# 설정을 이미지가 아니라 마운트로 공급 - 앱 추가 시 이미지 재빌드 불필요
+      - ./nginx-proxy/conf.d:/etc/nginx/conf.d:ro	# 앱별 server 블록 (app.conf, _default.conf, ...)
+      - ./nginx-proxy/ssl:/etc/nginx/ssl:ro	# SSL 인증서/개인키 (nginx-proxy/ssl/README.md 참고, 비어있어도 무해)
+    healthcheck:	# _default.conf의 catch-all이 Host 헤더 없는 요청에 200을 응답한다
+      test: ["CMD", "wget", "-qO-", "http://localhost/"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    depends_on:	# 시작 순서 의존성
+      frontend:	# frontend가 준비된 후 시작
+        condition: service_healthy
+      backend:	# backend가 준비된 후 시작
+        condition: service_healthy
+    restart: unless-stopped	# 운영 환경이므로 컨테이너가 죽으면 자동 재시작
+
+volumes:	# 명명된 볼륨 정의
+  db-data:	# postgres 데이터 영속화용 볼륨

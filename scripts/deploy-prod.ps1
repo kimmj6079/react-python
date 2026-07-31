@@ -1,4 +1,4 @@
-# 클라우드 VM(k3s)에 SSH로 원격 배포한다.
+﻿# 클라우드 VM(k3s)에 SSH로 원격 배포한다.
 # 사전 준비: scripts/provision-vm.sh 1회 실행 완료, k8s/base/secret.yaml
 # 준비(실제 강한 값), GHCR 패키지 Public 전환(또는 imagePullSecrets).
 #

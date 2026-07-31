@@ -22,10 +22,17 @@ services:	# 이 파일에서 정의할 컨테이너 서비스 목록 시작
       retries: 10
     volumes:	# 데이터 영속화를 위한 볼륨 마운트
       - db-data:/var/lib/postgresql/data	# 명명된 볼륨을 postgres 데이터 디렉토리에 연결
+    mem_limit: 512m	# k8s/base/postgres-statefulset.yaml의 limits와 동일한 값 - 컨테이너 하나가 VM 전체 메모리를 잠식하지 않도록
+    cpus: "0.5"	# 위와 동일한 이유의 CPU 제한
+    logging:	# 트래픽이 쌓여도 로그가 디스크를 무한정 채우지 않도록 로테이션
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped	# 운영 환경이므로 컨테이너가 죽으면 자동 재시작
 
   backend:	# FastAPI 백엔드 서비스 (GHCR 이미지 pull, 로컬 빌드 없음)
-    image: ghcr.io/kimmj6079/react-python-backend:latest	# cd.yml이 main 푸시 시 이미 푸시해둔 이미지
+    image: ghcr.io/kimmj6079/react-python-backend:${IMAGE_TAG:-latest}	# 기본은 latest, 롤백 시 .env.prod의 IMAGE_TAG를 sha-xxxxxxx로 바꿔 재배포
     environment:	# 백엔드에 주입할 환경변수
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}	# host는 compose 서비스명 db
       BACKEND_CORS_ORIGINS: http://${DOMAIN:-app.${APP_HOST}.nip.io}	# DOMAIN 비어있으면 nip.io 자동 계산, 채워지면 실제 도메인 사용(k8s configmap과 동일 형식)
@@ -34,12 +41,26 @@ services:	# 이 파일에서 정의할 컨테이너 서비스 목록 시작
         condition: service_healthy	# db의 헬스체크가 통과해야 시작
     # 호스트에 포트를 노출하지 않는다 - 공유 nginx 서비스를 통해서만 도달 가능
     # (k8s에서 backend Service가 Ingress 없이는 클러스터 밖에 노출되지 않는 것과 동일한 특성)
+    mem_limit: 256m	# k8s/base/backend-deployment.yaml의 limits와 동일한 값
+    cpus: "0.5"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped	# 운영 환경이므로 컨테이너가 죽으면 자동 재시작
 
   frontend:	# React/Vite 프론트엔드 서비스 (GHCR 이미지 pull, 로컬 빌드 없음)
-    image: ghcr.io/kimmj6079/react-python-frontend:latest	# cd.yml이 target: production으로 빌드해 푸시해둔 이미지
+    image: ghcr.io/kimmj6079/react-python-frontend:${IMAGE_TAG:-latest}	# 기본은 latest, 롤백 시 .env.prod의 IMAGE_TAG를 sha-xxxxxxx로 바꿔 재배포
     # 호스트에 포트를 노출하지 않는다 - 내부 전용, 공유 nginx 서비스만 이 컨테이너에 도달한다
     # (VM에 다른 앱도 함께 올릴 수 있도록 80번 포트는 nginx 서비스 하나만 잡는다)
+    mem_limit: 128m	# k8s/base/frontend-deployment.yaml의 limits와 동일한 값
+    cpus: "0.25"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped	# 운영 환경이므로 컨테이너가 죽으면 자동 재시작
 
   nginx:	# 공유 리버스 프록시 - 이 VM에 올라가는 모든 앱의 유일한 진입점(80/443번 포트)
@@ -60,6 +81,13 @@ services:	# 이 파일에서 정의할 컨테이너 서비스 목록 시작
         condition: service_healthy
       backend:	# backend가 준비된 후 시작
         condition: service_healthy
+    mem_limit: 128m	# 정적 프록시 역할이라 가볍게 - k8s 쪽엔 없는 서비스라 별도 기준값 없이 보수적으로 설정
+    cpus: "0.25"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped	# 운영 환경이므로 컨테이너가 죽으면 자동 재시작
 
 volumes:	# 명명된 볼륨 정의

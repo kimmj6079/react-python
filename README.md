@@ -67,14 +67,22 @@ FastAPI + React(TypeScript/Vite) + PostgreSQL 풀스택 스터디 프로젝트. 
 - 도메인: 지금 당장은 필요 없다(`.env.prod`의 `DOMAIN`을 비워두면 `app.<VM_PUBLIC_IP>.nip.io`를 자동으로 씀). 나중에 실제 도메인을 구매하면 그때 `DOMAIN`에 채우면 된다.
 
 **`deploy-prod-compose.sh` 실행 시 서버 안에서 벌어지는 일 (배포/재배포마다)**
-1. 로컬에서 `.env.prod`의 `DOMAIN`(비어있으면 `app.<VM_PUBLIC_IP>.nip.io`로 자동 계산)을 계산해 `nginx-proxy/conf.d/*.conf`의 `__APP_DOMAIN__` 플레이스홀더를 치환한 뒤, `docker-compose.prod.yml` / `.env.prod` / 렌더링된 conf 파일들을 scp로 서버의 `~/react-python-deploy/`에 저장 (`.env.prod`는 비밀번호가 들어있어 `chmod 600`으로 다른 사용자가 못 읽게 처리)
-2. `nginx-proxy/ssl/`에 SSL 인증서 파일이 있으면(아래 "SSL/실제 도메인으로 전환하려면" 참고) 함께 전송하고 개인키를 `chmod 600` 처리 — 아직 없으면(지금 상태) 조용히 건너뜀
-3. `.env.prod`에 GHCR 토큰이 채워져 있으면 `docker login ghcr.io` 실행 (토큰은 SSH stdin으로만 전달되고 명령줄에 노출되지 않음)
-4. `docker compose pull`로 GHCR에서 최신 backend/frontend 이미지를 받아옴
-5. `docker compose up -d`로 db(postgres)·backend·frontend·nginx 컨테이너를 기동/갱신 — 이 중 `nginx`만 호스트 80/443번 포트를 잡고, `nginx-proxy/conf.d/app.conf`가 `server_name __APP_DOMAIN__` 기준으로 `/`는 frontend, `/api`는 backend로 프록시함(k3s 경로의 Ingress 역할을 이 공유 컨테이너가 대신함)
-6. `docker compose run --rm backend alembic upgrade head`로 마이그레이션 적용 (멱등적이라 매번 실행해도 안전 — k3s 경로처럼 Job을 지웠다 다시 만드는 절차가 필요 없음)
+1. 로컬에서 `.env.prod`의 `DOMAIN`(비어있으면 `app.<VM_PUBLIC_IP>.nip.io`로 자동 계산)을 계산해 `nginx-proxy/conf.d/*.conf`의 `__APP_DOMAIN__` 플레이스홀더를 치환한 뒤, `docker-compose.prod.yml` / `.env.prod` / 렌더링된 conf 파일들 / `backup-db.sh`를 scp로 서버의 `~/react-python-deploy/`에 저장 (`.env.prod`는 비밀번호가 들어있어 `chmod 600`으로 다른 사용자가 못 읽게 처리)
+2. 매일 03:00에 `backup-db.sh`(DB 백업, 아래 참고)가 돌도록 crontab에 등록/갱신 (멱등적 - 재배포해도 중복 등록 안 됨)
+3. `nginx-proxy/ssl/`에 SSL 인증서 파일이 있으면(아래 "SSL/실제 도메인으로 전환하려면" 참고) 함께 전송하고 개인키를 `chmod 600` 처리 — 아직 없으면(지금 상태) 조용히 건너뜀
+4. `.env.prod`에 GHCR 토큰이 채워져 있으면 `docker login ghcr.io` 실행 (토큰은 SSH stdin으로만 전달되고 명령줄에 노출되지 않음)
+5. `docker compose pull`로 GHCR에서 `.env.prod`의 `IMAGE_TAG`(기본 `latest`)에 해당하는 backend/frontend 이미지를 받아옴
+6. `docker compose up -d`로 db(postgres)·backend·frontend·nginx 컨테이너를 기동/갱신 — 이 중 `nginx`만 호스트 80/443번 포트를 잡고, `nginx-proxy/conf.d/app.conf`가 `server_name __APP_DOMAIN__` 기준으로 `/`는 frontend, `/api`는 backend로 프록시함(k3s 경로의 Ingress 역할을 이 공유 컨테이너가 대신함)
+7. `docker compose run --rm backend alembic upgrade head`로 마이그레이션 적용 (멱등적이라 매번 실행해도 안전 — k3s 경로처럼 Job을 지웠다 다시 만드는 절차가 필요 없음)
+8. 배포 후 `curl`로 SPA(`/`)와 API(`/api/v1/items`) 응답을 확인 — 둘 중 하나라도 실패하면 컨테이너 상태를 출력하고 스크립트가 비정상 종료(exit 1)한다. "완료" 메시지는 이 검증을 통과했을 때만 뜬다.
 
-즉 8단계와 마찬가지로 서버에 뭔가를 미리 설치해둘 필요가 없고(최초 Docker/Compose 설치 제외), 로컬에서 스크립트 한 줄로 서버 쪽 상태가 전부 갱신된다. 완료 후 접속 주소는 `http://app.<VM_PUBLIC_IP>.nip.io`다(k3s 경로와 동일하게 host 기반, 실제 도메인/SSL 전환 후에는 해당 도메인 + https).
+즉 8단계와 마찬가지로 서버에 뭔가를 미리 설치해둘 필요가 없고(최초 Docker/Compose/cron 설치 제외), 로컬에서 스크립트 한 줄로 서버 쪽 상태가 전부 갱신된다. 완료 후 접속 주소는 `http://app.<VM_PUBLIC_IP>.nip.io`다(k3s 경로와 동일하게 host 기반, 실제 도메인/SSL 전환 후에는 해당 도메인 + https).
+
+**롤백하려면**: GitHub → Packages에서 직전 정상 커밋의 `sha-xxxxxxx` 태그를 확인해 `.env.prod`의 `IMAGE_TAG`에 채우고 스크립트를 재실행하면 그 시점 이미지로 돌아간다(기본값은 `latest`). DB 마이그레이션까지 자동으로 되돌아가진 않으므로, 롤백 대상 이후 스키마 변경이 있었다면 별도 `alembic downgrade`가 필요할 수 있다.
+
+**DB 백업**: `scripts/backup-db.sh`가 매일 03:00 `pg_dump` 결과를 `~/react-python-deploy/backups/`에 gzip으로 저장하고 7일 지난 파일은 자동 삭제한다. VM 로컬 디스크 안에서의 최소 백업이라 VM 자체가 사라지는 재해까지는 대비하지 못한다 — 그 이상을 원하면 오브젝트 스토리지 업로드를 추가로 고려할 것.
+
+**모니터링(선택)**: 코드 추가 없이, UptimeRobot·healthchecks.io 같은 무료 외부 서비스에 `http://<도메인>/api/v1/items`를 주기적으로 호출하도록 등록해두면 컨테이너가 죽었을 때 이메일/슬랙 알림을 받을 수 있다.
 
 **나중에 이 VM에 다른 앱(예: Spring Boot)을 추가로 올리려면**: `docker-compose.prod.yml`에 서비스 블록 하나 추가 + `nginx-proxy/conf.d/`에 `server_name <이름>.__APP_DOMAIN__`로 그 서비스에 프록시하는 conf 파일 하나만 추가하면 된다. 기존 `app.conf`/`frontend`/`backend`는 전혀 건드릴 필요가 없다 — 공유 `nginx` 서비스가 Host 헤더를 보고 어느 앱으로 보낼지 알아서 나눠주기 때문이다.
 

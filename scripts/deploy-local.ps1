@@ -1,4 +1,4 @@
-# Build the app images and deploy them to a local minikube cluster.
+﻿# Build the app images and deploy them to a local minikube cluster.
 # Prereqs: `minikube start` and `minikube addons enable ingress` already run.
 $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..")

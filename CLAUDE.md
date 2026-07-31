@@ -37,6 +37,7 @@ frontend/   React + TS + Vite, Vitest
 k8s/        Kustomize 매니페스트 (base/ + overlays/dev, prod/)
 .github/workflows/  ci.yml, cd.yml
 scripts/    minikube 배포(deploy-local) + 클라우드 VM 배포(provision-vm, deploy-prod, deploy-prod-compose) 스크립트 (.sh / .ps1)
+            + backup-db.sh (docker-compose 운영 배포 시 VM에 전송되어 cron으로 매일 실행되는 DB 백업)
 docker-compose.yml       로컬 통합 개발 환경
 docker-compose.prod.yml  운영 배포용 (k3s 없이 Docker/Compose만 있는 서버, GHCR 이미지 pull-only)
 nginx-proxy/conf.d/      docker-compose 운영 배포의 공유 리버스 프록시 설정 (앱별 server 블록, 이미지 재빌드 없이 마운트)
@@ -143,6 +144,12 @@ k3s/kubernetes를 설치할 수 없거나 원하지 않는, Docker + Compose 플
 4. `./scripts/deploy-prod-compose.sh <user>@<VM_PUBLIC_IP>`를 다시 실행 — `.env.prod`에 SSL 파일이 있으면 스크립트가 자동으로 함께 전송하고 `chmod 600` 처리한다.
 
 `docker-compose.prod.yml`의 `nginx` 서비스는 이미 443 포트 노출 + `nginx-proxy/ssl` 볼륨 마운트가 되어 있으므로(인증서가 없어도 무해함), 이 전환 시 `docker-compose.prod.yml`은 건드릴 필요가 없다.
+
+**롤백하려면**: `docker-compose.prod.yml`의 backend/frontend 이미지는 `:${IMAGE_TAG:-latest}`를 참조한다. 배포 직후 문제가 생기면 GitHub → Packages → `react-python-backend`/`react-python-frontend`에서 직전 정상 커밋의 `sha-xxxxxxx` 태그를 확인해 `.env.prod`의 `IMAGE_TAG`에 채우고 `deploy-prod-compose.sh`를 재실행하면 그 시점 이미지로 즉시 되돌아간다. 단, 이건 애플리케이션 코드만 롤백할 뿐 DB 마이그레이션까지 자동으로 되돌리지 않는다 — 롤백 대상 이후에 스키마 변경이 있었다면 별도로 `alembic downgrade`가 필요할 수 있다.
+
+**DB 백업**: 배포할 때마다 `scripts/backup-db.sh`가 VM에 전송되고, 매일 03:00에 `pg_dump` 결과를 `react-python-deploy/backups/`에 gzip으로 저장하도록 crontab에 자동 등록/갱신된다(7일 지난 백업은 자동 삭제). 이건 VM 로컬 디스크 안에서의 최소한의 백업이라 VM 자체가 사라지는 재해까지는 대비하지 못한다 — 그 수준까지 필요하면 이 스크립트에 오브젝트 스토리지(S3 등) 업로드 단계를 추가로 붙이는 걸 고려할 것(클라우드 제공자마다 방식이 달라 기본 구현에는 포함하지 않았다).
+
+**모니터링(선택)**: 코드 변경 없이, UptimeRobot·healthchecks.io 같은 무료 외부 서비스에 `http://<도메인>/api/v1/items`(또는 백엔드의 `/health`, `/health/ready`)를 주기적으로 호출하도록 등록해두면 컨테이너가 죽었을 때(예: `restart: unless-stopped`가 반복 재시작 중이어도) 이메일/슬랙 등으로 알림을 받을 수 있다.
 
 ## 아키텍처
 

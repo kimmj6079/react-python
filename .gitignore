@@ -10,8 +10,6 @@ __pycache__/
 node_modules/
 frontend/dist/
 frontend/.vite/
-chatbot/frontend/.env.local
-chatbot/frontend/.next/
 
 # --- Env files (never commit real secrets) ---
 .env

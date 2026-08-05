@@ -49,6 +49,20 @@ k3s/kubernetes를 설치할 수 없거나 원하지 않는, Docker + Compose 플
 2. GHCR 패키지(`react-python-backend`/`react-python-frontend`) 접근 방식 결정 — 둘 중 하나:
    - **Public 전환** (k3s 경로와 동일): GitHub → Packages에서 두 패키지를 Public으로. 별도 인증 불필요.
    - **Private 유지**: 저장소/패키지를 private로 둔 채로 가려면, `.env.prod`의 `GHCR_USERNAME`/`GHCR_TOKEN`(read:packages 권한만 있는 PAT)을 채운다. `deploy-prod-compose.sh`/`.ps1`가 pull 직전에 VM에서 `docker login ghcr.io`를 자동 실행해준다(PAT은 SSH stdin으로만 전달되고, 원격에 저장되는 `.env.prod`는 `chmod 600`으로 보호됨).
+
+   **`GHCR_USERNAME`/`GHCR_TOKEN` 발급 방법** (이 저장소에서는 이미 `.env.prod.example`에 주석으로도 적혀 있다):
+   - `GHCR_USERNAME`: 표시 이름/이메일이 아니라 GitHub **로그인 계정명**(아이디) 그대로.
+   - `GHCR_TOKEN`: GitHub Personal Access Token — 반드시 **"Tokens (classic)"**(Fine-grained 아님, GHCR 로그인은 classic PAT 기준으로만 지원됨).
+     1. GitHub 우측 상단 프로필 → **Settings** → **Developer settings** → **Personal access tokens** → **Tokens (classic)**
+     2. **Generate new token** → **Generate new token (classic)**
+     3. Note에 용도 기입(예: `react-python-ghcr-pull`), Expiration은 무기한 대신 기간을 정해서 설정(만료되면 재발급 후 `.env.prod`에 값 갱신 필요)
+     4. **Select scopes**에서 `read:packages` 딱 하나만 체크 (`write:packages`/`delete:packages`/`repo` 등은 불필요 — 최소 권한 원칙)
+     5. **Generate token** 클릭 → 화면에 표시되는 `ghp_`로 시작하는 값은 이때 한 번만 보이므로(재조회 불가) 바로 복사해서 `.env.prod`의 `GHCR_TOKEN`에 붙여넣을 것
+   - 채우고 나서 VM에 배포하기 전에 로컬에서 토큰이 유효한지 미리 확인하려면:
+     ```bash
+     echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
+     ```
+   - 토큰이 만료/폐기되면 `deploy-prod-compose.sh`의 `docker login` 단계에서 실패한다 — 위 1~5 절차로 재발급 후 `.env.prod`의 `GHCR_TOKEN`만 갱신하고 스크립트를 다시 실행하면 된다.
 3. `cp .env.prod.example .env.prod` 후 실제 강한 값으로 수정(로컬, gitignore됨).
 
 이후 반복 배포(코드 변경 → `main` 푸시로 CI가 GHCR에 새 `:latest` 푸시 후):
@@ -93,7 +107,7 @@ k3s/kubernetes를 설치할 수 없거나 원하지 않는, Docker + Compose 플
 
 - 방화벽/보안그룹에 인바운드 22(SSH), 80(HTTP) 허용 — SSL을 쓸 계획이면 443도 함께 (AWS는 보안 그룹, GCP는 방화벽 규칙, 오라클 클라우드는 시큐리티 리스트로 이름이 다르지만 개념은 동일)
 - 해당 VM에 SSH로 접속 가능한 키 페어/계정 준비
-- GHCR 패키지(`react-python-backend`/`react-python-frontend`) 접근 방식 결정 — **Public 전환**(권장, GitHub → Packages에서 설정, 별도 인증 불필요) 또는 **Private 유지**(`.env.prod`의 `GHCR_USERNAME`/`GHCR_TOKEN`에 `read:packages` 권한만 있는 PAT 채움)
+- GHCR 패키지(`react-python-backend`/`react-python-frontend`) 접근 방식 결정 — **Public 전환**(권장, GitHub → Packages에서 설정, 별도 인증 불필요) 또는 **Private 유지**(`.env.prod`의 `GHCR_USERNAME`/`GHCR_TOKEN`에 `read:packages` 권한만 있는 PAT 채움 — 발급 방법은 위 "Docker Compose (클라우드 VM, k3s 없이 실제 배포)" 절 참고)
 
 #### 3단계 — 로컬에서 미리 준비할 파일
 

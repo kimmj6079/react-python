@@ -1,6 +1,6 @@
 # react-python
 
-FastAPI + React(TypeScript/Vite) + PostgreSQL 풀스택 스터디 프로젝트. 개발 → 테스트 → Docker → Kubernetes → CI/CD까지 실무 흐름을 학습한다. 전체 아키텍처와 명령어 레퍼런스는 [CLAUDE.md](./CLAUDE.md) 참고.
+FastAPI + React(TypeScript/Vite) + PostgreSQL 풀스택 스터디 프로젝트. 개발 → 테스트 → Docker → Kubernetes → CI/CD까지 실무 흐름을 학습한다. 로컬 아키텍처와 명령어 레퍼런스는 [CLAUDE.md](./CLAUDE.md), 클라우드 VM 배포/CI/CD 상세는 [DEPLOYMENT.md](./DEPLOYMENT.md) 참고.
 
 ------------------------------------------------------------------------------------------------------------------------
 
@@ -29,7 +29,7 @@ FastAPI + React(TypeScript/Vite) + PostgreSQL 풀스택 스터디 프로젝트. 
 | **8. 클라우드 VM 실배포** (k3s) | 최초 1회 프로비저닝 후 반복 배포 | `./scripts/provision-vm.sh`(최초) → `secret.yaml` 실값 준비 → `./scripts/deploy-prod.sh` |
 | **8-B. 클라우드 VM 실배포** (docker-compose, k3s 불필요) | Docker + Compose만 설치된 서버용 대안 경로 | `.env.prod` 실값 준비 → `./scripts/deploy-prod-compose.sh` |
 
-8단계는 k3s가 설치된 서버용, 8-B는 Docker/Compose만 있는 서버용 대안 경로다 — 서버 환경에 맞는 쪽 하나만 쓰면 된다. 배포 완료 후 접속: 두 경로 모두 `http://app.<VM_PUBLIC_IP>.nip.io`. 운영 단계 상세는 [CLAUDE.md](./CLAUDE.md)의 "CI/CD", "Kubernetes (클라우드 VM, k3s 실제 배포)", "Docker Compose (클라우드 VM, k3s 없이 실제 배포)" 절 참고.
+8단계는 k3s가 설치된 서버용, 8-B는 Docker/Compose만 있는 서버용 대안 경로다 — 서버 환경에 맞는 쪽 하나만 쓰면 된다. 배포 완료 후 접속: 두 경로 모두 `http://app.<VM_PUBLIC_IP>.nip.io`. 운영 단계 상세는 [DEPLOYMENT.md](./DEPLOYMENT.md)의 "CI/CD", "Kubernetes (클라우드 VM, k3s 실제 배포)", "Docker Compose (클라우드 VM, k3s 없이 실제 배포)" 절 참고.
 
 ------------------------------------------------------------------------------------------------------------------------
 
@@ -373,4 +373,4 @@ docker compose down -v
 
 ## 더 알아보기
 
-- 테스트/린트/빌드, Docker 이미지 빌드, Kubernetes 배포, CI/CD 구조는 [CLAUDE.md](./CLAUDE.md)에 정리되어 있다.
+- 테스트/린트/빌드, Docker 이미지 빌드는 [CLAUDE.md](./CLAUDE.md), Kubernetes/docker-compose 클라우드 배포와 CI/CD 구조는 [DEPLOYMENT.md](./DEPLOYMENT.md)에 정리되어 있다.

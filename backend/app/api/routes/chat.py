@@ -2,7 +2,7 @@
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import text
 
-from app.api.deps import DbSession
+# from app.api.deps import DbSession
 
 router = APIRouter(tags=["chat"])
 

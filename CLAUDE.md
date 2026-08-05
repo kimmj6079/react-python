@@ -2,9 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+------------------------------------------------------------------------------------------------------------------------
+
 ## 프로젝트 개요
 
 FastAPI(백엔드) + React/TypeScript/Vite(프론트엔드) + PostgreSQL 풀스택 스터디 프로젝트. 로컬 개발 → 테스트 → Docker → Kubernetes(minikube/kind) → GitHub Actions CI/CD까지 실무 표준에 가까운 흐름을 학습하는 것이 목적이다. 예제 도메인은 간단한 `items` CRUD 하나뿐이다.
+
+------------------------------------------------------------------------------------------------------------------------
 
 ## 전체 흐름 한눈에 보기
 
@@ -17,6 +21,8 @@ FastAPI(백엔드) + React/TypeScript/Vite(프론트엔드) + PostgreSQL 풀스�
 | **3. docker-compose 통합 검증** | 전체를 컨테이너로 한 번에 띄워 확인 | `docker compose up --build` |
 | **4. k8s 로컬 배포** (minikube/kind) | 로컬 쿠버네티스에 배포해보기 | `minikube start` → `secret.yaml` 준비 → `./scripts/deploy-local.sh` |
 
+------------------------------------------------------------------------------------------------------------------------
+
 ### 운영 (CI/CD → 클라우드 VM 배포)
 
 | 단계 | 무엇을 하는가 | 실행 명령 |
@@ -28,6 +34,8 @@ FastAPI(백엔드) + React/TypeScript/Vite(프론트엔드) + PostgreSQL 풀스�
 | **8-B. 클라우드 VM 실배포** (docker-compose, k3s 불필요) | Docker + Compose만 설치된 서버용 대안 경로 | `.env.prod` 실값 준비 → `./scripts/deploy-prod-compose.sh` |
 
 8단계는 k3s 기반, 8-B는 Docker/Compose만 설치된 서버를 위한 대안 경로다 — 둘 중 서버 환경에 맞는 쪽 하나만 쓰면 된다. 배포 완료 후 접속: k3s 경로는 `http://app.<VM_PUBLIC_IP>.nip.io`, docker-compose 경로는 `http://<VM_PUBLIC_IP>`. 각 단계의 상세 명령어는 아래 "자주 쓰는 명령어" 절 참고.
+
+------------------------------------------------------------------------------------------------------------------------
 
 ## 저장소 구조
 
@@ -43,6 +51,8 @@ docker-compose.prod.yml  운영 배포용 (k3s 없이 Docker/Compose만 있는 �
 nginx-proxy/conf.d/      docker-compose 운영 배포의 공유 리버스 프록시 설정 (앱별 server 블록, 이미지 재빌드 없이 마운트)
 nginx-proxy/ssl/         SSL 인증서/개인키 배치 위치 (실제 파일은 gitignore, README.md만 커밋됨)
 ```
+
+------------------------------------------------------------------------------------------------------------------------
 
 ## 자주 쓰는 명령어
 
@@ -64,6 +74,8 @@ uv run alembic check                             # 모델과 마이그레이션 
 
 pytest는 SQLite 인메모리 DB로 `get_db`를 오버라이드해서 돈다(`tests/conftest.py`). 실제 Postgres 연동 확인은 `docker compose up -d db` 등으로 별도로 한다.
 
+------------------------------------------------------------------------------------------------------------------------
+
 ### 프론트엔드 (`frontend/`)
 
 ```bash
@@ -75,6 +87,8 @@ npm run build       # tsc -b && vite build
 npm run format      # prettier --write .
 ```
 
+------------------------------------------------------------------------------------------------------------------------
+
 ### 로컬 통합 (docker-compose)
 
 ```bash
@@ -82,6 +96,8 @@ docker compose up --build                         # db+backend+frontend 동시 �
 docker compose run --rm backend alembic upgrade head   # 마이그레이션은 자동 실행되지 않음, 수동 적용
 docker compose down -v                             # 컨테이너+볼륨 정리
 ```
+
+------------------------------------------------------------------------------------------------------------------------
 
 ### Kubernetes (로컬 minikube/kind 기준)
 
@@ -100,6 +116,8 @@ kubectl delete job/migrate -n study-app --ignore-not-found
 kubectl apply -f k8s/base/migrate-job.yaml
 ```
 
+------------------------------------------------------------------------------------------------------------------------
+
 ### Kubernetes (클라우드 VM, k3s 실제 배포)
 
 SSH로 접속 가능한 공인 IP를 가진 VM에 k3s를 직접 설치해 배포한다. TLS/도메인 없이 IP + nip.io로 시작하는 범위이며, GitHub Actions가 자동으로 원격 배포하지는 않는다(수동 스크립트).
@@ -115,6 +133,8 @@ SSH로 접속 가능한 공인 IP를 가진 VM에 k3s를 직접 설치해 배포
 ./scripts/deploy-prod.sh <user>@<VM_PUBLIC_IP>   # 또는 deploy-prod.ps1 (Windows)
 ```
 `k8s/overlays/prod`(base 상속, ingress host/CORS만 VM IP로 patch)를 로컬에서 `kubectl kustomize`로 렌더링해 SSH 파이프로 원격 `kubectl apply -f -`에 전달한다. `:latest` + `imagePullPolicy: IfNotPresent` 조합은 레지스트리 pull 환경에서 재배포해도 새 이미지를 받아오지 않으므로, 배포 시점에 `imagePullPolicy: Always`로 치환하고 `kubectl rollout restart`로 최신 이미지 수신을 강제한다. 완료 후 `http://app.<VM_PUBLIC_IP>.nip.io`로 접속.
+
+------------------------------------------------------------------------------------------------------------------------
 
 ### Docker Compose (클라우드 VM, k3s 없이 실제 배포)
 
@@ -151,6 +171,8 @@ k3s/kubernetes를 설치할 수 없거나 원하지 않는, Docker + Compose 플
 
 **모니터링(선택)**: 코드 변경 없이, UptimeRobot·healthchecks.io 같은 무료 외부 서비스에 `http://<도메인>/api/v1/items`(또는 백엔드의 `/health`, `/health/ready`)를 주기적으로 호출하도록 등록해두면 컨테이너가 죽었을 때(예: `restart: unless-stopped`가 반복 재시작 중이어도) 이메일/슬랙 등으로 알림을 받을 수 있다.
 
+------------------------------------------------------------------------------------------------------------------------
+
 ## 아키텍처
 
 **요청 흐름 (k8s 경로, Ingress 경유)**: 브라우저 → Ingress(dev: `app.127.0.0.1.nip.io`, 클라우드 VM 실배포: `app.<VM_PUBLIC_IP>.nip.io`) → `/` 경로는 frontend(nginx, 정적 빌드) / `/api` 경로는 backend(FastAPI) → Postgres(StatefulSet).
@@ -171,6 +193,8 @@ k3s/kubernetes를 설치할 수 없거나 원하지 않는, Docker + Compose 플
 **Alembic ↔ FastAPI 설정 단일 소스**: `alembic/env.py`가 `alembic.ini`의 `sqlalchemy.url`을 무시하고 `app.core.config.settings.database_url`로 덮어쓴다. DB 연결 문자열은 `Settings`(환경변수/`.env`) 한 곳에서만 관리한다.
 
 **uv 기본 editable install**: `uv sync`는 프로젝트 자체를 editable로 설치한다. 그래서 `docker-compose.yml`의 backend 서비스가 `./backend/app:/app/app`을 바인드 마운트하면 컨테이너 안 venv가 그 소스를 그대로 바라봐서 `--reload`가 동작한다. Dockerfile을 바꿔서 non-editable 설치로 바꾸면 이 핫리로드가 깨진다.
+
+------------------------------------------------------------------------------------------------------------------------
 
 ## CI/CD
 

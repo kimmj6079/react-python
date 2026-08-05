@@ -2,6 +2,8 @@
 
 FastAPI + React(TypeScript/Vite) + PostgreSQL 풀스택 스터디 프로젝트. 개발 → 테스트 → Docker → Kubernetes → CI/CD까지 실무 흐름을 학습한다. 전체 아키텍처와 명령어 레퍼런스는 [CLAUDE.md](./CLAUDE.md) 참고.
 
+------------------------------------------------------------------------------------------------------------------------
+
 ## 전체 흐름 한눈에 보기
 
 ### 로컬 (개발 · 검증)
@@ -15,6 +17,8 @@ FastAPI + React(TypeScript/Vite) + PostgreSQL 풀스택 스터디 프로젝트. 
 
 로컬 단계는 이 문서 아래 "사전 준비"~"로컬 개발 시작하기"에서 자세히 다룬다.
 
+------------------------------------------------------------------------------------------------------------------------
+
 ### 운영 (CI/CD → 클라우드 VM 배포)
 
 | 단계 | 무엇을 하는가 | 실행 명령 |
@@ -26,6 +30,8 @@ FastAPI + React(TypeScript/Vite) + PostgreSQL 풀스택 스터디 프로젝트. 
 | **8-B. 클라우드 VM 실배포** (docker-compose, k3s 불필요) | Docker + Compose만 설치된 서버용 대안 경로 | `.env.prod` 실값 준비 → `./scripts/deploy-prod-compose.sh` |
 
 8단계는 k3s가 설치된 서버용, 8-B는 Docker/Compose만 있는 서버용 대안 경로다 — 서버 환경에 맞는 쪽 하나만 쓰면 된다. 배포 완료 후 접속: 두 경로 모두 `http://app.<VM_PUBLIC_IP>.nip.io`. 운영 단계 상세는 [CLAUDE.md](./CLAUDE.md)의 "CI/CD", "Kubernetes (클라우드 VM, k3s 실제 배포)", "Docker Compose (클라우드 VM, k3s 없이 실제 배포)" 절 참고.
+
+------------------------------------------------------------------------------------------------------------------------
 
 ### 8단계 상세: 클라우드 VM(서버)에서 실제로 처리되는 일
 
@@ -50,6 +56,8 @@ FastAPI + React(TypeScript/Vite) + PostgreSQL 풀스택 스터디 프로젝트. 
 5. `ingress-nginx`가 80번 포트로 들어오는 실제 요청을 backend/frontend Service로 라우팅하기 시작
 
 즉 서버에 직접 뭔가를 설치하거나 파일을 복사해두는 작업은 사실상 없고(2번 섹션의 최초 프로비저닝 제외), 이후로는 로컬에서 스크립트 한 줄 실행하는 것으로 서버 쪽 상태가 전부 갱신된다.
+
+------------------------------------------------------------------------------------------------------------------------
 
 ### 8-B단계 상세: k3s 없이 docker-compose로 배포할 때 서버 안에서 벌어지는 일
 
@@ -92,6 +100,55 @@ FastAPI + React(TypeScript/Vite) + PostgreSQL 풀스택 스터디 프로젝트. 
 3. `nginx-proxy/conf.d/app.conf`를 열어 지금 활성 상태인 "HTTP" 블록을 지우거나 주석 처리하고, 이미 파일 안에 준비된 "HTTP → HTTPS 리다이렉트"와 "HTTPS" 두 블록의 주석을 해제한다.
 4. `deploy-prod-compose.sh`(또는 `.ps1`)를 다시 실행하면 SSL 파일과 새 설정이 함께 반영된다. `docker-compose.prod.yml`의 `nginx` 서비스는 이미 443 포트 + `nginx-proxy/ssl` 마운트가 준비돼 있어(인증서가 없어도 무해) 이 파일은 따로 안 건드려도 된다.
 
+------------------------------------------------------------------------------------------------------------------------
+
+### 8 / 8-B단계 참고: 서버 업로드 파일 · 실행 명령 요약
+
+평소에는 `deploy-prod.sh` / `deploy-prod-compose.sh` 실행 한 줄이면 충분하다. 아래는 그 스크립트가 내부적으로 하는 일을 수동 절차로 풀어쓴 것으로, 스크립트 없이 재현하거나 실패 원인을 파악할 때만 참고하면 된다.
+
+**8-B (docker-compose) 경로**
+
+로컬에서 미리 준비:
+- `.env.prod` — `cp .env.prod.example .env.prod` 후 실제 값 채움
+- `nginx-proxy/ssl/*.pem` — SSL 쓸 때만
+
+서버 `~/react-python-deploy/`로 업로드되는 파일:
+- `docker-compose.prod.yml`
+- `.env.prod` (업로드 후 `chmod 600`)
+- `backup-db.sh` (`scripts/backup-db.sh`, 업로드 후 `chmod +x`)
+- `nginx-proxy/conf.d/*.conf` (`__APP_DOMAIN__`을 실제 도메인으로 치환한 버전)
+- `nginx-proxy/ssl/*.pem` (있을 때만)
+
+서버에서 실행하는 명령:
+```bash
+cd react-python-deploy
+docker login ghcr.io -u <GHCR_USERNAME>   # private 패키지일 때만, PAT을 비밀번호로 입력
+docker compose -f docker-compose.prod.yml --env-file .env.prod pull
+docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+docker compose -f docker-compose.prod.yml --env-file .env.prod run --rm backend alembic upgrade head
+curl -sf http://localhost/ && curl -sf http://localhost/api/v1/items   # 헬스체크
+```
+앱 소스 코드는 업로드하지 않는다 — backend/frontend는 GHCR에서 `pull`한 이미지를 그대로 쓴다.
+
+**8 (k3s) 경로**
+
+파일 업로드 자체가 없다 — 로컬에서 렌더링한 매니페스트를 SSH 파이프로 서버의 `kubectl apply -f -`에 그대로 흘려보낸다.
+
+로컬에서 미리 준비: `k8s/base/secret.yaml` (`cp k8s/base/secret.yaml.example k8s/base/secret.yaml` 후 실제 값)
+
+서버에서 실행하는 명령:
+```bash
+kubectl apply -f -                          # 파이프로 전달된 렌더링 매니페스트
+kubectl rollout restart deployment/backend deployment/frontend -n study-app
+kubectl rollout status deployment/backend -n study-app --timeout=120s
+kubectl rollout status deployment/frontend -n study-app --timeout=120s
+kubectl delete job/migrate -n study-app --ignore-not-found
+kubectl apply -f -                          # 파이프로 전달된 migrate-job.yaml
+kubectl wait --for=condition=complete job/migrate -n study-app --timeout=120s
+```
+
+------------------------------------------------------------------------------------------------------------------------
+
 ## 사전 준비 (초기 셋팅)
 
 ### 1) 저장소 클론
@@ -100,6 +157,8 @@ FastAPI + React(TypeScript/Vite) + PostgreSQL 풀스택 스터디 프로젝트. 
 git clone https://github.com/kimmj6079/react-python.git
 cd react-python
 ```
+
+------------------------------------------------------------------------------------------------------------------------
 
 ### 2) 필요한 프로그램 설치
 
@@ -120,6 +179,8 @@ node --version       # 로컬 프로세스로 프론트엔드 돌릴 경우
 npm --version
 ```
 
+------------------------------------------------------------------------------------------------------------------------
+
 ### 3) 환경변수 파일 준비 (로컬 프로세스로 실행할 경우만 필요)
 
 Docker로만 실행할 거면 이 단계는 건너뛰어도 된다 (`docker-compose.yml`에 필요한 값이 이미 다 들어있음). `uv run`/`npm run dev`로 직접 띄울 거면 각 폴더의 예시 파일을 복사해서 실제 설정 파일을 만들어야 한다:
@@ -130,6 +191,8 @@ cp frontend/.env.example frontend/.env
 ```
 
 `.env`는 사람/환경마다 값이 다를 수 있어서 `.gitignore`에 등록돼 있고, 저장소에는 `.env.example`(템플릿)만 커밋된다. 기본값 그대로도 아래 "로컬 개발 시작하기" 흐름과 맞게 세팅돼 있어 값을 바꾸지 않아도 동작한다.
+
+------------------------------------------------------------------------------------------------------------------------
 
 ## 로컬 개발 시작하기
 
@@ -146,6 +209,8 @@ docker compose up -d db
 - 최초 실행 시 `postgres:16-alpine` 이미지를 도커 허브에서 내려받기 때문에 몇 초~몇십 초 걸릴 수 있다. 이후에는 캐시돼서 빠르다.
 - 데이터는 `docker-compose.yml`에 정의된 볼륨(`db-data`)에 저장되므로, 컨테이너를 껐다 켜도 데이터는 유지된다. (완전히 지우려면 뒤에서 나오는 `docker compose down -v`)
 
+------------------------------------------------------------------------------------------------------------------------
+
 ### 2) 백엔드 (터미널 1)
 
 ```bash
@@ -160,6 +225,8 @@ uv run uvicorn app.main:app --reload      # http://localhost:8000
 - `cp .env.example .env`: `.env.example`은 "이런 환경변수가 필요하다"는 템플릿이고, `.env`는 실제로 앱이 읽는 파일이다. `.env`는 `.gitignore`에 등록돼 있어 깃에 올라가지 않는다(사람마다 DB 접속정보가 다를 수 있으므로). 지금은 기본값(`postgresql+psycopg://postgres:postgres@localhost:5432/app`)이 `docker compose up -d db`로 띄운 DB와 그대로 맞으므로 값을 안 바꿔도 동작한다.
 - `uv run alembic upgrade head`: Alembic은 DB 스키마 버전 관리 도구다(코드로 치면 git과 비슷하게, DB 테이블 구조 변경 이력을 `backend/alembic/versions/`에 순서대로 기록해둔다). "head"는 "가장 최신 버전까지 적용해라"는 뜻이다. 이 명령을 실행해야 `items` 테이블이 실제로 DB에 생성된다 — 안 하면 백엔드는 뜨지만 API 호출 시 "테이블이 없다"는 에러가 난다.
 - `uv run uvicorn app.main:app --reload`: `uvicorn`은 FastAPI 앱을 실제로 구동하는 ASGI 서버다. `app.main:app`은 "`app/main.py` 파일 안의 `app`이라는 변수(FastAPI 인스턴스)를 실행해라"는 의미. `--reload`는 코드를 수정하고 저장할 때마다 서버가 자동으로 재시작되게 해주는 개발용 옵션이다(운영 배포 시에는 끈다). 뜨고 나면 `http://localhost:8000/health`로 정상 기동을 확인할 수 있고, `http://localhost:8000/docs`에서 자동 생성된 Swagger API 문서도 볼 수 있다.
+
+------------------------------------------------------------------------------------------------------------------------
 
 ### 3) 프론트엔드 (터미널 2)
 
@@ -176,6 +243,8 @@ npm run dev                               # http://localhost:5173
 
 브라우저에서 `http://localhost:5173`을 열면 프론트엔드가 `http://localhost:8000`의 백엔드 API를 호출한다. 이때 백엔드가 `http://localhost:5173`을 CORS 허용 목록(`backend/app/core/config.py`의 `backend_cors_origins`)에 넣어뒀기 때문에 브라우저가 이 요청을 차단하지 않는다 — 만약 프론트 포트를 바꾸면 이 값도 같이 바꿔야 한다.
 
+------------------------------------------------------------------------------------------------------------------------
+
 ### 한 번에 띄우기 (docker-compose)
 
 위 과정을 개별 실행하는 대신 전체를 컨테이너로 띄울 수도 있다:
@@ -187,6 +256,8 @@ docker compose run --rm backend alembic upgrade head   # 최초 1회 / 마이그
 
 - 프론트: http://localhost:5173
 - 백엔드: http://localhost:8000
+
+------------------------------------------------------------------------------------------------------------------------
 
 ### 백그라운드로 한 번에 띄우기
 
@@ -231,6 +302,8 @@ docker compose up -d db
 ```
 - 로그 보기: `tail -f backend.log` / `tail -f frontend.log`
 - 종료: `lsof -ti:8000 -sTCP:LISTEN | xargs -r kill` / `lsof -ti:5173 -sTCP:LISTEN | xargs -r kill`
+
+------------------------------------------------------------------------------------------------------------------------
 
 ### Visual Studio 사용 시
 
@@ -288,11 +361,15 @@ npm run dev
   Get-NetTCPConnection -LocalPort 5173 | Select-Object -ExpandProperty OwningProcess | ForEach-Object { Stop-Process -Id $_ -Force }   # 프론트엔드(5173)
   ```
 
+------------------------------------------------------------------------------------------------------------------------
+
 ### 정리
 
 ```bash
 docker compose down -v
 ```
+
+------------------------------------------------------------------------------------------------------------------------
 
 ## 더 알아보기
 

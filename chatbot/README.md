@@ -76,6 +76,17 @@ frontend/
 `fetch`로 호출해 렌더링.
 **검증**: `curl localhost:8000/api/v1/chat/health`, 브라우저에서 탭 전환 후 렌더링 확인.
 
+**체크리스트 (완료)**:
+- [x] `backend/app/api/routes/chat.py`에 `GET /chat/health -> {"status": "ok"}` placeholder 라우터 작성
+  (health.py의 liveness/readiness probe를 그대로 복붙하지 않도록 주의 — DB 체크 불필요)
+- [x] `backend/app/main.py`에 `chat.router` 등록 (`items`와 동일하게 `settings.api_v1_prefix` 사용)
+- [x] `frontend/src/App.tsx`에 `view: 'items' | 'chat'` 상태 + 탭 버튼 2개 추가, 조건부 렌더링으로 전환
+  (JSX 안 주석은 `//`가 아니라 `{/* ... */}`로 써야 함 — 안 그러면 화면에 그대로 텍스트로 렌더링됨)
+- [x] `frontend/src/components/chat/Chat.tsx` 작성 (`useEffect`로 placeholder fetch, `export function Chat()`
+  named export — `App.tsx`가 named import로 가져다 씀)
+- [x] `frontend/src/api/client.ts`에 `getChatHealth()` 추가 (`request()` 헬퍼 재사용)
+- [x] 검증: `http://localhost:8000/api/v1/chat/health` 200 확인 + 브라우저에서 탭 전환/렌더링 확인
+
 ### M1 — 단순 LLM 대화 (LangGraph 없이, Vercel AI SDK 스트리밍)
 FastAPI가 LLM을 직접 호출해 SSE로 스트리밍, 프론트는 `ai`/`@ai-sdk/react`의 `useChat`으로 수신.
 **핵심 함정**: Vercel AI SDK의 스트림 프로토콜(헤더 이름, 청크 타입)은 SDK 메이저 버전마다 바뀌어왔다 — 문서를
@@ -85,6 +96,17 @@ FastAPI가 LLM을 직접 호출해 SSE로 스트리밍, 프론트는 `ai`/`@ai-s
 **여기서 같이 결정할 것**: pytest에서 이 엔드포인트를 어떻게 테스트할지(LLM 클라이언트를 fixture로 목킹).
 **검증**: `curl -N`으로 원시 SSE 라인 확인, 브라우저에서 실시간 토큰 렌더링, DevTools "EventStream" 탭에서
 청크 순서 확인.
+
+**체크리스트 (진행 중)**:
+- [x] LLM 프로바이더 결정: **Anthropic (Claude)**
+- [ ] console.anthropic.com에서 API 키 발급
+- [ ] `backend`에서 `uv add anthropic`
+- [ ] `backend/app/core/config.py`의 `Settings`에 `anthropic_api_key: str = ""` 필드 추가
+- [ ] `backend/.env`(실값)·`backend/.env.example`(더미값)에 `ANTHROPIC_API_KEY=...` 추가
+- [ ] `app/api/routes/chat.py`의 엔드포인트를 실제 Claude 스트리밍 호출 + SSE 포맷으로 구현
+- [ ] pytest에서 LLM 호출 목킹 전략 설계
+- [ ] frontend에 `ai`, `@ai-sdk/react` 추가, `Chat.tsx`를 `useChat` 기반으로 교체
+- [ ] 검증: `curl -N`으로 SSE 라인 확인, 브라우저 실시간 렌더링, DevTools EventStream 청크 순서 확인
 
 ### M2 — LangGraph 도입 (단일 노드 → 멀티턴 메모리 → 도구/조건부 엣지)
 `StateGraph`를 직접 조립. `State(TypedDict)`에 `messages: Annotated[list, add_messages]`, 단일 노드
@@ -118,7 +140,7 @@ Sessions 뷰에서 세션 그룹핑 확인.
 (c) 작성된 코드 리뷰/디버깅 보조 역할을 한다. 코드 전문을 먼저 제공하지 않는다.
 
 ## 진행 현황
-- [ ] M0 — 배선 확인 (새 라우터 + 새 탭)
+- [x] M0 — 배선 확인 (새 라우터 + 새 탭)
 - [ ] M1 — 단순 LLM 대화 + 스트리밍 (+ 테스트 목킹 전략)
 - [ ] M2 — LangGraph 도입
 - [ ] M3 — Qdrant RAG

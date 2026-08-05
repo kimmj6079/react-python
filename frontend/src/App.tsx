@@ -5,9 +5,11 @@ import { createItem, listItems } from './api/client'
 import { ItemForm } from './components/ItemForm'
 import { ItemList } from './components/ItemList'
 import type { Item, ItemCreate } from './types/item'
+import { Chat } from './components/chat/Chat'
 import './App.css'
 
 function App() {
+  const [view, setView] = useState<'items' | 'chat'>('items')
   const [items, setItems] = useState<Item[]>([])
   const [error, setError] = useState<string | null>(null)
 
@@ -33,10 +35,23 @@ function App() {
 
   return (
     <main>
-      <h1>Items</h1>
-      {error ? <p role="alert">{error}</p> : null}
-      <ItemForm onSubmit={handleCreate} />
-      <ItemList items={items} />
+      <nav>
+        <button onClick={() => setView('items')}>Items</button>
+        <button onClick={() => setView('chat')}>Chat</button>
+      </nav>
+
+      {/* view 상태에 따라 다른 화면을 보여준다. (SPA)*/ }
+      {view === 'items' && (
+        <>
+          <h1>Items</h1>
+          {error ? <p role="alert">{error}</p> : null}
+          <ItemForm onSubmit={handleCreate} />
+          <ItemList items={items} />
+        </>
+      )}
+
+      {view === 'chat' && <Chat />}
+      
     </main>
   )
 }

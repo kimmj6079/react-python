@@ -31,3 +31,8 @@ export function createItem(item: ItemCreate): Promise<Item> {
     body: JSON.stringify(item),
   })
 }
+
+// GET /api/v1/chat/health : 채팅 서버 상태 확인
+export function getChatHealth(): Promise<{ status: string }> {
+  return request<{ status: string }>('/api/v1/chat/health')
+}

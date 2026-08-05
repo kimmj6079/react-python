@@ -2,7 +2,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import health, items
+from app.api.routes import chat, health, items
 from app.core.config import settings
 
 
@@ -23,6 +23,7 @@ def create_app() -> FastAPI:
     # 라우터 등록: health는 접두사 없이(/health), items는 /api/v1 접두사를 붙여(/api/v1/items) 노출.
     app.include_router(health.router)
     app.include_router(items.router, prefix=settings.api_v1_prefix)
+    app.include_router(chat.router, prefix=settings.api_v1_prefix)
 
     return app
 

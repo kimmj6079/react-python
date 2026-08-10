@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 FastAPI(백엔드) + React/TypeScript/Vite(프론트엔드) + PostgreSQL 풀스택 스터디 프로젝트. 로컬 개발 → 테스트 → Docker → Kubernetes(minikube/kind) → GitHub Actions CI/CD까지 실무 표준에 가까운 흐름을 학습하는 것이 목적이다. 예제 도메인은 간단한 `items` CRUD 하나뿐이다.
 
-클라우드 VM 실배포(k3s / docker-compose)와 CI/CD 파이프라인 상세는 이 파일이 아니라 [DEPLOYMENT.md](./DEPLOYMENT.md)에 정리되어 있다.
+새 PC 초기 설치 절차(OS별 설치 명령 · 검증 · 트러블슈팅 · Python 버전 고정)는 [SETUP.md](./SETUP.md)에, 클라우드 VM 실배포(k3s / docker-compose)와 CI/CD 파이프라인 상세는 [DEPLOYMENT.md](./DEPLOYMENT.md)에 정리되어 있다.
 
 ------------------------------------------------------------------------------------------------------------------------
 
@@ -18,7 +18,7 @@ FastAPI(백엔드) + React/TypeScript/Vite(프론트엔드) + PostgreSQL 풀스�
 
 | 단계 | 무엇을 하는가 | 실행 명령 |
 |---|---|---|
-| **1. 최초 셋팅** | 저장소 클론, 의존성 설치 | `git clone` → `uv sync` / `npm install` → `cp *.env.example *.env` |
+| **1. 최초 셋팅** ([SETUP.md](./SETUP.md)) | 저장소 클론, 의존성 설치 | `git clone` → `uv sync` / `npm install` → `cp *.env.example *.env` |
 | **2. 로컬 개발** (hot-reload) | DB → 백엔드 → 프론트 순서로 기동 | `docker compose up -d db` → `uv run uvicorn app.main:app --reload` / `npm run dev` |
 | **3. docker-compose 통합 검증** | 전체를 컨테이너로 한 번에 띄워 확인 | `docker compose up --build` |
 | **4. k8s 로컬 배포** (minikube/kind) | 로컬 쿠버네티스에 배포해보기 | `minikube start` → `secret.yaml` 준비 → `./scripts/deploy-local.sh` |
@@ -130,3 +130,5 @@ kubectl apply -f k8s/base/migrate-job.yaml
 **Alembic ↔ FastAPI 설정 단일 소스**: `alembic/env.py`가 `alembic.ini`의 `sqlalchemy.url`을 무시하고 `app.core.config.settings.database_url`로 덮어쓴다. DB 연결 문자열은 `Settings`(환경변수/`.env`) 한 곳에서만 관리한다.
 
 **uv 기본 editable install**: `uv sync`는 프로젝트 자체를 editable로 설치한다. 그래서 `docker-compose.yml`의 backend 서비스가 `./backend/app:/app/app`을 바인드 마운트하면 컨테이너 안 venv가 그 소스를 그대로 바라봐서 `--reload`가 동작한다. Dockerfile을 바꿔서 non-editable 설치로 바꾸면 이 핫리로드가 깨진다.
+
+**Python 버전은 두 파일에 이중으로 적혀 있고, 항상 같아야 한다**: `backend/.python-version`(현재 `3.14`, uv가 로컬/CI 가상환경을 만들 때 참조)과 `backend/Dockerfile`의 `FROM python:3.14-slim`(운영 이미지, builder·final 두 스테이지 모두). 버전을 올릴 때는 반드시 **양쪽을 함께** 바꾼다 — 한쪽만 바꾸면 CI가 검증한 인터프리터와 실제 배포되는 인터프리터가 달라진다. `pyproject.toml`의 `requires-python = ">=3.12"`는 별개 개념(의존성 해석용 하한선)이라 같이 올릴 필요 없다. `ci.yml`은 `backend/`에서 `uv sync --frozen`을 돌리므로 `.python-version`을 자동으로 따라간다 — 별도 설정 불필요. 배경 설명은 [SETUP.md](./SETUP.md)의 "Python 버전은 어떻게 정해지나" 절 참고.

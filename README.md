@@ -1,6 +1,6 @@
 # react-python
 
-FastAPI + React(TypeScript/Vite) + PostgreSQL 풀스택 스터디 프로젝트. 개발 → 테스트 → Docker → Kubernetes → CI/CD까지 실무 흐름을 학습한다. 로컬 아키텍처와 명령어 레퍼런스는 [CLAUDE.md](./CLAUDE.md), 클라우드 VM 배포/CI/CD 상세는 [DEPLOYMENT.md](./DEPLOYMENT.md) 참고.
+FastAPI + React(TypeScript/Vite) + PostgreSQL 풀스택 스터디 프로젝트. 개발 → 테스트 → Docker → Kubernetes → CI/CD까지 실무 흐름을 학습한다. 처음 설치하는 경우 [SETUP.md](./SETUP.md), 로컬 아키텍처와 명령어 레퍼런스는 [CLAUDE.md](./CLAUDE.md), 클라우드 VM 배포/CI/CD 상세는 [DEPLOYMENT.md](./DEPLOYMENT.md) 참고.
 
 ------------------------------------------------------------------------------------------------------------------------
 
@@ -15,7 +15,7 @@ FastAPI + React(TypeScript/Vite) + PostgreSQL 풀스택 스터디 프로젝트. 
 | **3. docker-compose 통합 검증** | 전체를 컨테이너로 한 번에 띄워 확인 | `docker compose up --build` |
 | **4. k8s 로컬 배포** (minikube/kind) | 로컬 쿠버네티스에 배포해보기 | `minikube start` → `secret.yaml` 준비 → `./scripts/deploy-local.sh` |
 
-로컬 단계는 이 문서 아래 "사전 준비"~"로컬 개발 시작하기"에서 자세히 다룬다.
+1단계(설치)는 [SETUP.md](./SETUP.md)에 OS별 명령·검증·트러블슈팅까지 정리돼 있다. 2~4단계는 이 문서 아래 "로컬 개발 시작하기"에서 다룬다.
 
 ------------------------------------------------------------------------------------------------------------------------
 
@@ -151,46 +151,35 @@ kubectl wait --for=condition=complete job/migrate -n study-app --timeout=120s
 
 ## 사전 준비 (초기 셋팅)
 
-### 1) 저장소 클론
+**아무것도 설치돼 있지 않은 PC에서 처음 세팅한다면 → [SETUP.md](./SETUP.md)** 를 따라간다. OS별 설치 명령, 설치 검증 체크리스트, 트러블슈팅까지 그쪽에 정리돼 있다.
+
+이미 환경이 갖춰진 사람을 위한 요약:
 
 ```bash
 git clone https://github.com/kimmj6079/react-python.git
 cd react-python
+cp backend/.env.example backend/.env       # Docker로만 실행할 거면 생략 가능
+cp frontend/.env.example frontend/.env
 ```
-
-------------------------------------------------------------------------------------------------------------------------
-
-### 2) 필요한 프로그램 설치
-
-어떤 방식으로 실행할지에 따라 필요한 게 다르다.
 
 | 실행 방식 | 필요한 프로그램 |
 |---|---|
 | **Docker로만 실행** (`docker compose up --build`) | [Docker Desktop](https://www.docker.com/products/docker-desktop/) 하나만 있으면 됨 |
-| **로컬 프로세스로 실행** (`uv run`, `npm run dev` 직접 실행, hot-reload용) | Docker Desktop(DB용) + [uv](https://docs.astral.sh/uv/getting-started/installation/)(Python 패키지 매니저, Python 인터프리터도 같이 관리해줌) + [Node.js 22+](https://nodejs.org/)(npm 포함) |
+| **로컬 프로세스로 실행** (`uv run`, `npm run dev` 직접 실행, hot-reload용) | Docker Desktop(DB용) + [uv](https://docs.astral.sh/uv/getting-started/installation/)(Python 패키지 매니저, Python 인터프리터도 같이 관리해줌 — **Python을 따로 설치할 필요 없다**) + [Node.js 22+](https://nodejs.org/)(npm 포함) |
 | **Kubernetes 배포까지 해볼 경우** | 위에 더해 `kubectl`, [minikube](https://minikube.sigs.k8s.io/docs/start/) 또는 kind |
 
 설치 확인:
 ```bash
 docker --version
 docker compose version
-uv --version        # 로컬 프로세스로 백엔드 돌릴 경우
+uv --version         # 로컬 프로세스로 백엔드 돌릴 경우
 node --version       # 로컬 프로세스로 프론트엔드 돌릴 경우
 npm --version
 ```
 
-------------------------------------------------------------------------------------------------------------------------
-
-### 3) 환경변수 파일 준비 (로컬 프로세스로 실행할 경우만 필요)
-
-Docker로만 실행할 거면 이 단계는 건너뛰어도 된다 (`docker-compose.yml`에 필요한 값이 이미 다 들어있음). `uv run`/`npm run dev`로 직접 띄울 거면 각 폴더의 예시 파일을 복사해서 실제 설정 파일을 만들어야 한다:
-
-```bash
-cp backend/.env.example backend/.env
-cp frontend/.env.example frontend/.env
-```
-
 `.env`는 사람/환경마다 값이 다를 수 있어서 `.gitignore`에 등록돼 있고, 저장소에는 `.env.example`(템플릿)만 커밋된다. 기본값 그대로도 아래 "로컬 개발 시작하기" 흐름과 맞게 세팅돼 있어 값을 바꾸지 않아도 동작한다.
+
+백엔드가 쓰는 Python 버전은 `backend/.python-version`(현재 `3.14`)에 고정돼 있고, `uv sync`가 이 버전을 자동으로 내려받아 `backend/.venv`를 만든다. 자세한 배경은 [SETUP.md](./SETUP.md)의 "Python 버전은 어떻게 정해지나" 절 참고.
 
 ------------------------------------------------------------------------------------------------------------------------
 
@@ -373,4 +362,5 @@ docker compose down -v
 
 ## 더 알아보기
 
+- 새 PC 초기 설치(OS별 설치 명령 · 검증 체크리스트 · 트러블슈팅 · Python 버전 고정)는 [SETUP.md](./SETUP.md)에 정리되어 있다.
 - 테스트/린트/빌드, Docker 이미지 빌드는 [CLAUDE.md](./CLAUDE.md), Kubernetes/docker-compose 클라우드 배포와 CI/CD 구조는 [DEPLOYMENT.md](./DEPLOYMENT.md)에 정리되어 있다.

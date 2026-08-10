@@ -6,8 +6,10 @@
 # non-root 사용자(appuser)로 실행하며, 8000번 포트에서 uvicorn으로 서비스한다.
 # =====================================================================
 
-# 빌드용 1단계 시작: 의존성 설치를 담당하는 builder 스테이지 (베이스: python 3.12-slim)
-FROM python:3.12-slim AS builder
+# 빌드용 1단계 시작: 의존성 설치를 담당하는 builder 스테이지 (베이스: python 3.14-slim)
+# 버전은 backend/.python-version(3.14)과 반드시 같아야 한다 -- 로컬/CI/운영 이미지가
+# 서로 다른 파이썬에서 돌면 "CI는 통과하는데 운영에서만 터지는" 상황이 생긴다.
+FROM python:3.14-slim AS builder
 # uv 공식 이미지에서 uv/uvx 바이너리만 가져와 패키지 매니저로 사용
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
@@ -30,7 +32,9 @@ RUN uv sync --frozen --no-dev
 
 
 # 최종 런타임 이미지 2단계 시작 (builder 산출물만 가져와 이미지 용량 최소화)
-FROM python:3.12-slim AS final
+# builder에서 만든 .venv를 그대로 복사해 쓰므로, 여기 베이스 이미지의 파이썬
+# 마이너 버전이 builder와 다르면 venv가 깨진다 (site-packages 경로/ABI 불일치).
+FROM python:3.14-slim AS final
 # 컨테이너를 root가 아닌 전용 사용자(appuser)로 실행하기 위해 계정 생성
 RUN useradd --create-home --uid 1000 appuser
 # 작업 디렉토리 설정

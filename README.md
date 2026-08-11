@@ -234,6 +234,105 @@ npm run dev                               # http://localhost:5173
 
 ------------------------------------------------------------------------------------------------------------------------
 
+### 4) 코드 검사 · 테스트 (개발 중 수시로)
+
+서버를 띄워둔 채로, 별도 터미널에서 수시로 돌리는 명령들이다.
+
+**백엔드 — 스타일 · 린트**
+
+```bash
+cd backend
+uv run ruff format .           # 코드 스타일 자동 정리 (들여쓰기, 따옴표, 줄바꿈, 파일 끝 개행)
+uv run ruff check .            # 린트 검사 (미사용 import, 정의 안 된 이름, import 정렬 등)
+uv run ruff check --fix .      # 위 검사 중 자동 수정 가능한 것만 고침
+```
+
+- `format`과 `check`는 역할이 다르다. `format`은 **모양**만 다듬고(코드 의미는 안 바뀜), `check`는 **문제**를 찾는다. 보통 `format` → `check --fix` 순서로 돌린다.
+- `check` 결과에 `[*]` 표시가 붙은 규칙은 `--fix`로 자동 수정된다. 표시가 없으면 직접 고쳐야 한다.
+- 검사 규칙은 `backend/pyproject.toml`의 `[tool.ruff.lint]` `select`에 정의돼 있다(현재 `E`, `F`, `I`, `UP`).
+
+**백엔드 — 테스트**
+
+```bash
+uv run pytest -v                                          # 전체 실행
+uv run pytest tests/test_items.py::test_create_item -v    # 딱 하나만
+```
+
+pytest는 `tests/conftest.py`에서 `get_db`를 **SQLite 인메모리 DB로 갈아끼우기** 때문에 Postgres가 안 떠 있어도 돌아간다. 실제 Postgres 연동 확인은 `docker compose up -d db` 후 `alembic upgrade head`로 따로 한다.
+
+| 옵션 | 용도 |
+|---|---|
+| `-q` | 출력 간략하게 (점 하나가 테스트 하나) |
+| `-x` | 첫 실패에서 즉시 중단 — 실패가 많을 때 하나씩 잡기 좋다 |
+| `--lf` | 직전에 **실패한 것만** 재실행 (last-failed) |
+| `-k "create"` | 이름에 `create`가 들어간 테스트만 |
+| `-s` | 테스트 안의 `print()` 출력을 화면에 보이게 (기본은 삼켜짐) |
+
+**프론트엔드**
+
+```bash
+cd frontend
+npm run format             # prettier --write . (스타일 자동 정리)
+npm run lint               # oxlint (린트 검사)
+npm run test -- --run      # Vitest 1회 실행
+npm run test               # Vitest watch 모드 (파일 저장할 때마다 재실행)
+npm run build              # tsc -b && vite build
+```
+
+- `npm run test`는 기본이 **watch 모드**라 터미널을 계속 점유한다. 한 번만 돌리려면 `-- --run`을 붙인다(`--`는 "뒤 옵션을 vitest에 그대로 넘겨라"는 npm 문법).
+- `npm run build`가 사실상 **타입 검사** 역할을 겸한다. 앞에 `tsc -b`가 붙어 있어서 타입 오류가 있으면 빌드가 실패한다. 별도 타입체크 명령이 없는 이유다.
+
+**커밋 전 한 번에 (CI와 같은 검사)**
+
+```bash
+(cd backend  && uv run ruff check . && uv run pytest -v)
+(cd frontend && npm run lint && npm run test -- --run && npm run build)
+```
+
+`.github/workflows/ci.yml`이 push/PR마다 돌리는 것과 **같은 명령**이다. 로컬에서 먼저 통과시키면 CI 빨간불을 볼 일이 없다. 참고로 CI는 `ruff format`을 검사하지 않는다 — 포맷은 로컬 편의용이다.
+
+**의존성 추가 · 삭제**
+
+| 명령 | 설명 |
+|---|---|
+| `uv add <패키지>` | 백엔드 런타임 의존성 추가 (`pyproject.toml` + `uv.lock` 자동 갱신) |
+| `uv add --dev <패키지>` | 백엔드 개발용 의존성 (pytest, ruff 등) |
+| `uv remove <패키지>` | 제거 |
+| `uv sync` | `uv.lock` 기준으로 `.venv` 재동기화 (다른 사람이 의존성을 추가했을 때) |
+| `npm install <패키지>` | 프론트 런타임 의존성 |
+| `npm install -D <패키지>` | 프론트 개발용 의존성 |
+
+`uv.lock`과 `package-lock.json`은 **반드시 커밋한다.** CI가 `uv sync --frozen` / `npm ci`로 lock 파일 그대로 설치하기 때문에, lock을 빼먹으면 CI에서만 다른 버전이 깔린다.
+
+**DB 마이그레이션**
+
+| 명령 | 설명 |
+|---|---|
+| `uv run alembic revision --autogenerate -m "메시지"` | 모델 변경을 감지해 새 마이그레이션 파일 생성 (**DB 연결 필요**) |
+| `uv run alembic upgrade head` | 최신 리비전까지 적용 |
+| `uv run alembic downgrade -1` | 한 단계 되돌리기 |
+| `uv run alembic current` | 지금 DB가 어느 리비전에 있는지 |
+| `uv run alembic history` | 마이그레이션 이력 전체 |
+| `uv run alembic check` | 모델과 마이그레이션이 어긋났는지 확인 (파일 생성 없이 검사만) |
+
+`--autogenerate`는 **실제 DB에 붙어서** 현재 스키마와 모델을 비교하는 방식이라, `docker compose up -d db`로 DB를 먼저 띄워야 한다. 그리고 새 모델을 추가했다면 `app/models/__init__.py`에도 등록해야 Alembic이 인식한다.
+
+**컨테이너 상태 확인**
+
+```bash
+docker compose ps                  # 어떤 컨테이너가 떠 있는지
+docker compose logs -f backend     # 로그 실시간 보기 (frontend/db도 동일)
+docker compose restart backend     # 특정 서비스만 재시작
+```
+
+**API 동작 확인**
+
+- `http://localhost:8000/docs` — Swagger UI. 브라우저에서 직접 API를 호출해볼 수 있어 curl보다 편하다.
+- `curl http://localhost:8000/health` — 백엔드 기동 확인
+- SSE 스트리밍 API는 `curl -N`을 써야 한다. `-N`이 없으면 응답이 끝날 때까지 버퍼링돼서 한꺼번에 출력된다.
+
+------------------------------------------------------------------------------------------------------------------------
+
 ### 한 번에 띄우기 (docker-compose)
 
 위 과정을 개별 실행하는 대신 전체를 컨테이너로 띄울 수도 있다:
@@ -363,4 +462,5 @@ docker compose down -v
 ## 더 알아보기
 
 - 새 PC 초기 설치(OS별 설치 명령 · 검증 체크리스트 · 트러블슈팅 · Python 버전 고정)는 [SETUP.md](./SETUP.md)에 정리되어 있다.
-- 테스트/린트/빌드, Docker 이미지 빌드는 [CLAUDE.md](./CLAUDE.md), Kubernetes/docker-compose 클라우드 배포와 CI/CD 구조는 [DEPLOYMENT.md](./DEPLOYMENT.md)에 정리되어 있다.
+- 개발 중 쓰는 검사/테스트/의존성/마이그레이션 명령어는 위 "4) 코드 검사 · 테스트" 절에 설명과 함께 정리돼 있다. 설명 없는 명령어 목록만 빠르게 훑고 싶으면 [CLAUDE.md](./CLAUDE.md)의 "자주 쓰는 명령어" 절을 보면 된다.
+- Docker 이미지 빌드는 [CLAUDE.md](./CLAUDE.md), Kubernetes/docker-compose 클라우드 배포와 CI/CD 구조는 [DEPLOYMENT.md](./DEPLOYMENT.md)에 정리되어 있다.

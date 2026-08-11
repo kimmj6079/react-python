@@ -58,7 +58,9 @@ uv run alembic upgrade head                      # 최초 1회 / 마이그레이
 uv run uvicorn app.main:app --reload             # 개발 서버 (localhost:8000)
 uv run pytest -v                                 # 전체 테스트
 uv run pytest tests/test_items.py::test_create_item -v   # 단일 테스트
+uv run ruff format .                             # 코드 스타일 자동 정리
 uv run ruff check .                              # 린트
+uv run ruff check --fix .                        # 린트 중 자동 수정 가능한 것만 수정
 uv run alembic revision --autogenerate -m "msg"  # 마이그레이션 생성 (DB 연결 필요)
 uv run alembic upgrade head                      # 마이그레이션 적용
 uv run alembic check                             # 모델과 마이그레이션 정합성 확인

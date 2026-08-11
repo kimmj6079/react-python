@@ -99,14 +99,30 @@ FastAPI가 LLM을 직접 호출해 SSE로 스트리밍, 프론트는 `ai`/`@ai-s
 
 **체크리스트 (진행 중)**:
 - [x] LLM 프로바이더 결정: **Anthropic (Claude)**
-- [ ] console.anthropic.com에서 API 키 발급
-- [ ] `backend`에서 `uv add anthropic`
-- [ ] `backend/app/core/config.py`의 `Settings`에 `anthropic_api_key: str = ""` 필드 추가
-- [ ] `backend/.env`(실값)·`backend/.env.example`(더미값)에 `ANTHROPIC_API_KEY=...` 추가
-- [ ] `app/api/routes/chat.py`의 엔드포인트를 실제 Claude 스트리밍 호출 + SSE 포맷으로 구현
-- [ ] pytest에서 LLM 호출 목킹 전략 설계
+- [x] console.anthropic.com에서 API 키 발급
+- [x] `backend`에서 `uv add anthropic`
+- [x] `backend/app/core/config.py`의 `Settings`에 `anthropic_api_key: str = ""` 필드 추가
+  (+ `anthropic_model: str = "claude-haiku-4-5"` — 교체 후보를 주석으로 병기. 시크릿 기본값은
+  반드시 `""` — config.py는 커밋되는 파일이라 실제 키를 적으면 GitHub에 그대로 올라간다)
+- [x] `backend/.env`(실값)·`backend/.env.example`(더미값)에 `ANTHROPIC_API_KEY=...` 추가
+  (`.env`는 gitignore 대상이라 git/탐색기에서 잘 안 보이고, `.env.example`은 커밋되는 파일이라
+  절대 실값을 넣으면 안 된다. pydantic-settings는 `.env`만 읽고 `.env.example`은 읽지 않는다)
+- [ ] **1a. 평범한 SSE로 Claude 스트리밍 흘려보내기** — `app/api/routes/chat.py`에 `POST /chat` 추가.
+  `AsyncAnthropic`(동기 클라이언트는 이벤트 루프를 막는다) + `client.messages.stream()`의 `.text_stream`을
+  `StreamingResponse(media_type="text/event-stream")`로 내보낸다. SSE 한 덩어리는 `data: ...\n\n`
+  — 줄바꿈 **두 개**가 구분자라 하나만 쓰면 클라이언트가 이벤트 경계를 못 잡는다.
+  검증: `curl -N -X POST localhost:8000/api/v1/chat -H 'Content-Type: application/json' -d '{"message":"..."}'`
+- [ ] **1b. AI SDK의 실제 와이어 포맷 캡처** — 최소 JS/TS 스크립트로 `streamText().toUIMessageStreamResponse()`를
+  띄우고 `curl -N -i`로 헤더+바이트를 그대로 기록해둔다 (문서 암기 금지 — 메이저 버전마다 바뀐다)
+- [ ] **1c. 1a의 출력을 1b 포맷에 맞추기** — AI SDK v5 메시지는 `content: string`이 아니라
+  `parts: [{type:"text", text:...}]` 배열이므로 순수 텍스트 변환 함수를 직접 작성
+- [ ] pytest에서 LLM 호출 목킹 전략 설계 (1a에서 클라이언트를 모듈 레벨/lifespan 중 어디에 뒀는지가 여기서 갈린다)
 - [ ] frontend에 `ai`, `@ai-sdk/react` 추가, `Chat.tsx`를 `useChat` 기반으로 교체
-- [ ] 검증: `curl -N`으로 SSE 라인 확인, 브라우저 실시간 렌더링, DevTools EventStream 청크 순서 확인
+- [ ] 최종 검증: 브라우저 실시간 렌더링 + DevTools "EventStream" 탭에서 청크 순서 확인
+
+> **1a~1c로 쪼갠 이유**: 미지수가 둘(Anthropic 스트리밍 API / AI SDK 프로토콜)이라 한 번에 하면
+> 화면에 글자가 안 나올 때 원인을 구분할 수 없다. 1a에서 "토큰이 실제로 흘러나온다"를 curl로
+> 확정해두면 이후 문제는 전부 포맷 문제로 좁혀진다.
 
 ### M2 — LangGraph 도입 (단일 노드 → 멀티턴 메모리 → 도구/조건부 엣지)
 `StateGraph`를 직접 조립. `State(TypedDict)`에 `messages: Annotated[list, add_messages]`, 단일 노드

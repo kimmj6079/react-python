@@ -12,6 +12,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "ai": "^7.0.73",
     "react": "^19.2.7",
     "react-dom": "^19.2.7"
   },

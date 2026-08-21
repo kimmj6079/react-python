@@ -91,8 +91,10 @@ frontend/
 FastAPI가 LLM을 직접 호출해 SSE로 스트리밍, 프론트는 `ai`/`@ai-sdk/react`의 `useChat`으로 수신.
 **핵심 함정**: Vercel AI SDK의 스트림 프로토콜(헤더 이름, 청크 타입)은 SDK 메이저 버전마다 바뀌어왔다 — 문서를
 암기해서 타이핑하지 말고, 먼저 아주 간단한 순수 JS/TS 스크립트나 Route Handler 등으로 `streamText().toUIMessageStreamResponse()`
-결과를 `curl -N -i`로 **실제 헤더/바이트를 캡처**한 뒤 FastAPI에서 그대로 모사한다. AI SDK v5 메시지는
+결과를 캡처한 뒤 FastAPI에서 그대로 모사한다. AI SDK 메시지는
 `content: string`이 아니라 `parts: [{type:"text", text:...}]` 배열이므로, 순수 텍스트로 변환하는 함수를 직접 작성.
+(실제로 설치된 건 **v5가 아니라 `ai@7`** 이었다 — 이 문서를 처음 쓸 때의 v5 가정이 이미 어긋나 있었다는 게
+1b가 필요한 이유의 산 증거다.)
 **여기서 같이 결정할 것**: pytest에서 이 엔드포인트를 어떻게 테스트할지(LLM 클라이언트를 fixture로 목킹).
 **검증**: `curl -N`으로 원시 SSE 라인 확인, 브라우저에서 실시간 토큰 렌더링, DevTools "EventStream" 탭에서
 청크 순서 확인.
@@ -107,15 +109,114 @@ FastAPI가 LLM을 직접 호출해 SSE로 스트리밍, 프론트는 `ai`/`@ai-s
 - [x] `backend/.env`(실값)·`backend/.env.example`(더미값)에 `ANTHROPIC_API_KEY=...` 추가
   (`.env`는 gitignore 대상이라 git/탐색기에서 잘 안 보이고, `.env.example`은 커밋되는 파일이라
   절대 실값을 넣으면 안 된다. pydantic-settings는 `.env`만 읽고 `.env.example`은 읽지 않는다)
-- [ ] **1a. 평범한 SSE로 Claude 스트리밍 흘려보내기** — `app/api/routes/chat.py`에 `POST /chat` 추가.
+- [x] **1a. 평범한 SSE로 Claude 스트리밍 흘려보내기** — `app/api/routes/chat.py`에 `POST /chat` 추가.
   `AsyncAnthropic`(동기 클라이언트는 이벤트 루프를 막는다) + `client.messages.stream()`의 `.text_stream`을
   `StreamingResponse(media_type="text/event-stream")`로 내보낸다. SSE 한 덩어리는 `data: ...\n\n`
   — 줄바꿈 **두 개**가 구분자라 하나만 쓰면 클라이언트가 이벤트 경계를 못 잡는다.
   검증: `curl -N -X POST localhost:8000/api/v1/chat -H 'Content-Type: application/json' -d '{"message":"..."}'`
-- [ ] **1b. AI SDK의 실제 와이어 포맷 캡처** — 최소 JS/TS 스크립트로 `streamText().toUIMessageStreamResponse()`를
-  띄우고 `curl -N -i`로 헤더+바이트를 그대로 기록해둔다 (문서 암기 금지 — 메이저 버전마다 바뀐다)
-- [ ] **1c. 1a의 출력을 1b 포맷에 맞추기** — AI SDK v5 메시지는 `content: string`이 아니라
-  `parts: [{type:"text", text:...}]` 배열이므로 순수 텍스트 변환 함수를 직접 작성
+  **결과(2026-08-21 검증 완료)**: `200`, `content-type: text/event-stream; charset=utf-8`,
+  `transfer-encoding: chunked`로 `data: {"text": "..."}` 청크가 순차적으로 흘러나온 뒤 `data: [DONE]`으로 종료.
+  한글 응답도 `ensure_ascii=False` 덕에 그대로 보임.
+  (함정: Windows Git Bash에서 `-d '{"message":"한글..."}'`처럼 한글을 인라인으로 주면 셸 코드페이지 때문에
+  바이트가 깨져 FastAPI가 `400 There was an error parsing the body`를 낸다 — 앱 버그가 아니다.
+  UTF-8 파일에 넣고 `-d @req.json`으로 보내면 정상.)
+- [x] **1b. AI SDK의 실제 와이어 포맷 캡처** — `frontend/scripts/capture-wire.mjs`에서
+  `streamText().toUIMessageStreamResponse()`를 한 번 돌려 헤더+바이트를 그대로 기록해둔다.
+  **문서 암기 금지 — 메이저 버전마다 바뀌므로 설치된 패키지에게 직접 물어본다.**
+
+  **위치를 `frontend/` 안으로 정한 이유(중요)**: 별도 npm 프로젝트로 분리하면 `ai`가 두 벌 설치되어
+  각자 따로 드리프트한다. 그러면 "캡처한 버전"과 "`useChat`이 실제로 파싱할 버전"이 어긋날 수 있는데,
+  이는 **1b가 막으려는 버그를 1b가 만드는 것**이다. 같은 `package.json`을 쓰면 캡처와 앱이 물리적으로
+  동일한 설치본을 공유하므로 이 틈이 원천적으로 없다. `ai`는 어차피 아래 체크리스트에서 frontend에
+  추가할 의존성이라 새로 들이는 것도 아니다.
+  (기존 검사에 미치는 영향: `tsc -b`는 `include`가 `src`/`vite.config.ts`뿐이라 무관, `vite build`·`vitest`도
+  무관, 최종 Docker 이미지는 `dist`만 복사하므로 무관. `oxlint`만 이 파일을 린트 대상으로 잡는다.)
+
+  **접근 방식(확정)**: HTTP 서버를 띄우지 않는다. `toUIMessageStreamResponse()`가 돌려주는 건 브라우저
+  `fetch()`가 주는 것과 같은 종류의 Web 표준 `Response`(= `headers` 맵 + `body` ReadableStream)인데,
+  `node:http`는 이 객체를 모르기 때문에 서버를 띄우려면 헤더 복사 + 스트림 퍼내기 "브리지"를 직접 써야 한다.
+  우리가 알고 싶은 헤더·바이트는 이미 그 `Response` 안에 다 들어 있으므로, **스크립트 안에서 그 객체를 바로
+  읽어 찍는 것**으로 충분하다. 미지수를 "AI SDK가 뭘 주는가" 하나로 줄이는 게 1a/1b/1c로 쪼갠 취지와 일관.
+  네트워크 계층(프록시 버퍼링·청크 뭉침) 검증은 M1 마지막 항목의 브라우저 DevTools 확인에서 어차피 한다.
+
+  **모델은 실제 Anthropic이 아니라 가짜(mock) 모델을 쓴다.** `data: {"type": ...}` 같은 봉투(envelope)는
+  AI SDK 코드가 만드는 것이라 **프로바이더와 무관**하다. 가짜 모델로 델타를 고정하면(예: `"안녕"`/`"하세"`/`"요"`)
+  API 키·비용·네트워크가 빠지고 **매번 동일한 바이트**가 나와 diff 비교가 된다. 덤으로 이 경험은 아래
+  "pytest 목킹 전략" 항목과 개념이 같다.
+
+  **만들 것**:
+  - `frontend`에서 `npm i ai` (`@ai-sdk/react`는 아직 불필요 — 1b는 서버 쪽 함수만 쓴다).
+    설치된 정확한 버전을 `npm ls ai`로 확인해 아래 결과에 함께 기록한다 — **1b 결과의 유효기간이 그 버전이다.**
+    (가짜 모델 유틸이 `ai` 안에 있는지 별도 패키지인지는 `node_modules` 안 `.d.ts`를 직접 열어 확인)
+
+    **탐색 경로(재캡처 시 이 순서로)**: `node_modules/ai/package.json`의 `exports` → `"./test"` subpath 발견
+    → `dist/test/index.d.ts`에서 `MockLanguageModelV4`·`simulateReadableStream` 확인 → `doStream`이 받는
+    `LanguageModelV4StreamResult`·`LanguageModelV4StreamPart` 정의는 `@ai-sdk/provider`의 `dist/index.d.ts`.
+    `streamText`의 `model`은 `LanguageModel = ... | V4 | V3 | V2`라 V2~V4 목이 다 통한다(최신 V4 사용).
+  - `frontend/scripts/capture-wire.mjs` — ① 가짜 모델로 고정 델타 흘리기 → ② `toUIMessageStreamResponse()`로
+    `Response` 얻기 → ③ `status`+`headers` 전부 출력, `body`를 청크 단위로 읽어 **`JSON.stringify`로 감싸** 출력.
+    감싸지 않으면 개행이 진짜 개행으로 렌더링돼 **`\n`이 몇 개인지가 화면에서 사라진다** — 1c에서 맞춰야 할
+    게 바로 그 개행 구조다. `testchat.py`의 `{line!r}`과 같은 이유.
+
+  **결과 (2026-08-21 캡처, `ai@7.0.73` 기준 — 버전이 바뀌면 재캡처할 것)**
+
+  응답 헤더 5개:
+  ```
+  content-type: text/event-stream
+  cache-control: no-cache
+  connection: keep-alive
+  x-accel-buffering: no
+  x-vercel-ai-ui-message-stream: v1      ← SDK 고유 헤더. 프로토콜 버전 표식
+  ```
+
+  본문 (이스케이프 표기 그대로 — `\n`이 **두 개**임에 주목):
+  ```
+  "data: {\"type\":\"start\"}\n\n"
+  "data: {\"type\":\"start-step\"}\n\n"
+  "data: {\"type\":\"text-start\",\"id\":\"0\"}\n\n"
+  "data: {\"type\":\"text-delta\",\"id\":\"0\",\"delta\":\"안녕\"}\n\n"
+  "data: {\"type\":\"text-delta\",\"id\":\"0\",\"delta\":\"하세\"}\n\n"
+  "data: {\"type\":\"text-delta\",\"id\":\"0\",\"delta\":\"요\"}\n\n"
+  "data: {\"type\":\"text-end\",\"id\":\"0\"}\n\n"
+  "data: {\"type\":\"finish-step\"}\n\n"
+  "data: {\"type\":\"finish\",\"finishReason\":\"stop\"}\n\n"
+  "data: [DONE]\n\n"
+  ```
+
+  즉 이벤트 순서는 `start` → `start-step` → `text-start` → `text-delta`×N → `text-end`
+  → `finish-step` → `finish` → `[DONE]`. 텍스트는 `text`가 아니라 **`delta`** 키에 담기고,
+  `text-start`/`text-delta`/`text-end`는 같은 `id`로 묶인다.
+
+  **"안쪽 포맷 ≠ 출력 포맷"의 실증 2건** (가짜 모델에 넣은 값과 나온 값이 다르다):
+  - `finishReason`: 넣은 건 `{ unified: "stop", raw: undefined }` **객체**인데 나온 건 `"stop"` **문자열**.
+  - `usage`: `inputTokens`/`outputTokens`를 채워 넣었는데 **출력에 아예 없다.** 기본값으로는 사용량을
+    보내지 않는다 — 필요하면 `toUIMessageStreamResponse()`에 옵션(`UIMessageStreamOptions`)을 줘야 한다.
+
+  **함정 기록**: `ai/test`에는 `MockLanguageModelV4`와 `MockEmbeddingModelV4`가 나란히 있어서
+  자동완성이 임베딩 쪽을 먼저 보여준다. 임베딩 모델을 넘기면 `TypeError: resolvedModel.doStream is not
+  a function`이 **라이브러리 안쪽 스택트레이스로** 터진다 — JS는 생성자에 모르는 키를 줘도 조용히 버리기
+  때문에, Python처럼 호출 지점에서 죽지 않고 그 메서드를 실제로 쓰는 순간까지 미뤄진다.
+
+  **1a와의 차이 = 1c에서 할 일**:
+  | | 1a 현재 | 1b 정답 | 1c |
+  |---|---|---|---|
+  | `data: ` 접두사 | 있음 | 있음 | 그대로 |
+  | 구분자 `\n\n` | 맞음 | 맞음 | 그대로 |
+  | 종료 센티넬 `data: [DONE]` | 있음 | 있음 | **우연히 이미 맞았다** |
+  | 텍스트 청크 | `{"text": "..."}` | `{"type":"text-delta","id":...,"delta":...}` | 교체 |
+  | 생애주기 이벤트 6개 | 없음 | 있음 | 추가 |
+  | `x-vercel-ai-ui-message-stream: v1` | 없음 | 있음 | 추가 |
+- [ ] **1c. 1a의 출력을 1b 포맷에 맞추기** — 할 일이 두 방향이다.
+  - **응답(내보내기)**: 위 1b 결과표의 "1c" 열대로 수정 — 텍스트 청크 JSON 교체 + 생애주기 이벤트 6개 추가
+    + `x-vercel-ai-ui-message-stream: v1` 헤더 추가. (`data: `·`\n\n`·`data: [DONE]`은 이미 맞다)
+  - **요청(받기)**: `useChat`이 POST하는 본문의 메시지는 `content: string`이 **아니다.** `ai@7`의
+    `UIMessage`는 `{ id, role: 'system'|'user'|'assistant', parts: [...] }`이고, 텍스트 파트는
+    `{ type: 'text', text: string, state?: 'streaming'|'done' }`다 (`.d.ts`에서 확인). 즉 지금
+    `ChatRequest`의 `message: str`은 못 쓰고, `parts` 배열에서 `type === 'text'`인 것만 골라
+    `text`를 이어붙이는 변환 함수가 필요하다.
+  - **아직 미확인**: 요청 본문의 **최상위** 모양(`{messages: [...]}`인지, `id`·`trigger` 같은 필드가
+    더 붙는지). 이건 `useChat`을 실제로 붙여 DevTools Network의 요청 페이로드를 보는 게 가장 확실하다
+    — 1b와 같은 논리로, 문서 암기 대신 실물을 본다.
 - [ ] pytest에서 LLM 호출 목킹 전략 설계 (1a에서 클라이언트를 모듈 레벨/lifespan 중 어디에 뒀는지가 여기서 갈린다)
 - [ ] frontend에 `ai`, `@ai-sdk/react` 추가, `Chat.tsx`를 `useChat` 기반으로 교체
 - [ ] 최종 검증: 브라우저 실시간 렌더링 + DevTools "EventStream" 탭에서 청크 순서 확인

@@ -1,4 +1,3 @@
-# Kubernetes가 컨테이너 상태를 확인할 때 호출하는 헬스체크 엔드포인트들.
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import text
 

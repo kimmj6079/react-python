@@ -1,10 +1,14 @@
-# Kubernetes가 컨테이너 상태를 확인할 때 호출하는 헬스체크 엔드포인트들.
-import json
-
-from fastapi import APIRouter
+# 챗봇 HTTP 라우터. 여기서는 요청을 받아 Anthropic 스트림을 열고 텍스트 델타를
+# 꺼내는 일만 한다. 와이어 포맷(AI SDK 프로토콜) 변환은 app/core/ai_sdk.py에 위임한다.
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.api.deps import AnthropicClient
+from app.core.ai_sdk import (
+    UI_MESSAGE_STREAM_HEADERS,
+    to_anthropic_messages,
+    ui_message_stream,
+)
 from app.core.config import settings
 from app.schemas.chat import ChatRequest
 
@@ -21,29 +25,35 @@ def chat_health() -> dict[str, str]:
 
 @router.post("/chat")
 async def chat(payload: ChatRequest, client: AnthropicClient) -> StreamingResponse:
-    async def event_stream():
-        # async with: 스트림이 끝나거나 예외가 나도 연결을 확실히 정리해준다.
+    # 변환은 스트림을 열기 전에 해둔다. 이유는 아래 HTTPException과 같다 —
+    # 스트림이 시작된 뒤에 터지는 예외는 진단하기 어렵기 때문이다.
+    # 브라우저가 매 요청에 히스토리 전체를 보내므로 서버는 무상태이고, 그대로
+    # 넘기면 멀티턴이 그냥 동작한다.
+    # (M2에서 LangGraph InMemorySaver + thread_id로 서버측 메모리로 뒤집는다.)
+    messages = to_anthropic_messages(payload.messages)
+
+    if not messages:
+        # 빈 messages로 Anthropic을 부르면 400이 나는데, 그건 스트림이 이미
+        # 시작된 뒤라서 클라이언트에는 "200 헤더 + 빈 본문 + 연결 끊김"으로
+        # 보인다. 원인을 찾기 매우 어려운 형태다. 스트림 시작 전에 걸러
+        # 정상적인 4xx로 돌려준다.
+        raise HTTPException(status_code=400, detail="no text content in messages")
+
+    # 이 제너레이터는 "텍스트 델타 문자열"만 내보낸다. SSE 포맷은 전혀 모른다.
+    # 그 덕에 M2에서 LangGraph로 갈아탈 때 바꿀 곳이 이 함수 하나로 좁혀진다.
+    async def text_deltas():
+        # async with를 반드시 이 안에 둔다. 밖으로 빼서 블록 안에서 return하면
+        # 함수가 리턴하는 순간 스트림이 닫히고, 정작 읽을 때는 이미 닫혀 있다.
         async with client.messages.stream(
             model=settings.anthropic_model,
             max_tokens=1024,
-            messages=[{"role": "user", "content": payload.message}],
+            messages=messages,
         ) as stream:
-            # text_stream은 텍스트 델타만 골라서 문자열로 주는 편의 iterator.
             async for text in stream.text_stream:
-                # 그냥 f"data: {text}" 로 쓰면 안 된다. text에 개행이 들어오는 순간
-                # SSE의 줄 구조가 깨진다. JSON으로 감싸면 개행이 "\n" 두 글자로
-                # 이스케이프되어 안전하다. ensure_ascii=False는 한글이 \uXXXX로
-                # 깨져 보이지 않게 하려는 것(동작엔 영향 없고 디버깅 편의).
-                chunk = json.dumps({"text": text}, ensure_ascii=False)
-                yield f"data: {chunk}\n\n"
-        # 스트림 종료 신호. 없으면 클라이언트가 끝난 줄 모르고 계속 기다린다.
-        yield "data: [DONE]\n\n"
+                yield text
 
     return StreamingResponse(
-        event_stream(),
+        ui_message_stream(text_deltas()),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",  # 중간 캐시가 스트림을 통째로 잡아두지 않게
-            "X-Accel-Buffering": "no",  # nginx 버퍼링 방지 (배포 시 필요)
-        },
+        headers=UI_MESSAGE_STREAM_HEADERS,
     )

@@ -1,5 +1,3 @@
-# items 리소스에 대한 HTTP 라우터. 실제 DB 작업은 app/crud/item.py에 위임하고
-# 여기서는 요청을 받아 CRUD 함수를 호출한 뒤 응답 스키마(ItemRead)로 변환하는 역할만 한다.
 from fastapi import APIRouter, HTTPException
 
 from app.api.deps import DbSession

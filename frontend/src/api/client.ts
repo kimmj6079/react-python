@@ -6,6 +6,11 @@ import type { Item, ItemCreate } from '../types/item'
 // 로컬 개발 기본값으로는 localhost:8000을 사용한다.
 const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
 
+// POST /api/v1/chat 의 전체 주소.
+// useChat은 내부에서 자기 fetch를 돌리므로 아래 request() 헬퍼를 통과하지 않는다.
+// 그래도 "주소를 만드는 규칙"은 이 파일 하나에만 둔다 — 안 그러면 VITE_API_URL 처리가 두 갈래로 갈라진다.
+export const CHAT_API_URL = `${API_URL}/api/v1/chat`
+
 // fetch를 감싼 공통 헬퍼. 에러 처리와 JSON 파싱을 한 곳에서 처리해서 중복을 줄인다.
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_URL}${path}`, {

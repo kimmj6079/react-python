@@ -305,9 +305,131 @@ FastAPI가 LLM을 직접 호출해 SSE로 스트리밍, 프론트는 `ai`/`@ai-s
   - `ruff check`는 E265(`#`뒤 공백)·E302(빈 줄 개수)를 잡지 않는다(preview 전용) — 그건 `ruff format`이
     처리한다. 단 문법 에러가 있는 파일은 포매터도 린터도 손대지 못한다.
 
-- [ ] pytest에서 LLM 호출 목킹 전략 설계 (1a에서 클라이언트를 모듈 레벨/lifespan 중 어디에 뒀는지가 여기서 갈린다)
-- [ ] frontend에 `ai`, `@ai-sdk/react` 추가, `Chat.tsx`를 `useChat` 기반으로 교체
-- [ ] 최종 검증: 브라우저 실시간 렌더링 + DevTools "EventStream" 탭에서 청크 순서 확인
+- [x] pytest에서 LLM 호출 목킹 전략 설계 — **1c 작업 중에 함께 끝났다** (`backend/tests/test_chat.py`).
+  1a에서 클라이언트를 모듈 레벨(`app/api/deps.py:19`)에 두되 `get_anthropic_client()` 함수로 한 겹
+  감싼 것이 여기서 값을 했다: 테스트가 `app.dependency_overrides[get_anthropic_client]`로 통째로
+  갈아끼우면 되고, `monkeypatch`로 모듈 전역을 직접 건드릴 필요가 없다. (라우터가 `_anthropic_client`를
+  직접 import했다면 이 방법이 막혔다.)
+  가짜는 `FakeAnthropic` → `FakeMessages.stream(**kwargs)`(호출 인자를 `calls`에 기록) → `FakeStream`
+  (async context manager + `.text_stream`) 3단이고, **라우터가 실제로 쓰는 표면만** 흉내낸다.
+  fixture는 `yield` 뒤에서 override를 반드시 지운다 — 안 지우면 단독 실행은 통과하고 전체 실행에서만
+  깨지는 오염이 생긴다. 검증(2026-08-26): `uv run pytest -q` → **16 passed**.
+- [x] **1d. `@ai-sdk/react` 설치 + `useChat` 시그니처 실측** — `Chat.tsx`를 쓰기 전에 훅의 실제 표면부터 본다.
+
+  **왜 또 실측인가**: 지금 남은 미지수는 "프론트가 그 바이트를 어떻게 소비하는가" **하나뿐**이다
+  (백엔드 출력은 1b 캡처와 바이트 단위 일치가 `tests/test_chat.py`로 못 박혀 있다). `useChat`은 AI SDK
+  메이저 버전마다 표면이 크게 바뀐 API라, 여기서 문서·블로그 예제를 암기해 타이핑하면 1b가 막으려던
+  실패(화면은 백지인데 에러는 없음)를 그대로 재현한다.
+
+  **`ai`와 `@ai-sdk/react`가 별도 패키지인 이유**: `ai`는 런타임 중립 코어(서버·노드·브라우저 공용)고,
+  React 훅은 `react`에 peer 의존하므로 분리돼 있다. 두 패키지의 버전 숫자는 서로 다르다 —
+  **1d 결과의 유효기간은 이 두 버전의 조합**이므로 둘 다 기록한다.
+
+  **명령** (`frontend/`에서. `ai`는 1b 때 이미 `^7.0.73`으로 들어와 있다):
+  ```bash
+  npm i @ai-sdk/react
+  npm ls ai @ai-sdk/react
+  grep -n "useChat\|DefaultChatTransport\|sendMessage" node_modules/@ai-sdk/react/dist/index.d.ts
+  ```
+
+  **결과 (2026-08-26 실측 — `ai@7.0.79` + `@ai-sdk/react@4.0.82` 기준)**
+
+  ⚠ **설치하면서 `ai`가 7.0.73 → 7.0.79로 따라 올라갔다.** `package.json`에 `^7.0.73`으로 적혀 있으니
+  npm이 트리를 다시 풀 때 patch를 올리는 게 정상 동작이다. 문제는 **1b 결과의 유효기간이 그 순간 끊겼다는
+  것**이다. 그래서 `node scripts/capture-wire.mjs`를 다시 돌려 확인했다 → 헤더 5개·본문 10줄이
+  **바이트 단위로 동일**. 1b 캡처와 `backend/tests/test_chat.py`의 `EXPECTED_SSE`는 그대로 유효하다.
+  (1b를 "한 번 보고 버리는 확인"이 아니라 **스크립트로** 남겨둔 값이 여기서 나왔다 — 재확인 비용이 명령 한 줄이다.)
+
+  찾던 답 4개:
+
+  1. **`useChat`은 입력 상태를 관리해주지 않는다.** 반환값은 `{ id, messages, sendMessage, status, error,
+     setMessages, regenerate, stop, clearError, ... }`이고 `input`·`handleInputChange`·`handleSubmit`은
+     **없다** (`@ai-sdk/react/dist/index.d.ts:102`의 `UseChatHelpers`). 텍스트 입력은 `useState`로 직접 관리한다.
+     — 예전 버전 예제를 그대로 베꼈다면 여기서 컴파일 에러가 났을 자리다.
+  2. **URL은 `api` 옵션이 아니라 transport로 준다.** `ChatInit`(`ai/dist/index.d.ts:5446`)에는 `api` 필드가
+     아예 없고 `transport?: ChatTransport`만 있다. URL은 `DefaultChatTransport`(`ai/dist/index.d.ts:5699`)의
+     생성자 옵션 `api`(`ai/dist/index.d.ts:5638`의 `HttpChatTransportInitOptions`, 기본값 `'/api/chat'`)로 들어간다.
+     → `useChat({ transport: new DefaultChatTransport({ api: ... }) })`.
+     `DefaultChatTransport`는 `@ai-sdk/react`가 아니라 **`ai`에서** import한다.
+  3. **전송은 `sendMessage({ text })`** (`ai/dist/index.d.ts:5533`). 인자가 유니온이고 각 가지에
+     `parts?: never` / `text?: never`가 붙어 있어 `{ text }`·`{ files }`·`{ parts }` 중 **하나만** 쓸 수 있다.
+     예전의 `append({ role, content })` 형태가 아니다.
+  4. **렌더링은 `message.parts` 순회** (`ai/dist/index.d.ts:1818`의 `UIMessage`). `content: string`은 없다.
+     파트 종류는 11종(`ai/dist/index.d.ts:1843`)이라 `part.type === 'text'`만 골라 그린다 — 1c에서 백엔드
+     `text_from_parts()`가 한 것과 **정확히 같은 필터를 프론트에서도 하는 셈**이다. 요청 본문 모양도 여기서
+     한 번 더 확인됐다(1c가 코드 근거로 잠정 확정한 `{id, role, parts}`).
+
+  덤으로 하나 더: **`status: 'submitted' | 'streaming' | 'ready' | 'error'`** (`ai/dist/index.d.ts:5412`).
+  boolean `isLoading`이 아니라 4상태다. `submitted`(요청은 나갔고 첫 청크 대기)와 `streaming`(청크 수신 중)이
+  구분되므로 "전송 버튼 비활성화"와 "응답 생성 중 표시"를 다르게 그릴 수 있다.
+
+  **함정**: `npm i` 중 `zod` peer 경고가 뜰 수 있다(`ai`의 peerDependencies가 `zod ^3.25.76 || ^4.1.8`).
+  `zod`를 직접 쓰지 않으므로 경고 자체는 무시해도 되지만, 설치가 **에러로 멈추는** 것은 다른 문제다.
+
+  **`npm audit` 취약점 3건 처리**: 설치 직후 `3 vulnerabilities (1 moderate, 2 high)`가 떴다.
+  경고를 보면 반사적으로 명령을 복붙하게 되는데, **출처부터 확인하는 습관**이 먼저다:
+  ```bash
+  npm ls undici nanoid postcss   # 누가 끌고 왔나
+  npm audit fix --dry-run        # 무엇이 바뀌나 (실행하지 않고 미리보기)
+  ```
+  결과 — `postcss`/`nanoid`는 **vite**, `undici`는 **jsdom**과 `@ai-sdk/provider-utils`에서 온 전이
+  의존성이다. 즉 우리가 직접 넣은 패키지가 아니고, 셋 다 patch 범위 상향으로 해결된다
+  (`undici 7.28.0→7.29.0`, `postcss 8.5.22→8.5.26`, `nanoid 3.3.16→3.3.18`). `package.json`은 안 바뀌고
+  lockfile만 바뀐다 → **`npm audit fix` 실행**.
+  **`npm audit fix --force`는 쓰지 않는다** — major를 올려 breaking change를 부르는 옵션이라, 취약점 3건
+  고치려다 vite/vitest가 안 뜨는 상황을 만든다. 참고로 이 셋은 빌드타임·Node 전용이라 브라우저 번들에
+  실리지 않지만(최종 Docker 이미지는 `dist`만 복사한다), `npm audit`을 습관적으로 무시하면 진짜 런타임
+  취약점이 왔을 때도 못 알아본다.
+- [x] **1e. `Chat.tsx`를 `useChat` 기반으로 교체** — 1d에서 확인한 시그니처대로 작성. CORS는 이미
+  `backend_cors_origins`에 `http://localhost:5173`이 들어 있어 추가 설정이 필요 없었다.
+
+  **`client.ts`에 `CHAT_API_URL` 상수를 export한 이유**: 이 저장소 규칙은 "컴포넌트는 fetch를 직접
+  쓰지 않고 `client.ts`의 함수를 쓴다"인데, `useChat`은 fetch를 **자기가** 하므로 `request()` 헬퍼를
+  통과시킬 방법이 없다. 그래서 규칙을 반만 지켰다 — 호출은 훅에 맡기고 **주소 조립만 client.ts에
+  남긴다.** `Chat.tsx`에서 `import.meta.env`를 다시 읽었다면 `VITE_API_URL` 처리(프로덕션에서 빈
+  문자열 → 상대경로)가 두 곳에 복사되고, 한쪽만 고치는 날 프로덕션에서만 404가 난다.
+
+  **함정 기록 (실제로 겪은 것)**
+  - `useChat`을 `useState`로 오타 → 화면 **완전 백지**. `useState`는 `[값, 설정함수]` **배열**을
+    돌려주므로 `{ messages, ... }`로 구조분해하면 전부 `undefined`가 되고, 그 자리에서는 에러가
+    안 난다. 30줄 아래 `messages.map()`에서야 `TypeError`가 터지고 React가 트리 전체를 언마운트한다
+    → **원인 줄과 터지는 줄이 다르다.** `tsc -b`는 이걸 실행 전에 잡았고, 특히
+    `TS6133: 'useChat' is declared but its value is never read`가 사실상 정답을 알려주는 힌트였다.
+  - 백지가 뜨면 브라우저 콘솔보다 `npx tsc -b`가 빠를 때가 많다. Vite의 빨간 오버레이는 문법/빌드
+    에러에만 뜨고, 렌더 중 터지는 런타임 에러는 조용히 백지가 된다.
+- [x] 최종 검증: 브라우저 실시간 렌더링 + DevTools "EventStream" 탭에서 청크 순서 확인
+  **(2026-08-26 완료)** — 토큰이 순차적으로 흘러나오는 것, 멀티턴이 기억되는 것, 응답이
+  `parts`로 도착하는 것까지 브라우저에서 확인했다.
+
+- [x] **1f. 챗봇 UI 마감 (체크리스트에 없던 추가 작업)** — 실서비스처럼 보이도록 다듬었다.
+  - **의존성**: `react-markdown@10.1.0` + `remark-gfm@4.0.1`. LLM 응답은 마크다운이라
+    안 붙이면 `# 제목`, `**굵게**`, 표가 날것으로 보인다. `remark-gfm`이 따로인 이유는
+    표·취소선·체크박스·자동링크가 순정 CommonMark가 아닌 GitHub 확장이기 때문.
+    **마크다운은 assistant 메시지에만** 적용한다 — 사용자가 친 `**text**`까지 해석하면
+    내가 뭘 보냈는지 화면에서 확인할 수 없고, 입력을 마크다운으로 해석하는 표면을 넓힐 이유도 없다.
+  - **스타일**: 순수 CSS + BEM(`chat__header`, `msg--user`). `Chat.css`를 컴포넌트 옆에 둔
+    이유는 **삭제 가능성**이다 — 전역 폴더에 모으면 "이 클래스 아직 쓰나?"를 아무도 확신 못 해서
+    CSS가 한 방향으로만 자란다. 색은 전부 `index.css`의 CSS 변수를 쓰므로 다크모드가 공짜다.
+  - **레이아웃 판단**: 어시스턴트는 말풍선 없이 본문처럼 그린다(ChatGPT/Claude 형태).
+    미학이 아니라 **표와 코드블록** 때문이다 — 78% 폭 풍선 안에 표를 넣으면 반드시 뚫고 나간다.
+  - **CSS 함정 3개**
+    - `height: 100dvh` (`100vh` 아님). 모바일에서 `100vh`는 주소창 높이를 모르고 계산해서
+      **입력창이 화면 밖으로 잘려 나간다.** 모바일 웹 챗봇의 가장 흔한 버그.
+    - 입력창 `font-size: 16px` 고정. iOS Safari는 16px 미만 입력창에 포커스하면 **화면을
+      자동 확대**한다. 디자인상 15px이 예뻐도 이것 때문에 16px을 지킨다.
+    - flex 자식의 `min-height` 기본값은 `auto`(내용만큼은 커진다)라, `0`으로 눌러야 안쪽
+      `overflow-y: auto`가 실제로 스크롤된다. **flexbox 스크롤 문제의 대부분이 이 한 줄이다.**
+  - **JS 함정**: `textarea` 자동 높이는 `el.style.height = 'auto'`를 **먼저** 해야 한다.
+    `scrollHeight`가 현재 높이에 갇혀서, 안 그러면 한 번 커진 입력창이 절대 줄어들지 않는다.
+  - **★ 한글 IME**: `Enter` 전송에는 `if (e.nativeEvent.isComposing) return` 가드가 필수다.
+    한글은 조합 방식이라 "안녕"을 치는 동안의 Enter는 "조합 확정"이지 "전송"이 아니다.
+    가드가 없으면 마지막 글자에서 중복 전송된다 — **영어로 테스트하면 절대 재현되지 않는 버그.**
+  - **items 화면 정리**: 프론트의 Items 탭은 `App.tsx`에서 `nav`를 주석 처리해 숨겼고,
+    첫 렌더에 `listItems()`를 부르지 않도록 `useEffect` 의존성을 `[view]`로 바꿨다
+    → **DB 없이 백엔드+프론트만 띄우면 챗봇 개발이 된다.** 백엔드 `/api/v1/items`·alembic·
+    k8s migrate Job은 DB/마이그레이션/CI 학습 소재라 **그대로 남겼다.**
+    (부수효과: `App.test.tsx`의 items 테스트 2개는 탭을 누를 방법이 없어져 통과 불가 →
+    챗 화면 스모크 테스트 1개로 교체. 테스트가 새 동작을 기술하게 된 것이지 억지로 맞춘 게 아니다.)
 
 > **1a~1c로 쪼갠 이유**: 미지수가 둘(Anthropic 스트리밍 API / AI SDK 프로토콜)이라 한 번에 하면
 > 화면에 글자가 안 나올 때 원인을 구분할 수 없다. 1a에서 "토큰이 실제로 흘러나온다"를 curl로
@@ -786,7 +908,7 @@ Langfuse score(M4가 이미 붙어 있으니 저장소를 새로 만들 필요�
 
 ## 진행 현황
 - [x] M0 — 배선 확인 (새 라우터 + 새 탭)
-- [ ] M1 — 단순 LLM 대화 + 스트리밍 (+ 테스트 목킹 전략)
+- [x] M1 — 단순 LLM 대화 + 스트리밍 (+ 테스트 목킹 전략 + 챗봇 UI 마감)
 - [ ] M2 — LangGraph 도입
 - [ ] M3 — Qdrant RAG
 - [ ] M4 — Langfuse 트레이싱

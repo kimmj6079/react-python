@@ -1,0 +1,396 @@
+/* index.css의 CSS 변수를 그대로 쓴다. 그 변수들이 prefers-color-scheme에서
+   값만 바뀌므로 다크모드를 위해 여기서 따로 할 일이 없다.
+   색을 #hex로 박는 순간 다크모드가 깨진다 - 그게 변수를 쓰는 이유다. */
+
+.chat {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+}
+
+/* ---------- 헤더 ---------- */
+.chat__header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 20px;
+  height: 56px;
+  flex-shrink: 0; /* 없으면 메시지가 많을 때 헤더가 찌그러진다 */
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.chat__title {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.1px;
+}
+
+.chat__new {
+  margin-left: auto;
+  border: 1px solid var(--border);
+  background: none;
+  color: var(--text);
+  border-radius: 999px;
+  padding: 6px 14px;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  transition:
+    border-color 0.15s,
+    color 0.15s;
+}
+.chat__new:hover:not(:disabled) {
+  border-color: var(--accent-border);
+  color: var(--text-h);
+}
+.chat__new:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* ---------- 스크롤 영역 ---------- */
+/* 스크롤되는 요소는 이것 하나뿐이다. 안쪽 .chat__thread가 가운데 정렬과
+   최대 폭을 담당한다. 스크롤과 폭 제한을 한 요소에 겹치면, 스크롤바가
+   콘텐츠 폭 안쪽에 생겨서 어색해진다. */
+.chat__scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain; /* 끝까지 스크롤해도 페이지 전체가 딸려가지 않게 */
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+.chat__thread {
+  max-width: 768px;
+  margin: 0 auto;
+  padding: 24px 20px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+
+/* ---------- 빈 화면 ---------- */
+.chat__empty {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 20px;
+  padding: 24px 20px;
+  text-align: center;
+}
+.chat__empty-title {
+  font-size: 26px;
+  letter-spacing: -0.4px;
+}
+.chat__suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  max-width: 640px;
+}
+.chat__suggestion {
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 9px 16px;
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+  text-align: left;
+  transition:
+    border-color 0.15s,
+    color 0.15s;
+}
+.chat__suggestion:hover {
+  border-color: var(--accent-border);
+  color: var(--text-h);
+}
+
+/* ---------- 메시지 ---------- */
+.msg {
+  display: flex;
+  gap: 12px;
+}
+
+/* 사용자: 오른쪽 말풍선. 실제 챗봇들이 쓰는 형태다. */
+.msg--user {
+  justify-content: flex-end;
+}
+.msg--user .msg__body {
+  max-width: 78%;
+  background: var(--accent);
+  color: #fff;
+  padding: 10px 16px;
+  border-radius: 18px 18px 4px 18px;
+  white-space: pre-wrap; /* Shift+Enter로 넣은 줄바꿈 보존 */
+  overflow-wrap: anywhere; /* 긴 URL이 레이아웃을 밀어내지 않게 */
+}
+
+/* 어시스턴트: 말풍선 없이 본문처럼. 표/코드블록이 좁은 풍선에 갇히지 않는다.
+   ChatGPT/Claude가 이 형태를 쓰는 이유가 그것이다. */
+.msg--assistant .msg__body {
+  flex: 1;
+  min-width: 0; /* flex 자식이 콘텐츠 때문에 넘치는 것을 막는다 */
+  color: var(--text-h);
+  padding-top: 3px;
+  overflow-wrap: anywhere;
+}
+
+.msg__avatar {
+  flex-shrink: 0;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-border);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* ---------- 마크다운 결과 다듬기 ----------
+   :where()로 감싸면 우선순위가 0이 되어, 나중에 특정 요소를 !important 없이
+   덮어쓸 수 있다. */
+.msg__body :where(p) {
+  margin: 0 0 12px;
+}
+.msg__body :where(p:last-child) {
+  margin-bottom: 0;
+}
+.msg__body :where(ul, ol) {
+  margin: 10px 0;
+  padding-left: 22px;
+}
+.msg__body :where(li) {
+  margin: 4px 0;
+}
+.msg__body :where(h1, h2, h3, h4) {
+  font-size: 1em;
+  font-weight: 600;
+  margin: 18px 0 8px;
+  letter-spacing: normal;
+}
+.msg__body :where(pre) {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px;
+  margin: 12px 0;
+  overflow-x: auto; /* 코드는 줄바꿈하면 망가지므로 가로 스크롤 */
+  font-size: 13px;
+  line-height: 1.6;
+}
+.msg__body :where(pre code) {
+  background: none;
+  padding: 0;
+  font-size: inherit;
+}
+/* 표가 좁은 화면을 뚫지 않게. display:block이라야 overflow가 먹는다. */
+.msg__body :where(table) {
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+  border-collapse: collapse;
+  margin: 12px 0;
+  font-size: 14px;
+}
+.msg__body :where(th, td) {
+  border: 1px solid var(--border);
+  padding: 6px 12px;
+  white-space: nowrap;
+}
+.msg__body :where(th) {
+  background: var(--bg-soft);
+}
+.msg__body :where(blockquote) {
+  margin: 12px 0;
+  padding-left: 14px;
+  border-left: 3px solid var(--border);
+  color: var(--text);
+}
+.msg--user .msg__body :where(code) {
+  background: rgba(255, 255, 255, 0.22);
+  color: #fff;
+}
+
+/* ---------- 타이핑 인디케이터 ---------- */
+.typing {
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
+  height: 24px;
+}
+.typing i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text);
+  animation: typing-blink 1.2s infinite;
+}
+.typing i:nth-child(2) {
+  animation-delay: 0.2s;
+}
+.typing i:nth-child(3) {
+  animation-delay: 0.4s;
+}
+@keyframes typing-blink {
+  0%,
+  60%,
+  100% {
+    opacity: 0.25;
+  }
+  30% {
+    opacity: 0.9;
+  }
+}
+/* 움직임에 민감한 사용자를 위한 OS 설정을 존중한다. 접근성 기본기다. */
+@media (prefers-reduced-motion: reduce) {
+  .typing i {
+    animation: none;
+    opacity: 0.5;
+  }
+}
+
+/* ---------- 에러 배너 ---------- */
+.chat__error {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: 768px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 10px 20px;
+  font-size: 14px;
+  color: var(--text-h);
+}
+.chat__error span {
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+.chat__error button {
+  border: none;
+  background: none;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+  font: inherit;
+  font-size: 13px;
+}
+
+/* ---------- 입력 영역 ---------- */
+.composer {
+  flex-shrink: 0;
+  width: 100%;
+  max-width: 768px;
+  margin: 0 auto;
+  /* env(safe-area-inset-bottom): 아이폰 홈 인디케이터 영역만큼 띄운다.
+     해당 없는 기기에서는 0이라 아무 영향이 없다. */
+  padding: 8px 20px calc(12px + env(safe-area-inset-bottom));
+}
+
+/* textarea와 버튼을 하나의 둥근 상자 안에 넣는다. 실제 챗봇들의 형태. */
+.composer__box {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 22px;
+  padding: 7px 7px 7px 16px;
+  transition: border-color 0.15s;
+}
+.composer__box:focus-within {
+  border-color: var(--accent-border);
+}
+
+.composer__input {
+  flex: 1;
+  resize: none; /* 높이는 JS가 계산한다 */
+  border: none;
+  background: none;
+  outline: none;
+  color: var(--text-h);
+  font: inherit;
+  /* 모바일 필수: 16px 미만이면 iOS Safari가 포커스 시 화면을 확대해버린다. */
+  font-size: 16px;
+  line-height: 1.5;
+  padding: 6px 0;
+  max-height: 180px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+.composer__input::placeholder {
+  color: var(--text);
+  opacity: 0.7;
+}
+
+.composer__btn {
+  flex-shrink: 0; /* 없으면 textarea에 밀려 버튼이 찌그러진다 */
+  width: 34px;
+  height: 34px;
+  border: none;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.composer__btn:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+.composer__btn--stop {
+  background: var(--text-h);
+  font-size: 11px;
+}
+
+.composer__hint {
+  margin-top: 8px;
+  text-align: center;
+  font-size: 12px;
+  opacity: 0.5;
+}
+
+/* ---------- 반응형 ---------- */
+@media (max-width: 640px) {
+  .chat__header {
+    height: 50px;
+    padding: 0 14px;
+  }
+  .chat__thread {
+    padding: 16px 14px 4px;
+    gap: 18px;
+  }
+  .msg--user .msg__body {
+    max-width: 86%; /* 좁은 화면에서 78%는 너무 답답하다 */
+  }
+  .chat__empty-title {
+    font-size: 21px;
+  }
+  .chat__suggestion {
+    font-size: 13px;
+    padding: 8px 14px;
+  }
+  .composer {
+    padding: 6px 12px calc(10px + env(safe-area-inset-bottom));
+  }
+  /* 좁은 화면에서 힌트는 자리만 차지한다. 어차피 모바일엔 Shift+Enter가 없다. */
+  .composer__hint {
+    display: none;
+  }
+}

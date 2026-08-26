@@ -1,22 +1,10 @@
+/* 앱 셸. #root(높이 고정 flex column)의 남은 공간을 전부 차지하고,
+   그 안을 Chat이 다시 채운다. */
 main {
-  max-width: 480px;
-  margin: 2rem auto;
-  padding: 0 1rem;
-  font-family: system-ui, sans-serif;
-}
-
-form {
+  flex: 1;
   display: flex;
-  gap: 0.5rem;
-  margin-bottom: 1rem;
-}
-
-ul {
-  list-style: none;
-  padding: 0;
-}
-
-li {
-  padding: 0.5rem 0;
-  border-bottom: 1px solid #ddd;
+  /* flex 자식의 min-height 기본값은 auto(=내용만큼은 커진다)라서,
+     이걸 0으로 눌러야 안쪽 overflow-y:auto가 실제로 스크롤된다.
+     flexbox 스크롤 문제의 대부분이 이 한 줄이다. */
+  min-height: 0;
 }

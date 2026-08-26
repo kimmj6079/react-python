@@ -1,39 +1,16 @@
 import { render, screen } from '@testing-library/react'
-import userEvent from '@testing-library/user-event'
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, it } from 'vitest'
 import App from './App'
-import * as client from './api/client'
-
-vi.mock('./api/client')
-const mockedClient = vi.mocked(client)
 
 describe('App', () => {
-  it('lists items loaded from the API', async () => {
-    mockedClient.listItems.mockResolvedValue([
-      { id: 1, name: 'keyboard', description: 'mechanical', created_at: '2026-01-01T00:00:00Z' },
-    ])
-
+  // 스모크 테스트: 챗 화면이 그려지는지만 본다.
+  // useChat의 실제 통신은 여기서 검증하지 않는다 - fetch를 가로채야 하는데,
+  // 와이어 포맷은 백엔드 tests/test_chat.py가 바이트 단위로 이미 검증하고 있다.
+  // 같은 것을 두 곳에서 검증하면 포맷이 바뀔 때 고칠 곳만 두 배가 된다.
+  it('renders the chat view', () => {
     render(<App />)
 
-    expect(await screen.findByText('keyboard')).toBeInTheDocument()
-  })
-
-  it('submits the form and appends the created item', async () => {
-    mockedClient.listItems.mockResolvedValue([])
-    mockedClient.createItem.mockResolvedValue({
-      id: 2,
-      name: 'mouse',
-      description: null,
-      created_at: '2026-01-01T00:00:00Z',
-    })
-
-    render(<App />)
-    const user = userEvent.setup()
-
-    await user.type(screen.getByLabelText('name'), 'mouse')
-    await user.click(screen.getByRole('button', { name: /add item/i }))
-
-    expect(await screen.findByText('mouse')).toBeInTheDocument()
-    expect(mockedClient.createItem).toHaveBeenCalledWith({ name: 'mouse', description: undefined })
+    expect(screen.getByRole('heading', { name: 'Chat' })).toBeInTheDocument()
+    expect(screen.getByPlaceholderText('메시지를 입력하세요')).toBeInTheDocument()
   })
 })

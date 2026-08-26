@@ -1,20 +1,31 @@
-# POST /api/v1/chat 테스트. Anthropic을 실제로 부르지 않고 가짜 클라이언트로 바꿔치기해서,
-# "우리가 만든 것"(SSE 와이어 포맷 · 스키마 파싱 · 메시지 변환/필터)만 검증한다.
+# POST /api/v1/chat 테스트. 실제 Anthropic을 부르지 않고 가짜 채팅 모델로 만든
+# 그래프를 주입해서, "우리가 만든 것"(SSE 와이어 포맷 · 스키마 파싱 · 메시지 변환/필터
+# · 그래프 배선)만 검증한다.
 #
-# 실제 API를 부르면 (1) 돈이 들고 (2) 느리고 (3) 네트워크에 흔들리고 (4) CI에는 키가 없고
-# (5) LLM 출력이 매번 달라 assert를 쓸 수가 없다.
-#
-# 기대하는 SSE 바이트는 frontend/scripts/capture-wire.mjs로 실측한 1b 캡처(ai@7.0.73)다.
-# chatbot/README.md의 M1-1b 항목에 원문이 있다.
-import pytest
+# M2에서 목킹 대상이 바뀌었다: M1은 AsyncAnthropic 클라이언트를 갈아끼웠지만
+# 이제는 그래프를 통째로 갈아끼운다. 기대하는 SSE 바이트는 M1-1b 캡처 그대로이고,
+# 그게 이 단계의 핵심이다 — 내부를 LangGraph로 바꿨는데 밖으로 나가는 바이트가
+# 같아야 "동작 동일"이 증명된다.
+from typing import Any
 
-from app.api.deps import get_anthropic_client
+import pytest
+from langchain_core.callbacks import AsyncCallbackManagerForLLMRun
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessageChunk, BaseMessage
+from langchain_core.outputs import ChatGenerationChunk, ChatResult
+
+from app.api.deps import get_graph
+from app.graph import build_graph
 from app.main import app
 
-# 가짜 클라이언트가 흘려보낼 고정 델타. 값을 고정하면 매 실행이 같은 바이트를 내므로
-# 캡처와 == 하나로 비교할 수 있다. 한글을 넣은 이유는 ensure_ascii=False가
-# 실제로 동작하는지(=\uXXXX로 escape되지 않는지) 같이 확인하기 위함이다.
+# 가짜 모델이 흘려보낼 고정 델타. 값을 고정하면 매 실행이 같은 바이트를 내므로
+# 1b 캡처와 == 하나로 비교할 수 있다. 한글을 넣은 이유는 ensure_ascii=False가
+# 실제로 동작하는지 같이 확인하기 위함이다.
 FAKE_DELTAS = ["안녕", "하세", "요"]
+
+# 가짜 모델이 어떤 메시지를 받았는지 기록해둔다. "무엇이 모델에 전달됐는가"를
+# 검증하는 게 이 테스트의 핵심이다 — 응답만 보면 히스토리 누락을 못 잡는다.
+CALLS: list[list[BaseMessage]] = []
 
 # 1b 캡처 그대로. 델타 3개이므로 text-delta도 3개다.
 EXPECTED_SSE = (
@@ -31,75 +42,61 @@ EXPECTED_SSE = (
 )
 
 
-class FakeStream:
-    """client.messages.stream(...)이 돌려주는 것의 최소 대역품.
+class FakeChatModel(BaseChatModel):
+    """LangGraph 노드가 부를 가짜 채팅 모델.
 
-    진짜 객체는 async context manager이고 .text_stream 속성으로 델타를 흘린다.
-    라우터가 실제로 쓰는 건 그 둘뿐이므로 그 둘만 흉내낸다.
+    진짜 ChatAnthropic이 하는 일 중 우리가 실제로 쓰는 표면만 흉내낸다.
     """
 
-    async def __aenter__(self):
-        # async with 진입 시 호출된다. as 뒤의 변수에 담길 값을 반환한다.
-        return self
-
-    async def __aexit__(self, *exc_info):
-        # 블록을 나갈 때 호출된다. False를 돌려주면 "예외를 삼키지 않는다"는 뜻이다.
-        # True를 돌려주면 테스트 중 발생한 예외가 조용히 사라져서 통과해버린다.
-        return False
-
     @property
-    def text_stream(self):
-        # 진짜 SDK도 이 속성이 async iterator를 준다. 매번 새 제너레이터를 만들어야
-        # 두 번 호출해도 이미 소진된 iterator를 주지 않는다.
-        async def gen():
-            for delta in FAKE_DELTAS:
-                yield delta
+    def _llm_type(self) -> str:
+        # BaseChatModel의 추상 멤버. 로깅·직렬화에 쓰인다.
+        return "fake"
 
-        return gen()
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
+        # 동기 · 비스트리밍 경로. 여기로 들어왔다는 건 스트리밍을 안 탔다는 뜻이라
+        # 조용히 통과시키지 않고 터뜨린다. streaming 설정이 잘못돼도 테스트는
+        # 통과해버리는 상황(청크 1개짜리 가짜 스트리밍)을 막는 가드다.
+        raise AssertionError("_generate가 호출됐다 = 스트리밍 경로를 타지 않았다")
 
-
-class FakeMessages:
-    """client.messages 자리에 들어갈 객체."""
-
-    def __init__(self):
-        # 라우터가 어떤 인자로 불렀는지 기록해둔다. "무엇이 Anthropic에 전달됐는가"를
-        # 검증하는 게 이 테스트의 핵심이다 — 응답만 보면 히스토리 누락을 못 잡는다.
-        self.calls = []
-
-    def stream(self, **kwargs):
-        # 진짜 SDK의 stream()도 async 함수가 아니다. async context manager를
-        # 반환하는 평범한 함수라서 여기서도 def로 맞춘다.
-        # (async def로 만들면 라우터의 `async with`가 코루틴을 받아 TypeError가 난다.)
-        self.calls.append(kwargs)
-        return FakeStream()
-
-
-class FakeAnthropic:
-    """AsyncAnthropic 자리에 들어갈 객체. 라우터는 .messages.stream()만 쓴다."""
-
-    def __init__(self):
-        self.messages = FakeMessages()
+    async def _astream(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: AsyncCallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ):
+        # 라우터가 실제로 타는 경로. 노드는 ainvoke()를 부르지만, _astream이
+        # 정의돼 있으면 LangChain이 이쪽으로 보낸다(실측 확인).
+        CALLS.append(messages)
+        for delta in FAKE_DELTAS:
+            chunk = ChatGenerationChunk(message=AIMessageChunk(content=delta))
+            if run_manager:
+                # ★ 이 콜백이 stream_mode="messages"가 토큰을 잡아내는 통로다.
+                # 빼먹으면 청크가 완성본 1개로만 나와 스트리밍이 죽는다.
+                await run_manager.on_llm_new_token(delta, chunk=chunk)
+            yield chunk
 
 
 @pytest.fixture
-def fake_anthropic():
-    """가짜 클라이언트를 주입하고, 테스트가 끝나면 원복한다.
+def fake_graph():
+    """가짜 모델로 만든 그래프를 주입하고, 테스트가 끝나면 원복한다.
 
-    yield 뒤의 정리 코드가 중요하다. dependency_overrides는 app 객체에 붙는
-    전역 상태라서, 지우지 않으면 다음 테스트까지 가짜가 살아남는다. 테스트를
-    단독으로 돌리면 통과하고 전체로 돌리면 깨지는 종류의 버그가 여기서 나온다.
+    dependency_overrides는 app 객체에 붙는 전역 상태라, 지우지 않으면 다음
+    테스트까지 가짜가 살아남는다. 단독 실행은 통과하고 전체 실행에서만
+    깨지는 종류의 버그가 여기서 나온다. CALLS도 같은 이유로 매번 비운다.
     """
-    fake = FakeAnthropic()
-    app.dependency_overrides[get_anthropic_client] = lambda: fake
-    yield fake
-    del app.dependency_overrides[get_anthropic_client]
+    CALLS.clear()
+    graph = build_graph(FakeChatModel())
+    app.dependency_overrides[get_graph] = lambda: graph
+    yield graph
+    del app.dependency_overrides[get_graph]
 
 
 def _wire(*messages):
     """useChat이 보내는 최상위 본문 모양을 만드는 헬퍼.
 
     실측한 포맷(frontend/node_modules/ai/dist/index.js:17593)을 한 곳에만 적어둔다.
-    각 테스트가 이 dict를 복붙하면, 포맷이 바뀔 때 고칠 곳이 여러 군데로 흩어진다.
     """
     return {
         "id": "test-chat",
@@ -114,38 +111,45 @@ def _msg(msg_id, role, text):
     return {"id": msg_id, "role": role, "parts": [{"type": "text", "text": text}]}
 
 
+def _seen():
+    """가짜 모델이 받은 메시지를 (타입, 내용) 쌍으로 납작하게 편다.
+
+    LangChain 메시지 객체를 그대로 비교하면 실패 메시지가 읽기 어려워서,
+    확인하고 싶은 두 가지(역할·내용)만 남긴다.
+    """
+    return [(type(m).__name__, m.content) for m in CALLS[0]]
+
+
 def test_chat_health(client):
     response = client.get("/api/v1/chat/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
 
 
-def test_stream_matches_ai_sdk_wire_format(client, fake_anthropic):
-    # 이 테스트가 M1의 핵심이다. 1b에서 실측한 바이트와 우리 출력이 같은지를 본다.
+def test_stream_matches_ai_sdk_wire_format(client, fake_graph):
+    # 2a의 핵심 테스트다. 내부를 LangGraph로 갈아엎었는데도 밖으로 나가는
+    # 바이트가 1b 캡처와 완전히 같아야 한다.
     response = client.post("/api/v1/chat", json=_wire(_msg("m1", "user", "안녕?")))
 
     assert response.status_code == 200
-    # SSE 청크 전체를 한 문자열로 비교한다. 개별 청크로 쪼개 비교하면 순서 버그를
-    # 놓치기 쉽고, 통째로 비교하면 순서·개수·구분자가 한 번에 검증된다.
     assert response.text == EXPECTED_SSE
 
 
-def test_stream_headers(client, fake_anthropic):
+def test_stream_headers(client, fake_graph):
     response = client.post("/api/v1/chat", json=_wire(_msg("m1", "user", "안녕?")))
 
-    # x-vercel-ai-ui-message-stream은 AI SDK 고유 헤더다. 이게 없으면 useChat이
-    # 응답을 UI message stream으로 인식하지 않는다 — 조용히 실패하는 종류라
-    # 명시적으로 못 박아둔다.
+    # x-vercel-ai-ui-message-stream이 없으면 useChat이 응답을 UI message stream으로
+    # 인식하지 않는다 — 조용히 실패하는 종류라 명시적으로 못 박아둔다.
     assert response.headers["x-vercel-ai-ui-message-stream"] == "v1"
-    # charset=utf-8은 StreamingResponse가 media_type에 자동으로 붙여준다.
     assert response.headers["content-type"] == "text/event-stream; charset=utf-8"
     assert response.headers["cache-control"] == "no-cache"
     assert response.headers["x-accel-buffering"] == "no"
 
 
-def test_full_history_is_forwarded(client, fake_anthropic):
+def test_full_history_is_forwarded(client, fake_graph):
     # 응답만 보면 절대 못 잡는 버그를 잡는 테스트: "마지막 메시지만 넘기고 있다".
-    # 실제 LLM이라면 그럴듯한 답이 나와서 통과해버린다.
+    # add_messages가 dict를 LangChain 메시지로 변환하므로, 역할이 보존되는지도
+    # 여기서 같이 확인된다.
     client.post(
         "/api/v1/chat",
         json=_wire(
@@ -155,19 +159,17 @@ def test_full_history_is_forwarded(client, fake_anthropic):
         ),
     )
 
-    # 라우터가 Anthropic을 정확히 한 번 불렀고,
-    assert len(fake_anthropic.messages.calls) == 1
-    # 히스토리 3개가 role까지 보존돼 전달됐는지 본다.
-    assert fake_anthropic.messages.calls[0]["messages"] == [
-        {"role": "user", "content": "My favorite color is teal."},
-        {"role": "assistant", "content": "Got it, teal."},
-        {"role": "user", "content": "What is my favorite color?"},
+    assert len(CALLS) == 1
+    assert _seen() == [
+        ("HumanMessage", "My favorite color is teal."),
+        ("AIMessage", "Got it, teal."),
+        ("HumanMessage", "What is my favorite color?"),
     ]
 
 
-def test_system_role_is_dropped(client, fake_anthropic):
-    # role="system"을 Anthropic messages 배열에 넣으면 400이다. 시스템 프롬프트는
-    # messages.stream(system=...) 별도 파라미터로 준다.
+def test_system_role_is_dropped(client, fake_graph):
+    # role="system"을 messages 배열에 그대로 넣으면 Anthropic이 400을 낸다.
+    # 시스템 프롬프트는 별도 경로로 준다.
     client.post(
         "/api/v1/chat",
         json=_wire(
@@ -176,12 +178,11 @@ def test_system_role_is_dropped(client, fake_anthropic):
         ),
     )
 
-    assert fake_anthropic.messages.calls[0]["messages"] == [{"role": "user", "content": "hello"}]
+    assert _seen() == [("HumanMessage", "hello")]
 
 
-def test_non_text_parts_are_dropped(client, fake_anthropic):
-    # 텍스트 파트가 없는 메시지는 content가 ""가 되어 Anthropic이 400을 낸다
-    # ("text content blocks must be non-empty"). 걸러지는지 확인한다.
+def test_non_text_parts_are_dropped(client, fake_graph):
+    # 텍스트 파트가 없는 메시지는 content가 ""가 되어 모델이 400을 낸다.
     payload = _wire(_msg("m1", "user", "hello"))
     payload["messages"].insert(
         0, {"id": "f1", "role": "user", "parts": [{"type": "file", "url": "x"}]}
@@ -189,12 +190,11 @@ def test_non_text_parts_are_dropped(client, fake_anthropic):
 
     client.post("/api/v1/chat", json=payload)
 
-    assert fake_anthropic.messages.calls[0]["messages"] == [{"role": "user", "content": "hello"}]
+    assert _seen() == [("HumanMessage", "hello")]
 
 
-def test_multiple_text_parts_are_joined(client, fake_anthropic):
-    # 한 메시지에 텍스트 파트가 여러 개인 경우. 구분자 없이 붙어야 한다 —
-    # 파트 경계는 스트리밍 분할 지점일 뿐 단어 경계가 아니다.
+def test_multiple_text_parts_are_joined(client, fake_graph):
+    # 파트 경계는 스트리밍 분할 지점일 뿐 단어 경계가 아니므로 구분자 없이 붙는다.
     client.post(
         "/api/v1/chat",
         json=_wire(
@@ -209,27 +209,27 @@ def test_multiple_text_parts_are_joined(client, fake_anthropic):
         ),
     )
 
-    assert fake_anthropic.messages.calls[0]["messages"] == [
-        {"role": "user", "content": "안녕하세요"}
-    ]
+    assert _seen() == [("HumanMessage", "안녕하세요")]
 
 
-def test_model_and_max_tokens_come_from_settings(client, fake_anthropic):
-    # 모델명을 라우터에 하드코딩하지 않았는지 확인한다. settings에서 온다면
+def test_model_is_configured_from_settings():
+    # 모델명을 코드에 하드코딩하지 않았는지 확인한다. settings에서 온다면
     # config.py 한 줄로 모델을 교체할 수 있다는 뜻이다.
+    #
+    # _model이라는 비공개 이름을 테스트가 들여다보는 건 일반적으로 냄새지만,
+    # 여기서는 의도적이다 — 아래 streaming 회귀를 막을 다른 방법이 없다.
+    from app.api import deps
     from app.core.config import settings
 
-    client.post("/api/v1/chat", json=_wire(_msg("m1", "user", "hi")))
+    assert deps._model.model == settings.anthropic_model
+    assert deps._model.max_tokens == 1024
+    # ★ streaming=False면 astream(stream_mode="messages")가 완성본 1개만 흘린다.
+    # 에러가 안 나고 "글자가 툭 나타나는" 형태로만 드러나므로 여기서 못 박는다.
+    assert deps._model.streaming is True
 
-    call = fake_anthropic.messages.calls[0]
-    assert call["model"] == settings.anthropic_model
-    assert call["max_tokens"] == 1024
 
-
-def test_empty_messages_returns_400(client, fake_anthropic):
-    # 텍스트가 하나도 없는 요청. 스트림을 시작한 뒤 Anthropic이 400을 내면
-    # 클라이언트에는 "200 헤더 + 빈 본문 + 끊김"으로 보여서 진단이 어렵다.
-    # 스트림 시작 전에 걸러 정상적인 4xx가 나오는지 확인한다.
+def test_empty_messages_returns_400(client, fake_graph):
+    # 텍스트가 하나도 없는 요청. 스트림 시작 전에 걸러 정상적인 4xx가 나오는지.
     response = client.post(
         "/api/v1/chat",
         json=_wire({"id": "f1", "role": "user", "parts": [{"type": "file", "url": "x"}]}),
@@ -237,21 +237,17 @@ def test_empty_messages_returns_400(client, fake_anthropic):
 
     assert response.status_code == 400
     assert response.json() == {"detail": "no text content in messages"}
-    # 그리고 Anthropic을 아예 부르지 않았어야 한다. 불렀다면 가드가 스트림
-    # 안쪽에 있다는 뜻이다.
-    assert fake_anthropic.messages.calls == []
+    # 그리고 모델을 아예 부르지 않았어야 한다. 불렀다면 가드가 스트림 안쪽에 있다는 뜻이다.
+    assert CALLS == []
 
 
-def test_old_request_format_is_rejected(client, fake_anthropic):
+def test_old_request_format_is_rejected(client, fake_graph):
     # 1a~1c-A에서 쓰던 {"message": "..."} 포맷이 확실히 막히는지.
-    # 스키마가 실제로 검증하고 있다는 증거다 — 안 그러면 extra="ignore"가
-    # 다 삼켜서 messages가 빈 리스트로 통과할 수도 있다.
     response = client.post("/api/v1/chat", json={"message": "old format"})
     assert response.status_code == 422
 
 
-def test_invalid_role_is_rejected(client, fake_anthropic):
-    # role을 Literal로 좁게 잡은 것의 값. 오타나 예상 못 한 값이 조용히
-    # 통과하지 않고 422로 걸린다.
+def test_invalid_role_is_rejected(client, fake_graph):
+    # role을 Literal로 좁게 잡은 것의 값. 오타가 조용히 통과하지 않는다.
     response = client.post("/api/v1/chat", json=_wire(_msg("m1", "usr", "typo in role")))
     assert response.status_code == 422

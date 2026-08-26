@@ -443,6 +443,92 @@ FastAPI가 LLM을 직접 호출해 SSE로 스트리밍, 프론트는 `ai`/`@ai-s
 **검증**: 같은 `thread_id`로 2회 연속 요청해 이전 턴을 기억하는지 확인, `graph.get_state(config)`로 체크포인트
 내용 직접 출력.
 
+**체크리스트 (진행 중)** — M1을 1a~1f로 쪼갠 것과 같은 이유로 셋으로 나눴다: 미지수를 한 번에 하나씩만 남긴다.
+
+| | 단계 | 바뀌는 것 | 미지수 |
+|---|---|---|---|
+| 2a | LangGraph로 교체 (**동작 완전 동일**) | 백엔드 내부만 | LangGraph 자체 |
+| 2b | `InMemorySaver` + `thread_id` (**아키텍처 전환**) | 백엔드 + 프론트 + 스키마 + 테스트 | 상태 소유권 이동 |
+| 2c | 도구 1개 + 조건부 엣지 | 그래프 구조 | 라우팅 · 도구 실행 |
+
+- [x] **2a. LangGraph 배선으로 교체 — 동작은 그대로** (2026-08-26 완료)
+
+  **왜 "동작 동일"부터인가**: 2a에서는 프론트도 요청/응답 포맷도 한 글자도 안 바뀐다. 오직 "누가 토큰을
+  만드는가"만 Anthropic 직접 호출 → LangGraph 그래프로 바뀐다. 그래서 **기존 테스트 16개가 그대로
+  통과해야 하고**, 하나라도 깨지면 그건 LangGraph 배선 문제다 — 원인이 자동으로 좁혀진다.
+  2b에서 스키마와 프론트를 동시에 바꿔버리면 이 안전망이 사라진다.
+  (실무에서 큰 리팩터링을 할 때 "동작 불변 + 구조 변경"을 먼저 커밋하고 기능 변경을 나중에 얹는 것과 같은 이유.)
+
+  **M1-1c 설계가 현금화된 지점**: `ui_message_stream(deltas: AsyncIterable[str])`로 "누가 토큰을
+  만드는가"를 인자로 밀어냈던 덕에 **`core/ai_sdk.py`는 한 줄도 안 바뀌었다.** 바뀐 건 라우터의
+  `text_deltas()` 하나. `to_anthropic_messages()`도 그대로다 — `add_messages`가
+  `{"role","content"}` dict를 `HumanMessage`/`AIMessage`로 알아서 변환하기 때문(실측).
+
+  **설치 (`uv add langgraph langchain-anthropic`)**
+  ```
+  langgraph 1.2.11 / langchain-anthropic 1.6.1 / langchain-core 1.6.0
+  langgraph-checkpoint 4.2.0 · langgraph-prebuilt 1.1.0 (langgraph가 함께 끌고 옴)
+  ```
+
+  **LangChain 메시지를 쓰기로 한 결정**: `langgraph`만 쓰고 노드 안에서 `AsyncAnthropic`을 직접 부르는
+  선택지도 있었다(의존성 최소, 지금 쓰는 dict 그대로). 그런데 2c의 `bind_tools`·`ToolNode`·
+  `tools_condition`과 M3의 `langchain-qdrant`가 전부 **LangChain 메시지 객체를 전제로 만들어진 부품**이라,
+  그 길로 가면 M2 후반에 부품을 손으로 다시 만들어야 한다. 그래서 `langchain-anthropic`을 택했다.
+  **대가는 명확히 알고 간다 — 추상화 층이 하나 늘어 무슨 요청이 나가는지가 한 겹 가려진다.**
+  실무에서 LangChain을 두고 논쟁이 갈리는 지점이 정확히 여기다(디버깅 난이도, 프로바이더 신기능 지연).
+  M4의 Langfuse 트레이싱이 그 가림막을 다시 걷어내는 역할을 한다.
+
+  **실측한 API 4가지** (버전이 바뀌면 다시 확인할 것)
+  1. import 경로: `langgraph.checkpoint.memory.InMemorySaver`(과거엔 `MemorySaver`),
+     `langgraph.graph.{StateGraph,START,END}`, `langgraph.graph.message.add_messages`,
+     `langgraph.prebuilt.{ToolNode,tools_condition}`
+  2. `stream_mode` 7종: `values` `updates` `checkpoints` `tasks` `debug` **`messages`** `custom`
+  3. `stream_mode="messages"`는 **`(AIMessageChunk, metadata)` 2-튜플**을 흘린다.
+     metadata에 `langgraph_node`가 있어 "어느 노드의 토큰인가"를 구분할 수 있다(노드가 늘어나는 M3부터 필요).
+  4. `ChatAnthropic`: `model`(alias `model_name`) 필수, `max_tokens`(alias `max_tokens_to_sample`) 기본 None,
+     `api_key` → `anthropic_api_key` 필드(기본 `SecretStr('')`), **`streaming` 기본 `False`**.
+     **빈 문자열 키로도 생성은 된다** → 키 없는 CI/pytest에서 앱 import가 안 터진다.
+
+  **★ 함정 1: `streaming=False`가 조용히 스트리밍을 죽인다 ★**
+  같은 그래프를 실제 Anthropic으로 두 번 돌려 비교한 실측:
+  ```
+  streaming=False (기본값): chunks=1  joined='1\n2\n3\n4\n5'
+  streaming=True          : chunks=3  joined='1\n2\n3\n4\n5'
+  ```
+  **둘 다 에러가 없고 최종 답도 같다.** `False`면 완성된 답이 청크 하나로 나올 뿐이라, 화면에서
+  "글자가 흐르지 않고 툭 나타나는" 것으로만 드러난다. `test_model_is_configured_from_settings`에서
+  `deps._model.streaming is True`를 못 박아 회귀를 막았다(비공개 `_model`을 테스트가 들여다보는 건
+  일반적으로 냄새지만, 이 회귀를 잡을 다른 방법이 없어 의도적으로 허용).
+
+  **★ 함정 2: `chunk.content`가 아니라 `chunk.text` ★**
+  ```python
+  AIMessageChunk(content=[{'type':'text','text':'AAA'}, {'type':'tool_use', ...}])
+    .content -> list   # 도구 호출/citations가 붙으면 리스트가 된다
+    .text    -> 'AAA'  # 텍스트 블록만 이어붙여 항상 str
+  ```
+  2c에서 도구를 붙이는 순간 리스트로 바뀌므로, 지금부터 `.text`를 쓰면 그때 안 깨진다.
+
+  **함정 3: 리듀서를 빼먹으면 히스토리가 날아간다.** `Annotated[list, add_messages]`의 두 번째 항목이
+  리듀서다. 없으면 노드가 반환한 `{"messages": [새 메시지]}`가 기존 리스트를 **덮어쓴다.**
+  LangGraph 초보의 1번 실수.
+
+  **테스트 목킹이 바뀐 지점**: M1은 `AsyncAnthropic` 클라이언트를 갈아끼웠지만, 이제 `get_graph`를
+  override해 **가짜 모델로 만든 그래프를 통째로** 주입한다. 가짜는 `BaseChatModel`을 상속해
+  `_astream`만 구현하고(노드가 `ainvoke`를 불러도 `_astream`이 정의돼 있으면 그쪽으로 간다 — 실측),
+  `run_manager.on_llm_new_token()`을 호출한다 — **이 콜백이 `stream_mode="messages"`가 토큰을 잡아내는
+  통로다.** 빼먹으면 청크가 완성본 1개로만 나온다. `_generate`는 `AssertionError`를 던지게 두어
+  "스트리밍 경로를 안 탔는데도 테스트가 통과하는" 상황을 막았다.
+
+  **검증**: `uv run pytest -q` → **16 passed** (M1과 같은 개수). 특히
+  `test_stream_matches_ai_sdk_wire_format`이 통과했다 = 내부를 갈아엎었는데 밖으로 나가는 바이트가
+  1b 캡처와 완전히 동일하다. 브라우저에서 스트리밍 동작도 확인.
+
+  **남겨둔 것**: `to_anthropic_messages`라는 이름이 이제 살짝 어긋난다(실제로는 `add_messages`가
+  소비하는 dict를 만든다). 2b에서 이 함수를 어차피 다시 건드리므로 그때 정리한다.
+  **이름이 어긋난 걸 알면서 두는 것과 모르고 두는 것은 다르다.**
+- [ ] 2b. `InMemorySaver` + `thread_id` — 상태의 주인을 브라우저에서 서버로
+- [ ] 2c. 도구 1개 + `add_conditional_edges(tools_condition)`
+
 ### M3 — Qdrant 연동 (RAG 완성)
 Qdrant Cloud 가입 → 무료 클러스터 생성 → API Key/URL 확보(무료 티어는 1주 미사용 시 suspend, 4주 시 삭제 유의).
 `qdrant-client` + `langchain-qdrant`, 임베딩은 OpenAI `text-embedding-3-small`. 일회성 인입 스크립트

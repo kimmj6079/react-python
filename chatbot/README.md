@@ -608,7 +608,105 @@ FastAPI가 LLM을 직접 호출해 SSE로 스트리밍, 프론트는 `ai`/`@ai-s
   3. **`trigger="regenerate-message"`를 400으로 막아뒀다** — 재생성은 그래프 상태를 되감아야 하는
      별도 기능(`get_state_history` / `update_state`)이라 조용히 "직전 질문 재전송"으로 처리하면
      답이 두 번 저장돼 대화가 서서히 오염된다. **못 하는 것을 명확히 거절하는 편이 낫다.**
-- [ ] 2c. 도구 1개 + `add_conditional_edges(tools_condition)`
+- [x] **2c. 도구 1개 + `add_conditional_edges(tools_condition)`** (2026-08-27 완료)
+
+  **먼저 개념 하나 — LLM은 함수를 실행하지 않는다.** 여기가 도구 호출에서 가장 흔한 오해다.
+  모델이 할 수 있는 건 텍스트를 만드는 것뿐이다. 인터넷도 DB도 시계도 없다. 그래서 모델은
+  함수를 부르는 대신 **"이 함수를 이 인자로 불러줘"라는 쪽지를 쓴다.** 실행은 **우리 서버가**
+  하고, 결과를 **다시 모델에게 알려준다.** 도구 호출은 마법이 아니라 **편지 왕복 2번**이다.
+
+  | | 누가 | 무슨 일 |
+  |---|---|---|
+  | 1 | 사용자 | "서울 지금 몇 시야?" |
+  | 2 | **모델**(1번째 호출) | 답을 못 한다. 쪽지를 쓴다 → `get_current_time(timezone="Asia/Seoul")` |
+  | 3 | **우리 서버**(`ToolNode`) | 쪽지를 읽고 **진짜 파이썬 함수 실행** → `"2026-08-27T11:46:37+09:00"` |
+  | 4 | **모델**(2번째 호출) | 결과를 받아 사람 말로 → "서울 현재 시각: 오전 11:46" |
+
+  **모델을 두 번 부른다**는 것이 핵심이고, 그래서 그래프에 **사이클**이 필요했다.
+
+  **넷으로 쪼갰다** — 2c-1(실측) / 2c-2(배선) / 2c-3(필터) / 2c-4(테스트).
+  실측을 먼저 한 이유: 2c에는 **에러 없이 조용히 새는 함정**이 있어서, 코드를 다 쓴 뒤 만나면
+  원인이 어디인지 헷갈린다. 실제로 실측이 그걸 미리 잡았다(아래 함정 1).
+
+  **실측한 API 5가지** (`scripts/probe_tools.py`, 버전이 바뀌면 다시 돌린다)
+  1. `@tool`이 만드는 것은 `StructuredTool`. **docstring이 `Args:` 섹션까지 통째로**
+     `description`이 되어 모델에게 전송되고, 타입 힌트+기본값은 `input_schema`(JSON Schema)가 된다.
+     즉 **docstring은 코드 문서가 아니라 프롬프트의 일부다.**
+  2. `bind_tools`는 원본을 안 바꾸고 새 객체(`_ChatModelBinding`)를 준다 → `deps.py`의 `_model` 재사용 안전.
+  3. `tools_condition`의 반환 타입이 `Literal['tools', '__end__']` — **문자열 `"tools"`가
+     하드코딩**이라 노드 이름을 그렇게 지어야 한다(다르게 하려면 `add_conditional_edges`의
+     3번째 인자로 매핑을 준다).
+  4. `BaseChatModel.bind_tools`의 **기본 구현은 `raise NotImplementedError`**다.
+     → 테스트의 가짜 모델에 `bind_tools`를 안 넣으면 **21개가 전부 ERROR**로 죽는다.
+  5. 스트리밍에서 도구 호출은 `tool_call_chunks`(인자가 **문자열 JSON**)로 오고,
+     LangChain이 그걸 모아 `.tool_calls`(dict)로 파싱한다.
+
+  **★ 함정 1: `stream_mode="messages"`에 `ToolMessage`도 섞여 나온다 ★**
+  ```
+  [call_model] AIMessageChunk  text=''                              ← 쪽지 작성 중(텍스트 없음)
+  [tools     ] ToolMessage     text='2026-08-27T11:46:37+09:00'    ← ★ 이게 샌다 ★
+  [call_model] AIMessageChunk  text='서울 현재 시각: 오전 11:46'
+  ```
+  이름이 "messages"지 "LLM 토큰"만 준다고 약속한 적이 없다. 안 거르면 **도구 실행 결과가
+  그대로 채팅창에 찍힌다** — 에러도 없고 200도 정상이라 화면을 눈으로 보기 전엔 모른다.
+  `chat.py`에 `if not isinstance(chunk, AIMessageChunk): continue` 한 줄로 막았다.
+
+  **★ 함정 2: `content=list`가 "항상"이다 — 예상보다 넓었다 ★**
+  FLOW.md에 "도구를 부를 때 리스트가 된다"고 적어뒀는데, 실제로는 **`bind_tools`를 한
+  순간부터 도구를 쓰든 안 쓰든 늘 리스트다.** 2a에서 `.content` 대신 `.text`를 써둔 덕에
+  `chat.py`는 이 변화에 한 줄도 영향받지 않았다 — **2a의 주석에 "2c에서 겪는다"고 적어둔
+  그 시점이 정확히 지금이었다.**
+
+  **★ 함정 3: 조건분기를 우리가 하지 않는다 ★**
+  `tools_condition`의 실제 본문은 이것뿐이다:
+  ```python
+  if hasattr(ai_message, "tool_calls") and len(ai_message.tool_calls) > 0:
+      return "tools"
+  return "__end__"
+  ```
+  **키워드 매칭도 정규식도 없다.** 판단은 Anthropic 서버에서 모델이 하고(근거는 우리가 보낸
+  `description`), 우리는 이미 나온 `tool_calls`가 비었나만 본다. 실측:
+  `"안녕!"` → `tool_calls: []` / `"서울 지금 몇 시야?"` → `tool_calls: [{...}]`.
+  **함의 3가지**: (a) 도구를 안 부르면 로직이 아니라 `description`을 고친다,
+  (b) 확률적이라 같은 질문에도 다르게 행동할 수 있다 → **도구 경로 테스트에 진짜 모델을
+  쓰면 안 된다**, (c) `tool_choice="any"`로 강제할 수는 있다.
+
+  **함정 4: Windows 콘솔 인코딩.** 실측 스크립트가 `UnicodeEncodeError: 'cp949' codec can't
+  encode '—'`로 죽었다. 이 저장소에서 **콘솔에 한글을 직접 print하는 첫 코드**라 여기서
+  처음 터졌다(FastAPI는 HTTP로 UTF-8을 내보내고, Docker는 리눅스라 무관). 로컬 Windows
+  개발자만 겪고 CI·운영에서는 안 보이는 종류다. `sys.stdout.reconfigure(encoding="utf-8")`로
+  스크립트가 자기 환경을 보장하게 했다.
+
+  **테스트를 짝으로 둔 이유**: `test_tool_call_round_trip`(도구 경로가 실제로 돈다)과
+  `test_tool_result_does_not_leak_into_the_stream`(도구 결과가 화면으로 안 샌다).
+  전자만 있으면 결과가 새도 통과하고, 후자만 있으면 **도구가 아예 안 돌아도** 통과한다.
+  2b의 "기억한다 + 안 섞인다" 짝과 같은 구조다.
+  가짜 모델도 둘로 나뉘었다 — `FakeChatModel`(도구를 절대 안 부름, 기존 21개가 2b와 같은
+  경로를 지킴)과 `ToolCallingFakeModel`(반드시 한 번 부름, 사이클 경로를 지킴).
+  도구 대역은 반환값을 `"TOOL_RESULT_MUST_NOT_LEAK"` 센티넬로 두었다 — 진짜 시각을 쓰면
+  테스트가 시계에 의존하고 실패 원인도 흐릿해진다. `build_graph`에 `tools` 인자를 만든 것이
+  여기서 값을 했다.
+
+  **검증**: `uv run pytest -q` → **23 passed**(21 + 2). 브라우저에서 "서울 지금 몇 시야?" →
+  도구 호출 후 사람 말로 답변, "안녕" → 도구를 안 부름(**반증 케이스**).
+  그래프 배선은 `_graph.get_graph().draw_mermaid()`로 확인했다 —
+  `call_model -.-> tools`(점선=조건부) / `tools --> call_model`(실선=사이클)이 보이면 맞다.
+
+  **실제로 테스트가 버그를 잡았다**: 2c-3(필터)을 건너뛰고 2c-4(테스트)를 먼저 넣었더니
+  `test_tool_result_does_not_leak_into_the_stream`이 `"delta":"TOOL_RESULT_MUST_NOT_LEAK"`를
+  찾아내 실패했다. **브라우저로는 "잘 된다"고 보였던 상태였다** — 눈으로 보는 검증의 한계다.
+
+  **알고 남겨둔 것**
+  1. **도구의 인자는 사용자가 아니라 LLM이 만든다 = 신뢰할 수 없는 입력이다.** 지금은
+     `ZoneInfo`가 모르는 이름에 예외를 던지는 것으로 충분하지만, 파일 경로·SQL·셸 명령을
+     받는 도구였다면 그 자리가 그대로 취약점이 된다("모델이 만든 값"은 방어가 되지 않는다 —
+     모델은 문서에 심어둔 문장에 설득당할 수 있다). M12에서 정면으로 다룬다.
+  2. **`ToolNode`의 예외 처리를 확인하지 않았다.** 도구가 던진 예외를 `ToolMessage`에
+     담아 모델에게 돌려주는 것이 기본 동작인데(`handle_tool_errors`), 실측하지 않았다.
+  3. **노드 이름 필터를 미리 넣지 않았다.** 지금은 타입(`AIMessageChunk`)으로 거른다.
+     M9의 쿼리 재작성처럼 "LLM을 부르지만 화면에 보이면 안 되는 노드"가 생기면 그때
+     `_meta["langgraph_node"]` 조건이 붙는다. **아직 없는 문제를 막는 코드는 왜 있는지
+     아무도 모르게 되기 때문에** 지금 넣지 않았다.
 
 ### M3 — Qdrant 연동 (RAG 완성)
 Qdrant Cloud 가입 → 무료 클러스터 생성 → API Key/URL 확보(무료 티어는 1주 미사용 시 suspend, 4주 시 삭제 유의).
@@ -1076,7 +1174,7 @@ Langfuse score(M4가 이미 붙어 있으니 저장소를 새로 만들 필요�
 ## 진행 현황
 - [x] M0 — 배선 확인 (새 라우터 + 새 탭)
 - [x] M1 — 단순 LLM 대화 + 스트리밍 (+ 테스트 목킹 전략 + 챗봇 UI 마감)
-- [ ] M2 — LangGraph 도입
+- [x] M2 — LangGraph 도입 (2a 배선 교체 · 2b 서버 체크포인터 · 2c 도구+조건부 엣지)
 - [ ] M3 — Qdrant RAG
 - [ ] M4 — Langfuse 트레이싱
 - [ ] M5 — CI/배포 반영 + 선택 확장

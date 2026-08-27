@@ -2,6 +2,7 @@
 # 꺼내는 일만 한다. 와이어 포맷(AI SDK 프로토콜) 변환은 app/core/ai_sdk.py에 위임한다.
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
+from langchain_core.messages import AIMessageChunk
 
 from app.api.deps import Graph
 from app.core.ai_sdk import (
@@ -71,13 +72,16 @@ async def chat(payload: ChatRequest, graph: Graph) -> StreamingResponse:
             config,
             stream_mode="messages",
         ):
+            # ★ 2c에서 필터가 하나 늘었다 ★
+            # stream_mode="messages"는 "메시지"를 흘리지 "LLM 토큰"만 흘린다고
+            # 약속한 적이 없다. 도구 노드가 생기면서 ToolMessage(도구 실행 결과)도
+            # 같은 통로로 나온다. 그건 모델에게 건네줄 재료지 사용자에게 보여줄
+            # 글이 아니다 — 안 거르면 답변 앞에 원시 결과가 그대로 찍힌다.
+            if not isinstance(chunk, AIMessageChunk):
+                continue
+
             # chunk.content가 아니라 chunk.text를 쓴다.
-            # content는 문자열일 수도, 콘텐츠 블록 리스트일 수도 있다 — 도구 호출이
-            # 붙으면 리스트가 된다(2c에서 실제로 겪는다). text는 그중 텍스트 블록만
-            # 이어붙여 항상 str을 준다.
-            #
-            # 빈 문자열을 거르는 이유: 도구 호출 청크처럼 텍스트가 없는 청크도
-            # 흘러나오는데, 그대로 내보내면 의미 없는 text-delta 이벤트가 생긴다.
+            # (이하 기존 주석 그대로)
             if chunk.text:
                 yield chunk.text
 

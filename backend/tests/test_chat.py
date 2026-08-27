@@ -12,8 +12,9 @@ from typing import Any
 import pytest
 from langchain_core.callbacks import AsyncCallbackManagerForLLMRun
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessageChunk, BaseMessage
+from langchain_core.messages import AIMessageChunk, BaseMessage, ToolMessage
 from langchain_core.outputs import ChatGenerationChunk, ChatResult
+from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
 
 from app.api.deps import get_graph
@@ -56,6 +57,20 @@ class FakeChatModel(BaseChatModel):
         # BaseChatModel의 추상 멤버. 로깅·직렬화에 쓰인다.
         return "fake"
 
+    @property
+    def _llm_type(self) -> str:
+        # BaseChatModel의 추상 멤버. 로깅·직렬화에 쓰인다.
+        return "fake"
+
+    def bind_tools(self, tools, **kwargs):
+        # BaseChatModel.bind_tools의 기본 구현은 raise NotImplementedError다(실측).
+        # 2c에서 build_graph가 이걸 부르므로 가짜 모델도 응답해야 한다.
+        #
+        # 자기 자신을 그대로 돌려준다 = 이 가짜는 도구를 절대 부르지 않는다.
+        # tool_calls가 늘 비어 있으니 tools_condition이 항상 __end__로 보내고,
+        # 기존 21개 테스트의 동작이 2b와 완전히 같게 유지된다.
+        return self
+
     def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
         # 동기 · 비스트리밍 경로. 여기로 들어왔다는 건 스트리밍을 안 탔다는 뜻이라
         # 조용히 통과시키지 않고 터뜨린다. streaming 설정이 잘못돼도 테스트는
@@ -79,6 +94,90 @@ class FakeChatModel(BaseChatModel):
                 # 빼먹으면 청크가 완성본 1개로만 나와 스트리밍이 죽는다.
                 await run_manager.on_llm_new_token(delta, chunk=chunk)
             yield chunk
+
+
+# 도구 대역. 이름은 진짜와 같게 두되(가짜 모델이 이 이름으로 부른다) 반환값만
+# 눈에 띄는 센티넬로 바꾼다. 진짜 시각을 쓰면 "SSE에 시각이 안 들어갔나"를
+# 정규식으로 확인해야 하는데, 그건 테스트가 실패했을 때 원인이 흐릿하다.
+@tool
+def get_current_time(timezone: str = "Asia/Seoul") -> str:
+    """테스트용 대역."""
+    return "TOOL_RESULT_MUST_NOT_LEAK"
+
+
+class ToolCallingFakeModel(BaseChatModel):
+    """도구를 반드시 한 번 부르는 가짜 모델. FakeChatModel과 역할이 정반대다.
+
+    FakeChatModel      : 도구를 절대 안 부른다 → 기존 21개가 2b와 같은 경로를 지킨다
+    ToolCallingFakeModel: 반드시 한 번 부른다  → 2c에서 생긴 사이클 경로를 지킨다
+    """
+
+    @property
+    def _llm_type(self) -> str:
+        return "fake-tool-calling"
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
+        raise AssertionError("_generate가 호출됐다 = 스트리밍 경로를 타지 않았다")
+
+    async def _astream(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: AsyncCallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ):
+        CALLS.append(messages)
+
+        # 진짜 모델과 같은 규칙으로 행동한다: 도구 결과가 이미 있으면 답변할 차례,
+        # 없으면 도구를 부를 차례. 이 분기가 사이클의 2바퀴째를 만든다.
+        if any(isinstance(m, ToolMessage) for m in messages):
+            for delta in ["지금", " 시각이야"]:
+                chunk = ChatGenerationChunk(message=AIMessageChunk(content=delta))
+                if run_manager:
+                    await run_manager.on_llm_new_token(delta, chunk=chunk)
+                yield chunk
+            return
+
+        # 도구 호출 청크. tool_calls를 직접 넣는 게 아니라 tool_call_chunks로 준다
+        # — 스트리밍에서는 인자 JSON이 조각조각 오기 때문에 args가 문자열이다(실측).
+        # LangChain이 이걸 모아 .tool_calls로 파싱해준다.
+        chunk = ChatGenerationChunk(
+            message=AIMessageChunk(
+                content="",
+                tool_call_chunks=[
+                    {
+                        "name": "get_current_time",
+                        "args": '{"timezone":"UTC"}',
+                        "id": "call_1",
+                        "index": 0,
+                    }
+                ],
+            )
+        )
+        if run_manager:
+            await run_manager.on_llm_new_token("", chunk=chunk)
+        yield chunk
+
+
+@pytest.fixture
+def tool_calling_graph():
+    """도구를 부르는 가짜 모델 + 대역 도구로 만든 그래프.
+
+    tools를 인자로 넘긴다 — build_graph가 tools를 받게 만든 이유가 여기서 값을 한다.
+    진짜 TOOLS를 쓰면 반환값이 실행 시각이라 테스트가 시계에 의존하게 된다.
+    """
+    CALLS.clear()
+    graph = build_graph(
+        ToolCallingFakeModel(),
+        checkpointer=InMemorySaver(),
+        tools=[get_current_time],
+    )
+    app.dependency_overrides[get_graph] = lambda: graph
+    yield graph
+    del app.dependency_overrides[get_graph]
 
 
 @pytest.fixture
@@ -341,3 +440,44 @@ def test_invalid_role_is_rejected(client, fake_graph):
     # role을 Literal로 좁게 잡은 것의 값. 오타가 조용히 통과하지 않는다.
     response = client.post("/api/v1/chat", json=_wire(_msg("m1", "usr", "typo in role")))
     assert response.status_code == 422
+
+
+def bind_tools(self, tools, **kwargs):
+    # BaseChatModel.bind_tools의 기본 구현은 raise NotImplementedError다(실측).
+    # 2c에서 build_graph가 이걸 부르므로 가짜 모델도 응답해야 한다.
+    #
+    # 자기 자신을 그대로 돌려준다 = 이 가짜는 도구를 절대 부르지 않는다.
+    # tool_calls가 늘 비어 있으니 tools_condition이 항상 __end__로 보내고,
+    # 기존 21개 테스트의 동작이 2b와 완전히 같게 유지된다.
+    return self
+
+
+def test_tool_result_does_not_leak_into_the_stream(client, tool_calling_graph):
+    # ★ 2c-3에서 고친 것을 못 박는 테스트 ★
+    # stream_mode="messages"는 ToolMessage도 흘린다. 안 거르면 도구 실행 결과가
+    # 그대로 채팅창에 찍힌다 — 에러도 안 나고 200도 정상이라, 화면을 눈으로
+    # 보기 전에는 아무도 모른다. 그래서 바이트로 확인한다.
+    response = client.post("/api/v1/chat", json=_wire(_msg("m1", "user", "몇 시야?")))
+
+    assert response.status_code == 200
+    # 모델이 만든 텍스트는 나가야 하고
+    assert "지금" in response.text
+    # 도구 결과는 나가면 안 된다
+    assert "TOOL_RESULT_MUST_NOT_LEAK" not in response.text
+
+
+def test_tool_call_round_trip(client, tool_calling_graph):
+    # 도구 경로가 실제로 한 바퀴 돌았는지. 위 테스트는 "안 새는가"만 보므로,
+    # 도구가 아예 실행되지 않아도 통과해버린다. 둘 다 있어야 의미가 있다.
+    client.post("/api/v1/chat", json=_wire(_msg("m1", "user", "몇 시야?")))
+
+    # 모델을 두 번 불렀다 = call_model → tools → call_model 사이클이 돌았다
+    assert len(CALLS) == 2
+
+    # 2번째 호출은 도구 왕복이 쌓인 히스토리를 받았다.
+    # AIMessage의 content가 ""인 것은 그게 텍스트가 아니라 도구 호출이었기 때문이다.
+    assert _seen(1) == [
+        ("HumanMessage", "몇 시야?"),
+        ("AIMessage", ""),
+        ("ToolMessage", "TOOL_RESULT_MUST_NOT_LEAK"),
+    ]

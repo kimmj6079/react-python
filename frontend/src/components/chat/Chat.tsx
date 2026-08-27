@@ -5,15 +5,12 @@
 // ai@7.0.79 / @ai-sdk/react@4.0.82 기준이고, 버전을 올리면 .d.ts를 다시 봐야 한다.
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react'
 import { useChat } from '@ai-sdk/react'
-import { DefaultChatTransport } from 'ai'
+import { generateId } from 'ai'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { CHAT_API_URL } from '../../api/client'
+import { chatTransport } from './transport'
 import './Chat.css'
 
-// transport는 "어디로 어떻게 보낼까"만 들고 있는 객체라 렌더마다 새로 만들 이유가 없다.
-// import 출처에 주의: 훅은 '@ai-sdk/react'인데 DefaultChatTransport는 코어인 'ai'에 있다.
-const transport = new DefaultChatTransport({ api: CHAT_API_URL })
 
 // 빈 화면에 띄울 예시 질문. 컴포넌트 밖 상수라 렌더마다 새로 만들어지지 않는다.
 const SUGGESTIONS = [
@@ -26,8 +23,26 @@ export function Chat() {
   // 입력창 값은 우리가 직접 관리한다. useChat은 input/handleInputChange를 주지 않는다.
   const [input, setInput] = useState('')
 
-  const { messages, sendMessage, setMessages, status, error, clearError, stop } = useChat({
-    transport,
+  // ★ 2b-2: 대화 세션 id를 컴포넌트가 소유한다 ★
+  // 2b-1 전까지는 useChat이 내부에서 만든 id를 그냥 썼다. 그때는 이 값이
+  // 아무 의미 없는 상관관계 id였지만, 2b-1부터는 이게 그대로 서버의
+  // thread_id다 — 즉 "어느 대화 기록에 이어 쓸 것인가"를 정하는 값이 됐다.
+  // 의미가 생긴 값은 남이 만들게 두지 않는다.
+  //
+  // useState(generateId())가 아니라 useState(() => generateId())인 것에 주의.
+  // 전자는 렌더마다 generateId()를 호출한다(반환값은 첫 번째만 쓰이고 나머지는
+  // 버려진다). lazy initializer를 쓰면 최초 1회만 실행된다.
+  //
+  // 새로고침하면 새 id가 생긴다 = 서버에도 새 스레드다. 화면도 비어 있으니
+  // 앞뒤가 맞는다. localStorage에 넣어 유지하지 않는 이유는 아래 ③ 참고.
+  const [chatId, setChatId] = useState(() => generateId())
+
+  // id를 넘기면 useChat이 이 값으로 Chat 인스턴스를 만든다. 그리고 id가 바뀌면
+  // 인스턴스를 통째로 새로 만든다(실측: shouldRecreateChat). 그래서 messages도
+  // 같이 비워진다 — 우리가 setMessages([])를 부를 필요가 없어졌다.
+  const { messages, sendMessage, status, error, clearError, stop } = useChat({
+    id: chatId,
+    transport : chatTransport,
   })
 
   // status는 4상태다: submitted | streaming | ready | error.
@@ -91,11 +106,25 @@ export function Chat() {
   return (
     <div className="chat">
       <header className="chat__header">
-        <h1 className="chat__title">Chat</h1>
+        {/* title 속성으로 thread_id를 노출한다. 학습 중 "지금 어느 스레드지?"를
+            브라우저에서 바로 확인하기 위한 것이고, CSS를 건드리지 않는다.
+            실무 서비스라면 이건 안 보여준다 — 사용자에게 의미 없는 값이고,
+            thread_id는 지금 구조상 남이 알면 대화에 끼어들 수 있는 값이다. */}
+        <h1 className="chat__title" title={`thread: ${chatId}`}>
+          Chat
+        </h1>
         <button
           type="button"
           className="chat__new"
-          onClick={() => setMessages([])}
+          // ★ 2b-2의 한 줄 ★
+          // 2b-1 전까지는 setMessages([])였다. 그건 브라우저 배열만 비우고
+          // 서버 스레드는 그대로 둬서, 화면은 비었는데 모델은 이전 대화를
+          // 기억하는 상태를 만들었다(2b-1 검증에서 눈으로 확인한 그것).
+          //
+          // 이제는 id를 새로 발급한다. useChat이 인스턴스를 재생성하면서
+          // messages도 비우고, 다음 요청은 서버의 새 thread_id로 나간다.
+          // "화면 비우기"와 "서버 스레드 바꾸기"가 한 동작이 된다.
+          onClick={() => setChatId(generateId())}
           disabled={messages.length === 0 || isBusy}
         >
           새 대화

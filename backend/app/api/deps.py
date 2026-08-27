@@ -3,6 +3,7 @@ from typing import Annotated
 
 from fastapi import Depends
 from langchain_anthropic import ChatAnthropic
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph.state import CompiledStateGraph
 from sqlalchemy.orm import Session
 
@@ -33,7 +34,27 @@ _model = ChatAnthropic(
     streaming=True,
 )
 
-_graph = build_graph(_model)
+# ★ 2b: 대화 상태의 저장소 ★
+# 이 객체 하나가 "모든 스레드의 모든 대화"를 들고 있다. 모듈 레벨에 두는 게
+# 필수다 — 요청마다 새로 만들면 매번 빈 저장소라 아무것도 기억하지 못한다.
+# (그런데도 에러는 안 난다. "매번 첫 턴처럼 행동"할 뿐이다.)
+#
+# ★ InMemorySaver의 한계를 알고 쓴다 ★ 이름 그대로 파이썬 프로세스 메모리다.
+#   1) --reload가 소스 변경을 감지해 재시작하면 전 대화가 사라진다.
+#      개발 중에 "왜 갑자기 기억을 못 하지?"의 90%가 이것이다.
+#   2) uvicorn --workers 2 이상이면 요청이 워커에 흩어지는데 워커마다 별도
+#      메모리라 대화가 뒤죽박죽 된다. k8s에서 replicas를 2로 올려도 같다.
+#      → 즉 이 상태로는 절대 스케일아웃할 수 없다.
+#   3) 지우는 코드가 없어서 스레드가 쌓이기만 한다. 프로세스가 오래 살면 누수다.
+#
+# 실무에서는 langgraph-checkpoint-postgres의 AsyncPostgresSaver를 쓴다. 이
+# 저장소에는 이미 Postgres가 있으니 전환 비용은 (a) 의존성 추가 (b) 여기 한 줄
+# (c) 체크포인터 테이블 생성(setup()) 뿐이다 — build_graph도 chat.py도 안 바뀐다.
+# 학습 단계에서 InMemorySaver로 시작하는 이유는 "체크포인터 개념"과 "DB 스키마
+# 마이그레이션"이라는 미지수 두 개를 동시에 열지 않기 위해서다.
+_checkpointer = InMemorySaver()
+
+_graph = build_graph(_model, checkpointer=_checkpointer)
 
 
 def get_graph() -> CompiledStateGraph:

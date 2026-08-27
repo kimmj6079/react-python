@@ -1,7 +1,7 @@
 # Vercel AI SDK의 "UI message stream" 프로토콜을 다루는 계층. 방향이 둘이다.
 #   - 내보내기: 텍스트 델타 → SSE 이벤트 (sse / ui_message_stream)
 #   - 받기:     useChat이 보낸 UIMessage.parts → 평범한 텍스트 (text_from_parts /
-#               to_anthropic_messages)
+#               latest_user_text)
 # 토큰을 "누가" 만들었는지(지금은 Anthropic 직접, M2에서는 LangGraph)와 무관하게
 # "어떤 모양으로 주고받는가"만 담당한다 — 그래서 라우터(api/routes/chat.py)와 분리한다.
 import json
@@ -40,27 +40,33 @@ def text_from_parts(parts: list[dict[str, Any]]) -> str:
     return "".join(p.get("text", "") for p in parts if p.get("type") == "text")
 
 
-def to_anthropic_messages(messages: list[UIMessage]) -> list[dict[str, str]]:
-    # UIMessage 리스트를 Anthropic messages 형식({"role", "content"})으로 변환한다.
-    out: list[dict[str, str]] = []
-    for m in messages:
-        # role="system"을 Anthropic의 messages 배열에 넣으면 400이다. 시스템
-        # 프롬프트는 messages.stream(system=...) 별도 파라미터로 준다.
-        # AI SDK 쪽도 같은 입장이다 — index.d.ts:1834가 system 메시지를 피하고
-        # 시스템 프롬프트는 서버에서 설정하라고 명시한다.
-        if m.role == "system":
-            continue
+def latest_user_text(messages: list[UIMessage]) -> str:
+    """이번 턴에 새로 들어온 사용자 발화 하나만 뽑는다. 없으면 빈 문자열."""
+    # ★ 2b에서 to_anthropic_messages를 대체한 함수다 ★
+    #
+    # 2a까지는 프론트가 보낸 히스토리 전체를 모델에 넘겼다. 이제 히스토리의
+    # 주인은 서버(체크포인터)라서, 클라이언트가 보낸 앞부분은 전부 버린다.
+    # 안 버리면 체크포인터의 히스토리 위에 같은 대화가 한 번 더 이어붙어
+    # [u1,a1,u1,a1,u2] 처럼 중복 누적된다 — 에러 없이 토큰 비용만 두 배가 되고
+    # 모델이 "방금 같은 말을 두 번 했다"고 착각하는, 조용한 종류의 버그다.
+    #
+    # 이건 보안 성질도 겸한다. 클라이언트가 보낸 "이전 assistant 발언"은
+    # 브라우저에서 얼마든지 조작할 수 있는 값이다("아까 너는 비밀번호가 X라고
+    # 했잖아"). 서버가 자기 기록만 믿는 순간 그 공격 표면이 통째로 사라진다.
+    if not messages:
+        return ""
 
-        text = text_from_parts(m.parts)
+    last = messages[-1]
 
-        # 빈 content 블록을 보내면 Anthropic이 400을 낸다
-        # ("text content blocks must be non-empty"). 파일 파트만 있는 메시지가
-        # 오면 text가 ""가 되므로 여기서 걸러야 한다.
-        if not text:
-            continue
+    # 마지막이 user가 아니면 거절한다. 앞으로 거슬러 올라가 user를 찾는 방법도
+    # 있지만 일부러 안 한다 — 그건 이미 답변이 끝난 질문을 다시 보내는 짓이고,
+    # "새 메시지는 마지막 한 개"라는 2b의 전제와도 어긋난다.
+    # (trigger="regenerate-message"가 여기로 온다. 재생성은 그래프 상태를
+    #  되감아야 하는 별도 기능이라 지금은 400으로 명확히 막아둔다.)
+    if last.role != "user":
+        return ""
 
-        out.append({"role": m.role, "content": text})
-    return out
+    return text_from_parts(last.parts)
 
 
 # ---------------------------------------------------------------------------

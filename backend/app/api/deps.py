@@ -8,8 +8,9 @@ from langgraph.graph.state import CompiledStateGraph
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.db.session import get_db
+from app.db.session import SessionLocal, get_db
 from app.graph import build_graph
+from app.rag.retriever import RetrievedChunk, search
 
 # DbSession이라는 타입 별칭을 만들어두면, 라우터 함수 파라미터에서
 # `db: DbSession`이라고만 써도 FastAPI가 자동으로 get_db()를 호출해 세션을 주입해준다.
@@ -54,7 +55,20 @@ _model = ChatAnthropic(
 # 마이그레이션"이라는 미지수 두 개를 동시에 열지 않기 위해서다.
 _checkpointer = InMemorySaver()
 
-_graph = build_graph(_model, checkpointer=_checkpointer)
+
+def _retrieve(query: str) -> list[RetrievedChunk]:
+    # graph.py가 받는 retrieve_fn의 실제 구현체. 그래프는 이 함수가 SQLAlchemy를
+    # 쓰는지 Qdrant를 쓰는지 몰라야 하므로(README M3 "인터페이스 하나, 구현
+    # 둘"), 세션을 여는 이 한 줄이 "저장소를 안다"는 책임 전체를 여기 가둔다.
+    #
+    # 요청마다(retrieve 노드가 호출될 때마다) 세션을 새로 열고 닫는다 —
+    # DbSession 의존성처럼 FastAPI가 대신 관리해줄 수 없다. 그래프 노드는
+    # HTTP 요청·응답 생명주기 밖에 있는 일반 함수이기 때문이다.
+    with SessionLocal() as db:
+        return search(db, query)
+
+
+_graph = build_graph(_model, retrieve_fn=_retrieve, checkpointer=_checkpointer)
 
 
 def get_graph() -> CompiledStateGraph:

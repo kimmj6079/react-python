@@ -20,6 +20,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from app.api.deps import get_graph
 from app.graph import build_graph
 from app.main import app
+from app.rag.retriever import RetrievedChunk
 
 # 가짜 모델이 흘려보낼 고정 델타. 값을 고정하면 매 실행이 같은 바이트를 내므로
 # 1b 캡처와 == 하나로 비교할 수 있다. 한글을 넣은 이유는 ensure_ascii=False가
@@ -51,11 +52,6 @@ class FakeChatModel(BaseChatModel):
 
     진짜 ChatAnthropic이 하는 일 중 우리가 실제로 쓰는 표면만 흉내낸다.
     """
-
-    @property
-    def _llm_type(self) -> str:
-        # BaseChatModel의 추상 멤버. 로깅·직렬화에 쓰인다.
-        return "fake"
 
     @property
     def _llm_type(self) -> str:
@@ -172,6 +168,7 @@ def tool_calling_graph():
     CALLS.clear()
     graph = build_graph(
         ToolCallingFakeModel(),
+        retrieve_fn=lambda _: [],
         checkpointer=InMemorySaver(),
         tools=[get_current_time],
     )
@@ -192,9 +189,13 @@ def fake_graph():
 
     dependency_overrides는 app 객체에 붙는 전역 상태라 지우지 않으면 다음
     테스트까지 가짜가 살아남는다. CALLS도 같은 이유로 매번 비운다.
+
+    ★ 3-2b: retrieve_fn=lambda _: [] ★ 검색 결과가 없다는 뜻이라 call_model이
+    시스템 메시지를 안 붙인다 — 이 fixture를 쓰는 기존 테스트들은 전부
+    "검색이 없던 시절"과 똑같이 동작해야 하므로 의도적으로 무검색 상태로 둔다.
     """
     CALLS.clear()
-    graph = build_graph(FakeChatModel(), checkpointer=InMemorySaver())
+    graph = build_graph(FakeChatModel(), retrieve_fn=lambda _: [], checkpointer=InMemorySaver())
     app.dependency_overrides[get_graph] = lambda: graph
     yield graph
     del app.dependency_overrides[get_graph]
@@ -442,16 +443,6 @@ def test_invalid_role_is_rejected(client, fake_graph):
     assert response.status_code == 422
 
 
-def bind_tools(self, tools, **kwargs):
-    # BaseChatModel.bind_tools의 기본 구현은 raise NotImplementedError다(실측).
-    # 2c에서 build_graph가 이걸 부르므로 가짜 모델도 응답해야 한다.
-    #
-    # 자기 자신을 그대로 돌려준다 = 이 가짜는 도구를 절대 부르지 않는다.
-    # tool_calls가 늘 비어 있으니 tools_condition이 항상 __end__로 보내고,
-    # 기존 21개 테스트의 동작이 2b와 완전히 같게 유지된다.
-    return self
-
-
 def test_tool_result_does_not_leak_into_the_stream(client, tool_calling_graph):
     # ★ 2c-3에서 고친 것을 못 박는 테스트 ★
     # stream_mode="messages"는 ToolMessage도 흘린다. 안 거르면 도구 실행 결과가
@@ -481,3 +472,65 @@ def test_tool_call_round_trip(client, tool_calling_graph):
         ("AIMessage", ""),
         ("ToolMessage", "TOOL_RESULT_MUST_NOT_LEAK"),
     ]
+
+
+FAKE_CHUNKS = [
+    RetrievedChunk(source="test.md", chunk_index=0, content="테스트 발췌 내용", distance=0.1)
+]
+
+
+@pytest.fixture
+def rag_graph():
+    """검색 결과가 있는 경우를 검증하기 위한 그래프. fake_graph와 반대로 채운다."""
+    CALLS.clear()
+    graph = build_graph(
+        FakeChatModel(), retrieve_fn=lambda _: FAKE_CHUNKS, checkpointer=InMemorySaver()
+    )
+    app.dependency_overrides[get_graph] = lambda: graph
+    yield graph
+    del app.dependency_overrides[get_graph]
+
+
+def test_retrieved_context_reaches_the_model_as_a_system_message(client, rag_graph):
+    # retrieve → call_model로 검색 결과가 실제로 전달되는지. 시스템 메시지가
+    # 맨 앞에 오고, 그 안에 청크 내용이 들어 있어야 한다.
+    client.post("/api/v1/chat", json=_wire(_msg("m1", "user", "테스트 질문")))
+
+    kind, content = _seen()[0]
+    assert kind == "SystemMessage"
+    assert "테스트 발췌 내용" in content
+    assert "test.md" in content
+
+
+def test_retrieved_context_does_not_leak_into_checkpointed_history(client, rag_graph):
+    # ★ 설계의 핵심을 못 박는 테스트 ★ 모델에게는 시스템 메시지가 갔지만
+    # (위 테스트), 체크포인터에 저장된 messages에는 SystemMessage가 없어야
+    # 한다 — 안 그러면 대화가 길어질수록 매 턴의 검색 결과가 전부 쌓인다.
+    client.post("/api/v1/chat", json=_wire(_msg("m1", "user", "테스트 질문")))
+
+    assert all(kind != "SystemMessage" for kind, _ in _state(rag_graph))
+
+
+def failing_retrieve(_: str) -> list[RetrievedChunk]:
+    raise RuntimeError("DB down")
+
+
+@pytest.fixture
+def failing_rag_graph():
+    """retrieve_fn이 항상 예외를 던지는 그래프 — 검색 장애 시에도 채팅이 죽지 않는지 검증."""
+    CALLS.clear()
+    graph = build_graph(FakeChatModel(), retrieve_fn=failing_retrieve, checkpointer=InMemorySaver())
+    app.dependency_overrides[get_graph] = lambda: graph
+    yield graph
+    del app.dependency_overrides[get_graph]
+
+
+def test_retrieve_failure_degrades_gracefully(client, failing_rag_graph):
+    # DB/임베딩이 죽어도 채팅 자체는 계속 응답해야 한다 — 검색 실패가 챗봇
+    # 전체 장애로 번지면 안 된다(retrieve 노드의 try/except가 지키는 성질).
+    response = client.post("/api/v1/chat", json=_wire(_msg("m1", "user", "질문")))
+
+    assert response.status_code == 200
+    assert response.text == EXPECTED_SSE
+    # 컨텍스트가 없으니 시스템 메시지도 없어야 한다 — 빈 리스트로 대체됐다는 증거.
+    assert _seen()[0][0] == "HumanMessage"

@@ -747,8 +747,91 @@ FastAPI가 LLM을 직접 호출해 SSE로 스트리밍, 프론트는 `ai`/`@ai-s
 다운로드(수백MB)와 CPU 추론 속도다. **인입 문서가 한국어라 다국어 모델을 골라야 한다** —
 어떤 모델이 지원되는지는 실측해서 정한다.
 
-- [x] 3-1. 청킹 + 임베딩 + pgvector 저장
-- [ ] 3-2. 검색 + 그래프 `retrieve` 노드 연결
+- [x] **3-1. 청킹 + 임베딩 + pgvector 저장** (2026-09-02 완료)
+
+  **만든 것**
+  - `postgres/Dockerfile`: `postgres:16-alpine` → `pgvector/pgvector:pg16`. 확장 하나를 위해
+    빌드 스크립트를 유지보수할 이유가 없어 공식 이미지를 썼다.
+    **함정**: alpine(musl)→debian(glibc) 교체라 텍스트 collation 규칙이 달라진다 — 기존 볼륨을
+    재사용하면 collation mismatch 위험이 있어 `docker compose down -v`로 볼륨을 지우고 새로 시작했다.
+  - `app/models/chunk.py`: `document_chunks` 테이블. 원문(content)을 벡터와 **같이** 저장한다 —
+    벡터는 비가역이라 원문 없이는 검색에 성공해도 모델에게 붙여줄 게 없다. `EMBEDDING_DIM = 1024`는
+    모델이 정하는 값이라 상수로 못 박았다(바꾸면 마이그레이션 + 전체 재인입).
+  - 마이그레이션 `c5cc997cbae6`: `CREATE EXTENSION IF NOT EXISTS vector`는 **autogenerate가 절대
+    못 만드는 줄**(확장은 SQLAlchemy 메타데이터에 없는 개념)이라 손으로 넣었다. `downgrade()`는
+    테이블만 지우고 확장은 남긴다 — IF NOT EXISTS와 대칭 논리로, 이 마이그레이션이 만들었다고
+    확신할 수 없는 것은 지우지 않는다.
+  - `app/rag/embedding.py`: `MODEL_NAME` 상수 + lazy 싱글턴 + `embed_passages`/`embed_query` 짝 +
+    `_check_dim` 안전핀. 모델명이 config가 아니라 코드 상수인 이유: **저장된 벡터 전체와 결합된
+    값**이라 환경마다 달라지면 에러 없이 검색 품질만 무너진다. "설정이냐 상수냐"의 기준 =
+    영속 데이터와의 결합 여부.
+  - `app/rag/ingest.py`: `chunk_text`(고정 600자 + 오버랩 100, 순수 함수) + `normalize_source`
+    (재인입 키 안정화 — 저장소 루트 기준 상대경로로 통일) + 같은 source DELETE→INSERT 한
+    트랜잭션(멱등). UPSERT를 안 쓴 이유: 문서가 짧아지면 옛 꼬리 청크가 유령으로 남는다.
+    (진짜 증분 업서트는 M11에서 `doc_hash`로)
+  - `tests/test_ingest.py`: chunk_text 4개(겹침 공유·꼬리 부분집합 드랍·overlap 가드·단일 청크).
+    임베딩·DB 쪽 절반은 pytest 대상이 아니다 — 그 품질 검증은 M6의 몫.
+
+  **실측 (`scripts/probe_embedding.py`)**: `intfloat/multilingual-e5-large` = 1024차원.
+  e5는 "query: "/"passage: " 접두어 비대칭 모델 — 접두어 유무의 점수 차이를 관련/무관 문장
+  반증 케이스로 확인하고, fastembed의 `query_embed`/`passage_embed` 경로로 고정했다.
+
+  **★ 함정: `chunk_index=1` 오타 — 4중 검증이 전부 통과했다 ★**
+  `i`를 `1`로 잘못 타이핑 → ruff(기본 규칙엔 미사용 루프 변수 검사 없음)·pytest 27개(chunk_text만
+  커버)·인입 성공 메시지·count 확인 쿼리 **전부 통과**하고, DB엔 전 청크가 index=1로 저장됐다.
+  min/max/distinct까지 보는 쿼리로야 발견됐다. 3-2 검색에서도 안 드러나고(검색은 embedding과
+  content만 쓴다) M7("N번째 청크가 이상하다")이나 M10(인용)에서야 터졌을 종류다. 멱등 인입 덕에
+  수정 비용 = 한 글자 + 재실행. **교훈: 검증 쿼리는 "행이 있는가"가 아니라 "값이 맞는가"를 본다.**
+
+  **함정 기록 (그 외)**
+  - E501은 문자열이 길면 `ruff format`이 못 고친다(문자열 내용은 불변) → 인접 문자열 연결
+    (implicit concatenation)로 수동 분할. E501의 100자는 코드포인트 수지 화면 폭이 아니다 —
+    한글이 많은 줄은 에디터 룰러와 어긋난다.
+  - `range(0, n, step)`의 step이 음수면 에러가 아니라 **빈 범위** → overlap ≥ chunk_size 가드
+    필수 (없으면 문서가 조용히 통째로 사라진다).
+  - `sys.stdout.reconfigure`를 모듈 레벨이 아니라 main() 안에서 — pytest가 import하는 모듈은
+    "import만 했는데 전역 상태가 바뀌는" 부수효과를 두면 안 된다 (import되지 않는 probe
+    스크립트와 다른 점).
+  - `zip(..., strict=True)` — 기본 zip은 길이가 어긋나면 조용히 짧은 쪽에 맞춰 자른다.
+  - e5 입력 한도는 512**토큰** — 문자 기준 600자 청크는 뒷부분이 조용히 잘린 채 임베딩될 수
+    있다. 알고 감수하는 베이스라인(토큰 기반 분할은 M7).
+
+  **알고 남겨둔 것**
+  1. **ANN 인덱스(HNSW/IVFFlat) 없음** — 인덱스 없는 pgvector는 순차 스캔 = **정확한** kNN이고
+     수백 청크에선 밀리초라 충분하다. 인덱스는 근사(recall < 100%) + 튜닝 파라미터가 따라오는
+     트레이드오프라 필요해질 때 넣는다. 기본이 HNSW인 Qdrant와의 차이로 3-4 비교에서 재등장.
+  2. 인입이 CLI 스크립트다 — 실무는 API 서버 프로세스와 격리된 배치/워커로 돌린다. M11에서 운영화.
+
+  **검증**: `uv run pytest -q` → **27 passed**(23+4). 인입 결과 CLAUDE.md 19 / SETUP.md 21 /
+  DEPLOYMENT.md 35 청크, 전부 dim 1024 + `distinct_idx = chunks` + `max_idx = chunks - 1`.
+  같은 파일 재인입 시 "기존 N개 삭제"가 찍히고 개수 불변(멱등의 반증 케이스). `alembic
+  downgrade -1` 왕복으로 테이블 소멸→복구 + 확장 잔존 확인.
+- [x] **3-2a. `retriever.py` 완성 + 독립 CLI 검증** (2026-09-04 완료)
+
+  **만든 것**: `search()`(질문 임베딩 → pgvector `cosine_distance` 정렬 → `RetrievedChunk`
+  리스트)는 이미 있었고, `main()`(인자 파싱 → 세션 오픈 → 검색 → 결과 출력)만 이어서
+  완성했다. `ingest.py`의 `main()`과 같은 패턴(빈 인자 가드 + `SystemExit(1)`, Windows
+  콘솔 대응 `sys.stdout.reconfigure`).
+
+  **세션을 `search()` 밖에서 여는 이유**: `main()`이 `with SessionLocal() as db: search(db, ...)`로
+  세션을 소유하고 `search()`엔 인자로 넘긴다. `search()`가 결과를 ORM 객체가 아니라
+  `RetrievedChunk` dataclass로 미리 복사해두기 때문에, 세션이 `with` 블록 끝에서 닫힌
+  뒤에도 결과를 안전하게 출력할 수 있다(3-1 설계가 여기서 실제로 값을 함).
+
+  **검증** (`uv run python -m app.rag.retriever "파이썬 버전은 어떻게 관리해?"`):
+  상위 5개 중 4개(SETUP.md#15·CLAUDE.md#18·SETUP.md#13·SETUP.md#0)가 실제로 Python 버전
+  관리 내용이었고 distance가 0.1851~0.1883 좁은 범위에 몰려 있었다 — 3-1에서 만든
+  임베딩·pgvector 저장이 실제로 의미 있는 순위를 만든다는 첫 육안 증거.
+
+  **함정 기록**
+  - DB(`docker compose up -d db`)가 안 떠 있으면 `search()`는 조용히 죽지 않고
+    `psycopg.errors.ConnectionTimeout`으로 죽는다 — 검색 로직과 무관한 별개 원인.
+  - `embedding.py:32`에서 fastembed의 mean-pooling 경고(`UserWarning`)가 뜨는데, 이건
+    실제 문제가 아니었다: `uv.lock` 히스토리를 보면 fastembed는 3-1부터 지금까지
+    `0.8.0` 한 버전뿐이라 인입 때와 검색 때가 같은 pooling 방식을 쓴다. 이 경고가
+    진짜 위험한 경우는 인입과 검색 사이에 fastembed 버전이 바뀌어 서로 다른 벡터
+    공간이 섞이는 것인데, 그 상황이 아니다.
+- [ ] 3-2b. `graph.py`에 `retrieve` 노드 추가 + 프롬프트 조립
 - [ ] 3-3. `Retriever` 인터페이스 + Qdrant 구현
 - [ ] 3-4. 설정 전환 + 비교 기록
 

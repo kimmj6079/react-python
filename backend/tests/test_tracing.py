@@ -26,8 +26,13 @@ def langfuse_keys(monkeypatch):
 
 
 def test_disabled_without_keys():
-    # 기본 상태(키 없음)에서는 빈 리스트다. "빈 핸들러"가 아니라 "빈 리스트"인 것이
-    # 핵심이다 — LangChain이 콜백을 아예 안 부르므로 오버헤드가 진짜 0이 된다.
+    # 키가 없으면 빈 리스트다. "빈 핸들러"가 아니라 "빈 리스트"인 것이 핵심이다 —
+    # LangChain이 콜백을 아예 안 부르므로 오버헤드가 진짜 0이 된다.
+    #
+    # 키를 비우는 일은 conftest.py의 _langfuse_off(autouse)가 한다. 예전에는 그냥
+    # "개발자 .env에 키가 없겠지"에 기대고 있었는데, 키를 등록하는 순간 이 테스트가
+    # 깨지면서 그 가정이 드러났다 — 테스트는 주변 환경이 아니라 자기가 만든 상태에만
+    # 의존해야 한다.
     assert settings.langfuse_enabled is False
     assert tracing.get_callbacks() == []
 
@@ -36,7 +41,11 @@ def test_half_configured_counts_as_disabled(monkeypatch):
     # ★ public만 넣고 secret을 깜빡한 반쪽 설정 ★ 이걸 "켜짐"으로 보면 인증 실패가
     # 요청마다 반복되고, 로그를 안 보면 "트레이스가 왜 안 쌓이지"만 남는다.
     # 판단을 settings.langfuse_enabled 한 곳에 모아둔 값이 여기서 나온다.
+    #
+    # secret을 명시적으로 비운다 — autouse fixture가 이미 비웠더라도, 이 테스트가
+    # 무엇을 전제하는지는 테스트 안에서 읽혀야 한다.
     monkeypatch.setattr(settings, "langfuse_public_key", "pk-lf-test", raising=False)
+    monkeypatch.setattr(settings, "langfuse_secret_key", "", raising=False)
     assert settings.langfuse_enabled is False
     assert tracing.get_callbacks() == []
 

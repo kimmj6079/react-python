@@ -22,7 +22,11 @@ FastAPI(백엔드) + React/TypeScript/Vite(프론트엔드) + PostgreSQL 풀스�
 - **함정을 미리 말한다.** 이 코드에서 흔히 터지는 실수, 에러 없이 조용히 실패하는 지점, 라이브러리 버전에 따라 달라지는 것.
 - **소스 전문을 처음부터 준다.** 스터디 단계를 진행할 때 "시그니처만" 같은 부분 제시로 시작하지 않는다. 손댈 파일마다 **완성된 소스 전문**을 주고 — 새 파일이면 파일 전체, 기존 파일이면 교체할 블록 전체 — 그 아래에 왜 그렇게 썼는지를 줄 단위로 설명한다. 요약·발췌·`...` 생략 금지.
 - **한 번에 한 단계씩 진행한다.** 남은 항목이 여러 개면 순서와 그 순서인 이유를 먼저 제시하고, **첫 항목만** 소스 전문으로 진행한다. 검증이 끝난 뒤 다음 항목으로 넘어간다.
-- **파일을 직접 수정하지는 않는다.** 코드는 화면에 보여주고 타이핑은 사용자가 한다 — 이 저장소의 목적이 그것이다. 다 쓴 뒤 리뷰를 요청받으면 그때 실제 파일을 읽어 검토한다.
+- **★ 코드는 Claude가 직접 작성한다 (2026-09-07 방식 변경) ★** 원래는 "코드를 화면에 보여주고 타이핑은 사용자가" 방식이었으나 분량을 따라가기 어려워, **Claude가 파일을 실제로 수정하고 사용자는 그 결과를 읽으며 학습**하는 방식으로 바꿨다. 목적(직접 배우기)은 그대로고 수단만 바뀐 것이라, **설명 부담은 오히려 커진다** — 타이핑하며 자연히 읽게 되던 것을 이제 설명이 대신해야 한다:
+  - 작업이 끝나면 **학습 가이드**를 낸다: 바뀐 파일들을 **읽을 순서대로** 나열하고, 각 파일에서 어디를 봐야 하는지(`파일:줄`)와 왜 그렇게 썼는지를 짚는다. diff를 아무 데서나 열면 맥락이 없으므로 순서를 지정하는 것이 핵심이다.
+  - **위의 "소스 전문" 규칙은 그대로 유효하다.** 소스가 채팅창이 아니라 파일에 있을 뿐이고, 설명은 여전히 줄 단위다. 요약으로 넘기지 않는다.
+  - **검증은 사용자가 직접 실행한다.** 명령과 "무엇이 보이면 성공인지"를 함께 준다.
+  - 커밋은 여전히 사용자 확인 후에만 한다.
 - **검증 방법을 같이 준다.** 무엇을 실행해서 무엇이 보이면 성공인지. 짐작으로 넘어가지 않게.
 - **실무 기준으로 한 번 더 짚는다 — 시니어 개발자가 옆에서 말해주듯이.** 사용자는 이 학습을 실제 업무에 쓰려고 한다. 그래서 "이 코드가 돌아간다"에서 끝내지 말고, **같은 코드를 실무 팀에서는 어떻게 다루는지**를 붙인다. 매 줄마다가 아니라, 판단이 갈리는 지점·처음 보는 도구·관례가 개입하는 곳에서 짚는다.
   - **코드리뷰에서 지적당할 지점.** 지금 코드에서 리뷰어가 뭐라고 할지, 그게 취향 문제인지 원칙 문제인지 구분해서.
@@ -59,7 +63,7 @@ k8s/        Kustomize 매니페스트 (base/ + overlays/dev, prod/)
 .github/workflows/  ci.yml, cd.yml
 scripts/    minikube 배포(deploy-local) + 클라우드 VM 배포(provision-vm, deploy-prod, deploy-prod-compose) 스크립트 (.sh / .ps1)
             + backup-db.sh (docker-compose 운영 배포 시 VM에 전송되어 cron으로 매일 실행되는 DB 백업)
-docker-compose.yml       로컬 통합 개발 환경
+docker-compose.yml       로컬 통합 개발 환경 (db=pgvector 포함 Postgres, qdrant=벡터 DB, backend, frontend)
 docker-compose.prod.yml  운영 배포용 (k3s 없이 Docker/Compose만 있는 서버, GHCR 이미지 pull-only)
 nginx-proxy/conf.d/      docker-compose 운영 배포의 공유 리버스 프록시 설정 (앱별 server 블록, 이미지 재빌드 없이 마운트)
 nginx-proxy/ssl/         SSL 인증서/개인키 배치 위치 (실제 파일은 gitignore, README.md만 커밋됨)
@@ -109,10 +113,34 @@ npm run format      # prettier --write .
 ### 로컬 통합 (docker-compose)
 
 ```bash
-docker compose up --build                         # db+backend+frontend 동시 기동
+docker compose up --build                         # db+qdrant+backend+frontend 동시 기동
 docker compose run --rm backend alembic upgrade head   # 마이그레이션은 자동 실행되지 않음, 수동 적용
 docker compose down -v                             # 컨테이너+볼륨 정리
 ```
+
+------------------------------------------------------------------------------------------------------------------------
+
+### 챗봇 RAG (문서 인입 · 검색)
+
+챗봇은 `document_chunks`에 인입된 문서를 매 턴 검색해 답변 근거로 쓴다. **인입은 자동으로
+실행되지 않는다** — 마이그레이션과 같은 이유로(명시적·감사 가능한 별도 단계) 손으로 돌린다.
+
+```bash
+docker compose up -d db qdrant                    # 저장소 둘 다 기동
+cd backend
+uv run python -m app.rag.ingest ../CLAUDE.md ../SETUP.md ../DEPLOYMENT.md   # 기본 저장소(pgvector)
+uv run python -m app.rag.ingest --store qdrant ../CLAUDE.md                 # Qdrant에 인입
+uv run python -m app.rag.retriever "파이썬 버전은 어떻게 관리해?"            # 챗봇 없이 검색만 확인
+uv run python scripts/compare_stores.py                                     # 두 저장소 나란히 비교
+```
+
+**저장소는 `VECTOR_STORE` 하나로 갈아끼운다**(`pgvector` | `qdrant`, 기본 `pgvector`).
+같은 문서를 양쪽에 각각 인입해야 하고, 한쪽에만 넣은 채 전환하면 챗봇이 "문서를 못 찾는다"고
+답한다 — 에러가 아니다. 상세 설계·비교 결과는 [chatbot/README.md](./chatbot/README.md)의 M3,
+현재 코드 흐름은 [chatbot/FLOW.md](./chatbot/FLOW.md) 참고.
+
+**문서를 고쳤으면 다시 인입해야 답이 바뀐다.** 재인입은 멱등이라(같은 `source`를 지우고 새로
+넣는다) 몇 번을 돌려도 중복이 쌓이지 않는다.
 
 ------------------------------------------------------------------------------------------------------------------------
 

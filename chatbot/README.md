@@ -831,9 +831,378 @@ FastAPI가 LLM을 직접 호출해 SSE로 스트리밍, 프론트는 `ai`/`@ai-s
     `0.8.0` 한 버전뿐이라 인입 때와 검색 때가 같은 pooling 방식을 쓴다. 이 경고가
     진짜 위험한 경우는 인입과 검색 사이에 fastembed 버전이 바뀌어 서로 다른 벡터
     공간이 섞이는 것인데, 그 상황이 아니다.
-- [ ] 3-2b. `graph.py`에 `retrieve` 노드 추가 + 프롬프트 조립
-- [ ] 3-3. `Retriever` 인터페이스 + Qdrant 구현
-- [ ] 3-4. 설정 전환 + 비교 기록
+- [x] **3-2b. `graph.py`에 `retrieve` 노드 추가 + 프롬프트 조립** (2026-09-04 완료)
+
+  여기서 처음으로 "RAG"가 챗봇이 됐다. 3-1이 넣기, 3-2a가 찾기였고, 3-2b가 **찾은 것을
+  모델에게 먹이는** 단계다.
+
+  **★ 설계 결정 ①: 검색을 도구가 아니라 "매 턴 무조건 실행되는 노드"로 했다 ★**
+  2c에서 이미 도구 배선(`bind_tools` + `ToolNode` + 사이클)이 있으므로, `search`를 `@tool`로
+  만들어 `TOOLS`에 한 줄 추가하는 선택지가 있었다(요즘 말하는 *agentic RAG*). 안 고른 이유:
+
+  | | 도구로 (agentic) | 노드로 (지금) |
+  |---|---|---|
+  | 검색 여부 | **모델이 정한다 = 확률적** | 항상 한다 = 결정론적 |
+  | 모델 호출 | 최소 2회 (쪽지 → 결과 읽고 답) | 1회 |
+  | "왜 문서를 안 봤지?" | 재현이 안 된다 | 생기지 않는다 |
+  | 잡담("안녕") 비용 | 0 | 임베딩 + DB 왕복 1회 |
+
+  **M6 평가 하네스가 없는 지금은 결정론이 압도적으로 중요하다.** 검색이 확률적으로 일어나면
+  "답이 나빴다"의 원인이 검색 품질인지 모델이 검색을 건너뛴 것인지 구분할 수 없고, 그 상태로
+  M7~M9의 개선을 측정하면 숫자가 노이즈에 묻힌다. 대가는 잡담에도 검색이 도는 것인데,
+  **로컬 임베딩이라 돈이 0원**이라 지금 감수할 만한 대가다. (조건부 검색은 M6으로 계측기를
+  만들고 M8/M9에서 검색 품질이 올라간 뒤에 "그때 켜서 지표가 안 떨어지는지" 확인하며 넣는 게
+  순서다 — 실무에서도 agentic RAG는 평가 없이 넣으면 원인 추적이 불가능해지는 대표적 항목이다.)
+
+  **★ 설계 결정 ②: 검색 결과를 `messages`가 아니라 별도 State 필드에 넣었다 ★**
+  `State`에 `retrieved_context: str`을 추가했다(`graph.py:84`). **리듀서가 없다 = 기본 동작인
+  "덮어쓰기"**라서 매 턴 통째로 새로 채워진다. `messages`처럼 쌓이지 않는다.
+
+  가장 쉬운 구현은 `retrieve` 노드가 `{"messages": [SystemMessage(...)]}`를 반환하는 것이었다.
+  그러면 **에러 없이** 이렇게 된다:
+  ```
+  1턴: [sys(검색1), u1, a1]
+  2턴: [sys(검색1), u1, a1, sys(검색2), u2, a2]
+  3턴: [sys(검색1), u1, a1, sys(검색2), u2, a2, sys(검색3), u3, a3]   ← 지난 턴 검색 결과가 전부 산다
+  ```
+  체크포인터가 `messages`를 통째로 저장하므로 **지난 턴의 검색 결과가 영원히 프롬프트에 남는다.**
+  10턴이면 청크 50개가 매 요청에 실려 나간다 — 토큰 비용이 선형으로 폭증하고, 모델은 지금
+  질문과 무관한 옛 발췌에 이끌린다. **에러도 경고도 없고 Langfuse(M4)를 붙이기 전엔 눈에도
+  안 보인다.** 이 저장소에서 반복되는 "조용히 새는 실패"의 전형이다.
+
+  **★ 설계 결정 ③: `call_model`이 시스템 메시지를 "잠깐" 붙인다 ★** (`graph.py:162~171`)
+  ```python
+  messages = state["messages"]
+  context = state.get("retrieved_context")
+  if context:
+      messages = [SystemMessage(content=...), *messages]   # 새 리스트를 만들 뿐
+  response = await model_with_tools.ainvoke(messages)
+  return {"messages": [response]}                          # 반환에는 시스템 메시지가 없다
+  ```
+  **모델에게는 가지만 체크포인터에는 안 남는다.** 파이썬 리스트 언패킹이 원본을 안 건드린다는
+  성질에 기대고 있어서, 무심코 `messages.insert(0, ...)`로 바꾸면 그 순간 ②의 누적이 되살아난다.
+  `test_retrieved_context_does_not_leak_into_checkpointed_history`가 이걸 못 박는다.
+
+  **★ 설계 결정 ④: `retrieve_fn`만 기본값이 없다 ★** (`graph.py:89`)
+  `checkpointer`·`tools`는 `None` 기본값이 있는데 `retrieve_fn`은 없다. 기본값을 주고 그게
+  조용히 진짜 DB를 부르게 하면, **이 인자를 깜빡한 새 테스트가 CI에서 실제 Postgres와
+  fastembed를 두드린다.** "없어도 그래프가 성립하는 부품"과 "없으면 무의미한 부품"을 기본값
+  유무로 구분했다 — 시그니처가 곧 문서가 되는 자리다.
+
+  **`asyncio.to_thread`가 필요한 이유** (`graph.py:146`): `retrieve_fn`은 동기 함수인데 안에서
+  DB 왕복 + fastembed CPU 추론(수십~수백ms)을 한다. `async def` 노드 안에서 그냥 부르면 그동안
+  **같은 프로세스의 다른 모든 요청이 멈춘다** — 다른 사용자의 스트리밍까지. asyncio에서 가장
+  흔한 사고이고, 혼자 테스트할 땐 절대 재현되지 않는다(요청이 하나뿐이라).
+
+  **검색 실패를 삼키는 이유** (`graph.py:145~149`): 여기서 예외가 올라가면 `astream()`이 raise
+  하는데, 그 시점은 이미 200 헤더가 나간 뒤다(FLOW.md "10번이 분기점이다"). 클라이언트에는
+  "헤더 정상 + 본문 없음 + 연결 끊김"으로만 보인다. **RAG는 있으면 답을 더 잘하는 보조 기능이지
+  챗봇의 필수 경로가 아니므로**, 검색이 죽으면 빈 컨텍스트로 계속 간다(graceful degradation).
+  대가: 근거 없는 답이 나갈 수 있다 → `logger.exception`으로 흔적은 반드시 남긴다.
+  **실무에서는 여기에 메트릭 하나(`rag_retrieve_failures_total`)가 더 붙는다** — 로그만 남기면
+  "요즘 답이 좀 이상한데?"가 검색 장애였다는 걸 아무도 연결하지 못한다.
+
+  **사이클 엣지는 `retrieve`를 거치지 않는다** (`graph.py:206`): `tools → call_model`이지
+  `tools → retrieve`가 아니다. 검색은 "이번 턴 사용자의 질문"에 대한 것이라 턴당 1회면 되고,
+  도구 왕복마다 다시 검색하면 같은 결과를 중복으로 가져오면서 지연만 는다.
+
+  **프롬프트가 레버다** (`graph.py:40~44`): "관련 없으면 억지로 끼워 맞추지 말고 모른다고 답하라"가
+  M10 그라운딩의 씨앗이다. 2c에서 "도구를 안 부르면 로직이 아니라 docstring을 고친다"였던 것과
+  같은 성질 — **답이 이상하면 코드가 아니라 이 문자열부터 고친다.**
+
+  **테스트 3개, 또 짝 구조** (27 → 30)
+
+  | 테스트 | 이게 없으면 놓치는 것 |
+  |---|---|
+  | `test_retrieved_context_reaches_the_model_as_a_system_message` | 검색 결과가 모델까지 아예 안 가는 것 |
+  | `test_retrieved_context_does_not_leak_into_checkpointed_history` | ②의 누적 (에러 없이 토큰만 폭증) |
+  | `test_retrieve_failure_degrades_gracefully` | DB 장애가 챗봇 전체 장애로 번지는 것 |
+
+  앞의 둘이 짝이다 — 전자만 있으면 누적돼도 통과하고, 후자만 있으면 **검색이 아예 안 돌아도**
+  통과한다. 2b의 "기억한다 + 안 섞인다", 2c의 "도구가 돈다 + 결과가 안 샌다"와 같은 구조다.
+
+  fixture도 셋으로 갈렸다: `fake_graph`(`retrieve_fn=lambda _: []` = 무검색 — **기존 27개가
+  "검색이 없던 시절"과 똑같이 동작하는지 지키는 안전망**), `rag_graph`(고정 청크 1개),
+  `failing_rag_graph`(항상 예외). 3-2b가 기존 테스트를 한 개도 안 깨뜨린 것이 `retrieve_fn`을
+  주입으로 만든 설계의 값이다.
+
+  **검증**: `uv run pytest -q` → **30 passed**(27+3).
+
+> **3-3도 셋으로 쪼갰다.** 통째로 하면 미지수가 둘(계약을 어떻게 뽑을까 + Qdrant API가 어떻게
+> 생겼나)이라 문제가 생겼을 때 원인을 구분할 수 없다. 1a~1f, 2a~2c와 같은 논리다.
+>
+> | | 단계 | 바뀌는 것 | 미지수 |
+> |---|---|---|---|
+> | 3-3a | `VectorStore` 계약 추출 + pgvector 구현 이사 (**동작 완전 동일**) | 백엔드 내부 배치만 | **없음**(순수 리팩터링) |
+> | 3-3b | Qdrant 컨테이너 + `qdrant-client` + probe 실측 | docker-compose · 의존성 | Qdrant API 실물 |
+> | 3-3c | `QdrantStore` 구현 (넣기 + 찾기) | 새 파일 하나 | 없음(계약이 이미 정해짐) |
+
+- [x] **3-3a. `VectorStore` 계약 추출 + pgvector 구현 이사** (2026-09-07 완료)
+
+  **★ 이 저장소의 작업 방식이 여기서 바뀌었다 ★** 한 단계에 손대는 파일이 8개가 되면서
+  타이핑으로 따라가기 어려워져, **Claude가 코드를 직접 작성하고 사용자는 학습 가이드로 읽는**
+  방식으로 전환했다(CLAUDE.md "작업 방식" 절 갱신).
+
+  **무엇이 문제였나**: 3-2b에서 "그래프는 저장소를 모른다"고 써놓고 바로 옆 파일이 알고 있었다.
+  ```python
+  # deps.py (3-2b)
+  def _retrieve(query): 
+      with SessionLocal() as db:      # ← SQLAlchemy Session
+          return search(db, query)    # ← search(db: Session, ...)
+  ```
+  `search()`의 첫 인자가 `db: Session`이다. **이 시그니처로는 Qdrant 구현을 만들 수 없다** —
+  Qdrant에 Session이라는 개념이 없기 때문이다. 인터페이스에 특정 구현의 타입이 새어나오는 것을
+  **추상화 누수(leaky abstraction)** 라 하고, **구현을 둘로 늘리려는 순간 가장 먼저 걸리는 게
+  이것이다.** "인터페이스 하나, 구현 둘"이라고 계획만 세워두고 실제로 두 번째 구현을 시작하기
+  전까지는 누수를 못 알아차린다는 게 이 단계의 교훈이다.
+
+  **★ 설계 결정 ①: 계약이 "찾기"가 아니라 "넣기 + 찾기"다 ★**
+  3-2b까지 그래프가 아는 것은 `retrieve_fn: Callable[[str], list[RetrievedChunk]]` 하나였다.
+  검색만 갈아끼울 때는 그걸로 충분했지만, **비교(3-4)를 하려면 같은 문서가 양쪽에 들어가 있어야
+  하므로 인입도 갈아끼워야 한다.** 넣기와 찾기는 반드시 같은 저장소를 봐야 하는 한 쌍이라
+  함수 두 개가 아니라 객체 하나(`VectorStore`)로 묶었다.
+
+  **★ 설계 결정 ②: 세션을 store가 소유한다 ★**
+  `search(query_vector, top_k)` — 계약에서 `Session`이라는 단어가 사라졌다. 대가는 "요청 하나의
+  트랜잭션에 검색까지 묶기"가 불가능해진 것인데, RAG 검색은 읽기 전용이라 지금 손해가 0이다.
+  트랜잭션 경계를 공유해야 하는 저장소라면 실무는 unit-of-work 패턴을 쓴다.
+
+  **★ 설계 결정 ③: store는 벡터를 받고 임베딩은 위층이 한다 ★**
+  `search(query)`가 아니라 `search(query_vector)`다. store가 임베딩까지 하면 **"인입은 passage
+  접두어, 검색은 query 접두어"라는 짝 규칙이 구현 수만큼 복사되고**, 한쪽만 고치는 날 에러 없이
+  검색 품질만 무너진다(`embedding.py:45`의 그 함정). 규칙을 `retriever.py` 한 곳에 가두는 게 방어다.
+
+  **★ 설계 결정 ④: `distance`(낮을수록 가깝다)를 계약으로 고정했다 ★**
+  pgvector는 거리를, **Qdrant는 점수(높을수록 가깝다)를 준다.** 계약이 둘 중 하나를 안 고르면
+  이 값을 쓰는 쪽(M6 지표, M8 리랭킹)이 저장소별로 분기하게 되고 **그 순간 추상화가 실패한 것이다.**
+  3-3a는 동작 불변 단계라 지금 쓰는 `distance`를 유지하고, 3-3c에서 Qdrant 어댑터가 `1 - score`로
+  변환해 맞춘다 — 코사인에서는 정확히 같은 값이라 손실이 없다. **어댑터의 일이 원래 이것이다.**
+
+  **`Protocol` vs `ABC`**: 구조적 타이핑(`Protocol`)을 골랐다. 구현체가 계약 파일을 상속하지
+  않아도 되고, `graph.py`가 `retrieve_fn`을 `Callable`로 받는 것과 같은 사고방식이다.
+  **대가를 알고 쓴다 — 이 저장소엔 mypy가 없어서(`pyproject`의 dev는 pytest·httpx·ruff뿐)
+  Protocol에 런타임 강제력이 없다.** 에디터 힌트 + 문서 + `tests/test_rag_store.py`의 conformance
+  테스트가 안전망의 전부다. 실무라면 여기서 타입 체커를 dev 그룹에 넣고 `ci.yml`에 한 줄
+  추가하는 게 정석이고, 그때 이 Protocol이 실제 강제력을 갖는다. 지금 안 하는 이유는 "타입 체커
+  도입"이 그 자체로 미지수 하나(설정 + 기존 에러 정리)라 M3에 섞으면 안 되기 때문이다.
+
+  **파일 배치 (신규 3 · 수정 5)**
+
+  | 파일 | 무엇을 |
+  |---|---|
+  | `app/rag/base.py` | **신규** — 계약만. `app.db`도 `qdrant_client`도 import하지 않는다 |
+  | `app/rag/pgvector_store.py` | **신규** — Postgres를 아는 코드 전부가 여기로 |
+  | `tests/test_rag_store.py` | **신규** — `issubclass(PgVectorStore, VectorStore)` 1개 |
+  | `app/rag/retriever.py` | `search(db, ...)` 제거 → `retrieve(store, query)` + CLI. **SQLAlchemy가 통째로 사라졌다** |
+  | `app/rag/ingest.py` | `insert_file(path, source, store)`. delete/add_all/commit이 store로 이사 |
+  | `app/api/deps.py` | `_store = PgVectorStore()` 한 줄 + `_retrieve`에서 `SessionLocal` 제거 |
+  | `app/graph.py` | import 한 줄 (`rag.retriever` → `rag.base`) |
+  | `tests/test_chat.py` | import 한 줄 (동일) |
+
+  **`graph.py`의 import 한 줄이 생각보다 중요하다**: `from app.rag.retriever import RetrievedChunk`
+  였으면 `graph.py`를 import하는 것만으로 `retriever` → `pgvector_store` → `app.db.session`이
+  줄줄이 딸려온다. **"그래프는 저장소를 모른다"가 import 그래프에서도 사실이어야 한다.**
+  계약(`base.py`)은 아무것도 import하지 않으므로 그걸 가리키면 딸려오는 게 없다.
+
+  **함정 기록**
+  - **`with` 블록 안에서 결과 리스트를 조립한다**(`pgvector_store.py`의 `search`). `rows`의 원소는
+    ORM 객체를 품은 `Row`라, 세션이 닫힌 뒤 건드리면 `DetachedInstanceError` 위험이 있다.
+    `return`을 `with` 안에 둬도 파이썬은 `__exit__`를 정상 실행하므로 세션은 확실히 닫힌다.
+    밖으로 빼면 "지금은 우연히 동작하지만 lazy load가 하나 끼는 순간 터지는" 코드가 된다.
+  - **`upsert_document`의 반환값이 "지운 개수"인 이유**: 인입 로그의 `기존 N개 삭제`가 멱등의
+    유일한 육안 증거다. 0이 찍히면 문서가 두 벌 쌓이고 있다는 뜻인데 **에러는 안 난다.**
+    (Qdrant는 삭제 개수를 안 돌려주므로 3-3c에서 `count` 한 번을 더 부르게 된다 — 계약이
+    한쪽만 싸게 줄 수 있는 값을 요구할 때 생기는 비용이다. 알고 넣었다.)
+  - **`store`를 인입 루프 밖에서 만든다.** `PgVectorStore`는 상태가 없어 지금은 차이가 없지만
+    `QdrantStore`는 HTTP 커넥션을 들고 있어 파일마다 새로 만들면 연결이 파일 수만큼 생긴다.
+  - **`insert_file`에 `store` 인자를 넣으면서 기본값을 주지 않았다** — `build_graph`의
+    `retrieve_fn`과 같은 이유다(3-2b). 기본값이 조용히 진짜 DB를 부르게 하면 안 된다.
+
+  **검증**: `uv run ruff check .` 통과, `uv run pytest -q` → **31 passed**(30 + conformance 1).
+  **기존 30개가 하나도 안 바뀌고 그대로 통과하는 것이 이 단계의 핵심 증거다** — 동작 불변
+  리팩터링이므로 하나라도 깨지면 그건 100% 이사 실수다. 특히
+  `test_stream_matches_ai_sdk_wire_format`이 여전히 통과 = 내부를 재배치했는데 밖으로 나가는
+  바이트는 M1-1b 캡처와 동일하다.
+
+  **알고 남겨둔 것**
+  1. **store에 타임아웃·재시도가 없다.** pgvector는 `db/session.py:20`의 `statement_timeout=5000`이
+     깔려 있어 그나마 보호되지만, **Qdrant는 HTTP라 3-3c에서 클라이언트 타임아웃을 명시해야 한다** —
+     안 주면 Qdrant가 느려질 때 `asyncio.to_thread`의 스레드 풀이 통째로 막혀서 3-2b가 이벤트
+     루프를 지키려고 만든 방어가 무력해진다. **3-3b 실측의 필수 확인 항목.**
+  2. **"동작 불변 리팩터링을 별도 커밋으로 분리"** 가 이 단계의 실무적 교훈이다. 리뷰어 입장에서
+     큰 diff에 기능 변경이 섞여 있으면 아무도 제대로 못 본다. 대형 리팩터링 PR의 설명 첫 줄이
+     보통 "no behavior change, tests untouched"인 이유가 이것이다.
+- [x] **3-3b. Qdrant 컨테이너 + `qdrant-client` + probe 실측** (2026-09-07 완료)
+
+  **버전 (실측 결과의 유효기간)**: `qdrant-client==1.19.0` (uv add가 `grpcio`·`h2`·`portalocker` 등
+  7개를 함께 끌고 옴) / 서버 이미지 `qdrant/qdrant:v1.19.1`.
+  **`latest`를 쓰지 않고 태그를 고정했다** — latest는 어제와 오늘이 다른 버전이라 "이 실측의
+  유효기간이 언제까지인가"를 말할 수 없다. 서버 버전은 `docker run --rm qdrant/qdrant:latest
+  ./qdrant --version`으로 확인해서 그 숫자로 고정했다(추측하지 않음).
+
+  **docker-compose에 서비스 추가**: 포트 `6333`(REST + 웹 대시보드 <http://localhost:6333/dashboard>),
+  `6334`(gRPC), 볼륨 `qdrant-data`. backend 서비스에는 `QDRANT_URL: http://qdrant:6333`을 넣었다 —
+  **컨테이너 "안"에서는 localhost가 아니라 서비스명이다**(로컬 dev는 localhost:6333).
+
+  **`scripts/probe_qdrant.py`로 실측한 7가지.** 임베딩 모델을 안 부르고 **4차원 가짜 벡터**를 쓴다 —
+  알고 싶은 건 "Qdrant API가 어떻게 생겼나" 하나뿐이라 미지수를 그것만 남긴다(1b에서 가짜 LLM을
+  쓴 것과 같은 이유). 덤으로 2.24GB 모델 로딩이 빠져 1초 안에 끝나고 결과가 매번 똑같다.
+
+  | # | 실측 | 3-3c에서 이게 강제한 것 |
+  |---|---|---|
+  | ② | 컬렉션을 **런타임 API 한 번**으로 만든다 (`VectorParams(size, distance)`) | 마이그레이션이 없다 → 앱이 `_ensure_collection`을 해야 한다 |
+  | ③ | **문자열 id `"a.md#0"` → 400 Bad Request** | `uuid5`로 결정론적 UUID 생성 |
+  | ④ | 같은 id로 다시 upsert → count 3 유지 (덮어쓰기) | 재인입이 자동 멱등이 된다 |
+  | ⑤ | 반환은 리스트가 아니라 `QueryResponse.points` → `ScoredPoint` | `.points`를 꺼내야 한다 |
+  | ⑤ | **`score`는 유사도(높을수록 가깝다)**, `1 - score`가 손계산 코사인과 **정확히 일치** | `distance=1.0 - score` 변환 |
+  | ⑥ | `delete`가 **삭제 개수를 안 준다**(`UpdateResult`에 operation_id/status뿐). payload 인덱스 없이도 필터는 동작 | 지우기 전에 `count`를 한 번 더 |
+  | ⑦ | 없는 컬렉션 검색 → **404 예외**(빈 결과가 아니다) | "없으면 만든다"를 명시해야 한다 |
+
+  **★ 함정 1: point id에 자연 키를 못 쓴다 ★** 이게 3-3b의 최대 수확이다. pgvector는
+  `(source, chunk_index)`를 그냥 컬럼으로 두면 됐지만 Qdrant의 id는 **unsigned int 또는 UUID뿐**이다.
+  그래서 `uuid5(NAMESPACE, f"{source}#{i}")`로 결정론적 UUID를 만든다. **`uuid4`(랜덤)를 쓰면
+  매번 다른 id가 나와 같은 문서를 넣을 때마다 중복이 쌓이는데, 에러가 안 나고 "검색 결과에 같은
+  내용이 여러 번 나오는 것"으로만 드러난다.**
+
+  **★ 함정 2: score와 distance의 방향이 반대다 ★** 변환을 빼먹으면 **M6 평가 하네스가
+  Qdrant에서만 순위를 거꾸로 매긴다 — 에러 없이.** 계약(`base.py`)이 `distance` 하나로 통일해
+  둔 덕에 변환 지점이 어댑터 한 줄로 고정됐다.
+
+  **덤 실측 — `QdrantClient`의 생성자는 연결하지 않는다.** 서버를 내린 채 만들어도 0.08초에
+  성공한다. 이 사실 덕분에 `tests/test_rag_store.py`가 **Qdrant 없이도 돈다**(`get_store("qdrant")`가
+  CI에서 안 죽는다). 생성자가 연결했다면 테스트 설계를 완전히 다르게 해야 했다 —
+  **"당연히 그럴 것"으로 넘기지 않고 재본 것이 값을 한 자리다.**
+
+- [x] **3-3c. `QdrantStore` 구현** (2026-09-07 완료)
+
+  `app/rag/qdrant_store.py` 하나가 늘었을 뿐, **`graph.py`·`chat.py`·`retriever.py`·`ai_sdk.py`·
+  프론트는 한 줄도 안 바뀌었다.** 3-3a에서 계약을 먼저 뽑아둔 값이 여기서 회수된다.
+  실측 번호를 코드 주석에 그대로 달아뒀다 — **문서를 암기해 쓴 줄이 하나도 없다.**
+
+  **pgvector와 "같은 일"인데 방법이 다른 지점 4개** = "전용 벡터 DB를 쓰면 뭐가 달라지나"의 실체:
+
+  | | pgvector | Qdrant |
+  |---|---|---|
+  | 스키마 | `vector(1024)` 컬럼 + **alembic 마이그레이션** | 런타임 `create_collection` — **마이그레이션 없음** |
+  | 키 | `(source, chunk_index)` 자연 키 | **uuid5 결정론적 UUID** (자연 키 불가) |
+  | 원자성 | delete+insert를 **한 트랜잭션** | **트랜잭션 없음** — 삭제와 삽입 사이에 빈 창이 생긴다 |
+  | 점수 | `cosine_distance` (낮을수록 가깝다) | `score` (높을수록) → `1 - score`로 변환 |
+
+  **★ 트랜잭션이 없다는 게 진짜 차이다 ★** pgvector는 "반쯤 지워진 상태"가 밖에서 보이는 순간이
+  아예 없었는데, Qdrant는 `delete` → `upsert` 사이에 **그 문서가 검색에서 통째로 사라지는 창이
+  실제로 존재한다.** 학습용이라 감수했고, 실무라면 두 갈래다:
+  - **(a) 새 컬렉션에 전부 넣고 alias를 원자적으로 바꿔 끼운다**(`update_collection_aliases`).
+    무중단 재인입이고, M7의 `docs_v1`/`docs_v2` A/B와 자연스럽게 이어진다. ← 실무 표준
+  - (b) 삭제를 생략하고 uuid5 덮어쓰기에만 의존 — 창은 없어지지만 **문서가 짧아지면 옛 꼬리
+    청크가 유령으로 남는다**(3-1에서 pgvector에 UPSERT를 안 쓴 것과 정확히 같은 이유). 그래서 안 골랐다.
+
+  **`TIMEOUT_SECONDS = 5`** — 3-3a의 "알고 남겨둔 것" ①을 여기서 회수했다. pgvector는
+  `db/session.py:20`의 `statement_timeout=5000`이 지켜줬지만 Qdrant는 HTTP다. `retrieve` 노드는
+  `asyncio.to_thread`로 도는데 여기서 무한정 매달리면 **스레드 풀이 통째로 막혀 3-2b가 이벤트
+  루프를 지키려고 만든 방어가 무력해진다.** "느린 Qdrant → 챗봇 전체 정지" 경로가 이 상수 하나로 끊긴다.
+
+  **`_collection_ready` 플래그**: 컬렉션 존재 확인을 프로세스당 한 번만 한다(매 검색마다 하면
+  사용자 요청당 왕복이 하나 더 붙는다). 대가는 "컬렉션이 밖에서 지워지면 재시작 전까지 404"인데,
+  **실무는 이 부트스트랩을 앱이 아니라 배포 단계의 Job으로 뺀다** — 이 저장소의
+  `k8s/base/migrate-job.yaml`이 pgvector에게 해주는 일과 정확히 같은 역할이다.
+
+  **`EMBEDDING_DIM`이 이사했다** (`models/chunk.py` → `rag/base.py`). 원래 자리가 틀렸다는 게
+  여기서 드러났다 — **1024는 Postgres 테이블의 성질이 아니라 임베딩 모델의 성질이고, 두 저장소가
+  반드시 합의해야 하는 값이다.** 저장소가 하나일 땐 안 보이다가 "qdrant_store가 SQLAlchemy 모델을
+  import한다"는 이상한 그림이 되어서야 드러났다. **잘못된 위치는 구현이 둘이 될 때 드러난다.**
+
+- [x] **3-4. 설정 전환 + 비교 기록** (2026-09-07 완료)
+
+  **`app/rag/factory.py`의 `get_store()`가 생겼다.** 3-3a에서 일부러 안 만들었던 그 팩토리다 —
+  구현이 하나뿐인데 만들면 분기가 항상 같은 쪽으로만 가는 코드가 되기 때문이었다. **아직 없는
+  문제를 막는 코드는 만들지 않는다**는 원칙(2c에서 노드 이름 필터를 미룬 것)이 한 바퀴 돌아
+  회수된 지점이다.
+
+  **예고한 대로 "한 줄"이었다**: `deps.py:68`이 `PgVectorStore()` → `get_store()`.
+  `graph.py`·`chat.py`·`ai_sdk.py`·`retriever.py`의 `retrieve()`·테스트 39개 전부 안 바뀌었다.
+
+  **오타를 폴백으로 삼키지 않는다**: `get_store("qdrnat")`는 `ValueError`다. 조용히 pgvector로
+  폴백하면 **"Qdrant로 바꿨는데 왜 결과가 그대로지?"를 몇 시간 헤맨다.** 설정 오타는 시끄럽게
+  죽는 편이 항상 싸다. `vector_store`를 `Literal`이 아니라 `str`로 둔 것도 같은 판단이다 —
+  Literal이면 앱 부팅 자체가 pydantic ValidationError로 죽는데 메시지가 Settings 전체 검증
+  실패로 나와서 원인 필드를 찾기가 오히려 번거롭다.
+
+  **CLI에 `--store` 플래그**: `settings`는 프로세스당 하나뿐이라 "둘을 동시에 열어 비교"가
+  안 된다. `get_store(name)`이 인자를 받는 이유가 이것이다.
+  ```bash
+  uv run python -m app.rag.ingest --store qdrant ../CLAUDE.md ../SETUP.md ../DEPLOYMENT.md
+  uv run python -m app.rag.retriever --store qdrant "파이썬 버전은 어떻게 관리해?"
+  ```
+  `pop_store_arg`가 `args`를 **제자리에서** 수정한다 — 먼저 빼내지 않으면 `--store`가 파일
+  경로로 취급돼 `파일이 없다: --store`로 죽는다. 순수 함수라 pytest로 5케이스를 검증한다
+  (**남은 인자까지 확인하는 게 핵심** — 이름만 검사하면 이 버그를 못 잡는다).
+
+  ### 비교 결과 (`scripts/compare_stores.py`, 2026-09-07)
+
+  **★ 임베딩을 질문당 딱 한 번 계산해서 양쪽에 같은 벡터를 넘긴다 ★** 이게 이 스크립트의 핵심
+  설계다. `retrieve()`를 두 번 부르면 임베딩도 두 번 도는데, 그러면 "저장소 차이"와 "임베딩
+  차이"가 섞여 무엇을 비교한 건지 알 수 없다. **계약의 `search`가 텍스트가 아니라 벡터를 받도록
+  설계한 3-3a의 결정 ③이 정확히 여기서 현금화된다.**
+
+  말뭉치: `CLAUDE.md` 20 + `SETUP.md` 21 + `DEPLOYMENT.md` 35 = **양쪽 모두 76청크**.
+
+  | 질문 종류 | 질문 | top5 겹침 | 순위 동일 | distance 최대 차 | pgvector | qdrant |
+  |---|---|---|---|---|---|---|
+  | normal | 파이썬 버전은 어떻게 관리해? | 5/5 | 예 | 0.0000 | 171.8ms | 42.8ms |
+  | normal | 마이그레이션은 언제 실행되나? | 5/5 | 예 | 0.0000 | 116.2ms | 24.0ms |
+  | normal | 대화 내용은 어디에 저장되나? | 5/5 | 예 | 0.0000 | 66.9ms | 23.1ms |
+  | keyword | `k8s/base/secret.yaml` | 5/5 | 예 | 0.0000 | 114.5ms | 39.3ms |
+  | keyword | `VITE_API_URL` | 5/5 | 예 | 0.0000 | 104.7ms | 34.3ms |
+
+  **합계 25/25 · 순위까지 동일 5/5 · distance 차이 전부 0.0000.**
+
+  **★ 이 결과의 해석이 M3 전체의 결론이다 ★**
+
+  1. **전용 벡터 DB가 검색 "품질"을 올려주지 않는다.** 같은 임베딩·같은 코사인 거리라면 결과는
+     **똑같다.** 품질을 움직이는 건 저장소가 아니라 **임베딩 모델(3-1)·청킹(M7)·하이브리드와
+     리랭킹(M8)·쿼리 변환(M9)** 이다. "검색이 안 좋으니 Qdrant로 바꾸자"는 대개 잘못된 처방이다.
+  2. **`1 - score` 변환이 정확하다는 실증.** 손계산이 아니라 실제 76청크 × 5질문에서 소수점 4자리가
+     전부 일치했다. 변환이 틀렸다면 순위가 완전히 뒤집혀 즉시 드러났을 것이다.
+  3. **속도 차이(2~4배)를 과대 해석하면 안 된다.** 76개 청크에서는 **양쪽 다 전수 스캔**이다
+     (pgvector는 ANN 인덱스가 없고, Qdrant도 `indexing_threshold`(기본 1만) 아래라 인덱스를 안 만든다).
+     즉 이건 "벡터 검색 알고리즘의 차이"가 아니라 **요청당 오버헤드의 차이**다 —
+     `PgVectorStore.search`는 호출마다 새 세션을 열고(`pool_pre_ping=True`라 왕복이 하나 더),
+     SQLAlchemy ORM이 Row를 만든다. Qdrant는 살아 있는 HTTP 커넥션을 재사용한다.
+     첫 질문의 171.8ms가 이후 66~116ms로 떨어지는 것도 커넥션 풀 워밍업이다.
+     **진짜 차이는 수십만~수백만 벡터에서 ANN 인덱스가 켜질 때 나온다 — 그건 이 말뭉치로 잴 수 없다.**
+  4. **keyword 질문이 "겹침 5/5"인 것에 속으면 안 된다.** 둘이 같은 답을 준다는 뜻이지 그 답이
+     좋다는 뜻이 아니다. `k8s/base/secret.yaml` 같은 질문에서 벡터 검색이 실제로 잘하는지는
+     **정답이 있는 골든셋이 있어야** 말할 수 있고, 그게 M6다. **M8 하이브리드 검색의 효과는 오직
+     이 종류에서만 드러나므로**, 지금 눈으로 봐둔 게 그때 "왜 필요한가"를 선명하게 만든다.
+
+  ### 그래서 어느 쪽을 기본으로 두는가 — `pgvector`
+
+  `settings.vector_store` 기본값은 `"pgvector"`다. 이유는 M3 서두에 적은 그대로이고, 비교를
+  직접 해본 지금 근거가 하나 더 붙었다: **검색 결과가 동일한데 인프라가 하나 늘면 백업·모니터링·
+  업그레이드·장애 대응이 전부 는다.** 이 저장소엔 이미 Postgres가 있다.
+  Qdrant가 값을 하기 시작하는 지점은 (a) 수백만 벡터 이상, (b) payload 필터가 무거워질 때(M12
+  멀티테넌시), (c) **DB 레벨 하이브리드 검색**(M8의 named vector + `FusionQuery`)이다.
+  → **M8에서 이 판단을 다시 한다.** 그때는 "Qdrant만 되는 기능"이 실제로 필요해지므로.
+
+  **함정 기록**
+  - `--store` 플래그는 **파일 경로 검증보다 먼저** 빼내야 한다. 안 그러면 `파일이 없다: --store`.
+  - Git Bash에서 `curl -d '{"...한글..."}'`을 인라인으로 주면 여전히 400이다(M1-1a의 함정이
+    그대로 재현됐다). UTF-8 파일에 담아 `-d @req.json`으로 보낸다.
+  - `ruff format`이 `probe_qdrant.py`의 f-string 줄바꿈을 한 번 고쳤다 — 포매터를 먼저 돌리고
+    커밋하는 습관이 없으면 diff에 무관한 줄이 섞인다.
+
+  **검증**
+  - `uv run ruff check .` 통과 / `uv run pytest -q` → **39 passed**(31 + 저장소·팩토리 8개).
+    **기존 30개가 전부 그대로다** — 저장소를 하나 더 만들고 설정으로 갈아끼우는 큰 변경인데
+    챗봇의 동작을 검증하는 테스트는 한 줄도 안 바뀌었다.
+  - Qdrant 멱등 재인입: `CLAUDE.md:청크 20개 저장 (기존 20개 삭제)` → 총 개수 **76 불변**.
+  - pgvector 쪽 `count(distinct chunk_index) == count(*)`, `max = count - 1` 재확인(3-1의
+    `chunk_index=1` 오타 사고 이후로 붙인 검증).
+  - **실제 챗봇 end-to-end**: `VECTOR_STORE=qdrant uvicorn ...` 으로 띄우고 실제 Anthropic 호출.
+    "VITE_API_URL은 언제 값이 정해지나?" → **`[출처: CLAUDE.md]`를 밝히며 빌드 타임이라고 정확히 답변.**
+  - **★ 반증 케이스 ★** "이 프로젝트의 Redis 캐시 만료 시간은?" → **"문서 발췌에서 찾을 수 없습니다"**.
+    성공 케이스만 보면 모델이 원래 알던 것인지 검색 덕인지 구분할 수 없다. M10 그라운딩의 씨앗이
+    `graph.py:40`의 프롬프트 한 문장에 이미 심어져 있다는 증거이기도 하다.
 
 **검증**: 샘플 문서에만 있는 내용을 질문 → 정답 확인 → **문서를 수정하고 재인입하면 답이 바뀌는지**
 확인(이게 "학습이 아니라 검색"임을 증명한다). 그리고 문서에 없는 것을 물었을 때의 행동도 본다.

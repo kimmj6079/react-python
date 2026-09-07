@@ -31,6 +31,25 @@ class Settings(BaseSettings):
     # 생성이 실패하지 않게 하기 위함.
     anthropic_api_key: str = ""
 
+    # --- RAG 저장소 설정 (M3-3c / M3-4) ---
+    # ★ 어느 벡터 저장소를 쓸 것인가 ★ "pgvector" 또는 "qdrant".
+    # 이 값 하나로 인입·검색·챗봇이 통째로 갈아끼워진다(app/rag/factory.py의 get_store).
+    #
+    # Literal이 아니라 str인 이유: 오타를 pydantic이 422처럼 조용히 잡아주는 것보다,
+    # get_store()가 "pgvector|qdrant 중 하나여야 한다"고 이름을 담아 죽는 편이 낫다.
+    # (Literal로 하면 앱 부팅 자체가 pydantic ValidationError로 죽는데, 메시지가
+    #  Settings 전체 검증 실패로 나와서 원인 필드를 찾기가 오히려 번거롭다.)
+    vector_store: str = "pgvector"
+
+    # Qdrant 접속 주소. 로컬은 docker-compose의 qdrant 서비스(포트 6333),
+    # 컨테이너 안에서는 docker-compose.yml이 http://qdrant:6333으로 덮어쓴다.
+    qdrant_url: str = "http://localhost:6333"
+
+    # 컬렉션 이름 = pgvector의 테이블 이름에 해당한다. 설정으로 뺀 이유:
+    # M7에서 청킹 전략을 바꿀 때 docs_v1 / docs_v2로 나란히 두고 A/B 비교를 하려면
+    # 이 값이 바뀔 수 있어야 한다. (pgvector에서 같은 걸 하려면 마이그레이션이 필요하다)
+    qdrant_collection: str = "document_chunks"
+
     @property
     def cors_origins(self) -> list[str]:
         # "a, b, c" 형태의 문자열을 ["a", "b", "c"] 리스트로 변환해서 CORSMiddleware에 넘긴다.

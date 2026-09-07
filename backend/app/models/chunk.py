@@ -10,12 +10,12 @@ from sqlalchemy import DateTime, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
+from app.rag.base import EMBEDDING_DIM
 
-# ★ 임베딩 차원. 모델이 정하는 값이라 여기 상수로 못 박는다 ★
-# intfloat/multilingual-e5-large = 1024차원(실측).
-# 모델을 바꾸면 이 숫자가 바뀌고, 그러면 컬럼 타입이 바뀌므로
-# 마이그레이션 + 전체 재인입이 필요하다. "설정 한 줄"이 아니다.
-EMBEDDING_DIM = 1024
+# ★ 3-3c에서 EMBEDDING_DIM이 이 파일을 떠났다 ★
+# 1024는 이 테이블의 성질이 아니라 임베딩 모델의 성질이고, pgvector와 Qdrant가
+# 반드시 같은 값으로 합의해야 하는 값이라 app/rag/base.py(계약)로 옮겼다.
+# 여기서는 import해서 쓰기만 한다 — 이름은 그대로라 아래 컬럼 정의는 안 바뀐다.
 
 
 class DocumentChunk(Base):

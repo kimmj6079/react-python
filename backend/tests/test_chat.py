@@ -20,7 +20,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from app.api.deps import get_graph
 from app.graph import build_graph
 from app.main import app
-from app.rag.retriever import RetrievedChunk
+from app.rag.base import RetrievedChunk
 
 # 가짜 모델이 흘려보낼 고정 델타. 값을 고정하면 매 실행이 같은 바이트를 내므로
 # 1b 캡처와 == 하나로 비교할 수 있다. 한글을 넣은 이유는 ensure_ascii=False가

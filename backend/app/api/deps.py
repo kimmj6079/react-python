@@ -8,9 +8,11 @@ from langgraph.graph.state import CompiledStateGraph
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.db.session import SessionLocal, get_db
+from app.db.session import get_db
 from app.graph import build_graph
-from app.rag.retriever import RetrievedChunk, search
+from app.rag.base import RetrievedChunk
+from app.rag.factory import get_store
+from app.rag.retriever import retrieve
 
 # DbSession이라는 타입 별칭을 만들어두면, 라우터 함수 파라미터에서
 # `db: DbSession`이라고만 써도 FastAPI가 자동으로 get_db()를 호출해 세션을 주입해준다.
@@ -56,16 +58,29 @@ _model = ChatAnthropic(
 _checkpointer = InMemorySaver()
 
 
+# ★ 3-4: 예고한 대로 이 한 줄만 바뀌었다 ★
+# 3-3a에서 `_store = PgVectorStore()`였고, 지금은 settings.vector_store를 읽는
+# 팩토리 호출이다. graph.py도 chat.py도 retriever.py도 테스트도 한 줄 안 바뀌었다 —
+# 2b에서 체크포인터를, 2c에서 도구를 인자로 밀어냈을 때와 같은 성질이 회수된 지점이다.
+#
+# 모듈 레벨에서 한 번만 만든다: QdrantStore는 HTTP 커넥션을 들고 있어서 요청마다
+# 새로 만들면 연결이 요청 수만큼 생긴다(_model·_checkpointer와 같은 이유).
+_store = get_store()
+
+
 def _retrieve(query: str) -> list[RetrievedChunk]:
-    # graph.py가 받는 retrieve_fn의 실제 구현체. 그래프는 이 함수가 SQLAlchemy를
-    # 쓰는지 Qdrant를 쓰는지 몰라야 하므로(README M3 "인터페이스 하나, 구현
-    # 둘"), 세션을 여는 이 한 줄이 "저장소를 안다"는 책임 전체를 여기 가둔다.
+    # graph.py가 받는 retrieve_fn의 실제 구현체.
     #
-    # 요청마다(retrieve 노드가 호출될 때마다) 세션을 새로 열고 닫는다 —
-    # DbSession 의존성처럼 FastAPI가 대신 관리해줄 수 없다. 그래프 노드는
-    # HTTP 요청·응답 생명주기 밖에 있는 일반 함수이기 때문이다.
-    with SessionLocal() as db:
-        return search(db, query)
+    # ★ 이 함수에서 SQLAlchemy가 사라졌다 ★ 3-2b에는 with SessionLocal()이 있었다 —
+    # 즉 "그래프는 저장소를 모른다"고 써놓고 그 바로 옆 파일이 Postgres를 알고
+    # 있었다. 이제 세션은 PgVectorStore 안에만 있고, deps.py가 아는 것은 "store를
+    # 하나 골라 retrieve에 넘긴다"뿐이다.
+    #
+    # 함수를 한 겹 남겨두는 이유: graph.py의 retrieve_fn 타입이
+    # Callable[[str], list[RetrievedChunk]]라 "질문 하나 받아 청크 리스트를 주는"
+    # 모양이어야 하는데, store.search는 벡터를 받는다. 임베딩을 끼워 넣는 이 한 줄이
+    # 두 모양을 잇는 어댑터다.
+    return retrieve(_store, query)
 
 
 _graph = build_graph(_model, retrieve_fn=_retrieve, checkpointer=_checkpointer)

@@ -11,11 +11,10 @@ import sys
 import time
 from pathlib import Path
 
-from sqlalchemy import delete
-
-from app.db.session import SessionLocal
-from app.models.chunk import DocumentChunk
+from app.core.config import settings
+from app.rag.base import VectorStore
 from app.rag.embedding import embed_passages
+from app.rag.factory import get_store, pop_store_arg
 
 # 청크 크기(문자 수). e5-large의 입력 한도는 512 "토큰"이라, 문자 기준인 지금은
 # 한도를 넘는 청크의 뒷부분이 조용히 잘린 채 임베딩될 수 있다(에러 없음).
@@ -63,7 +62,7 @@ def normalize_source(path: Path) -> str:
         return resolved.name
 
 
-def insert_file(path: Path, source: str) -> tuple[int, int]:
+def insert_file(path: Path, source: str, store: VectorStore) -> tuple[int, int]:
     text = path.read_text(encoding="utf-8")
     chunks = chunk_text(text)
 
@@ -71,19 +70,13 @@ def insert_file(path: Path, source: str) -> tuple[int, int]:
     # 배치 분할은 fastembed가 내부에서 알아서 한다(기본 batch_size=256).
     vectors = embed_passages(chunks)
 
-    # 삭제 + 삽입을 한 트랜잭션으로 묶는다: 커밋 전까지 검색(3-2)에는 옛 청크가
-    # 그대로 보이고, 커밋 순간 새 청크로 통째로 바뀐다. "반쯤 지워진 상태"가
-    # 밖에서 보이는 순간이 없다. 실패하면 통째로 롤백 = 옛 청크가 그대로 남는다.
-    with SessionLocal() as db:
-        stmt = delete(DocumentChunk).where(DocumentChunk.source == source)
-        deleted = db.execute(stmt).rowcount
-        db.add_all(
-            [
-                DocumentChunk(source=source, chunk_index=i, content=c, embedding=v)
-                for i, (c, v) in enumerate(zip(chunks, vectors, strict=True))
-            ]
-        )
-        db.commit()
+    # ★ 3-3a: "지우고 새로 넣기"를 이 함수가 더 이상 모른다 ★
+    # 3-1에서 여기 있던 delete + add_all + commit은 pgvector_store.py로 옮겼다.
+    # Postgres는 그 셋을 한 트랜잭션으로 묶을 수 있지만 Qdrant는 못 한다 —
+    # "어떻게 멱등을 달성하는가"는 저장소마다 다른 구현 세부라 계약에 두면 안 된다.
+    # 이 함수에 남은 것은 "무엇을 하는가"(읽기 → 청킹 → 임베딩 → 업서트)뿐이고,
+    # 그 넷은 저장소가 바뀌어도 같다.
+    deleted = store.upsert_document(source, chunks, vectors)
     return len(chunks), deleted
 
 
@@ -94,10 +87,17 @@ def main() -> None:
     # 상태(stdout)가 바뀌는" 부수효과는 라이브러리가 되는 순간 민폐다.
     sys.stdout.reconfigure(encoding="utf-8")
 
+    # ★ 3-4: --store 플래그를 먼저 빼낸다 ★ pop_store_arg가 args를 제자리에서
+    # 수정하므로, 아래 존재 검증은 남은 "파일 경로"만 보면 된다.
+    # 이 순서가 중요하다 — 먼저 빼내지 않으면 "--store"가 파일 경로로 취급돼
+    # "파일이 없다: --store"로 죽는다.
     args = sys.argv[1:]
+    store_name = pop_store_arg(args)
+
     if not args:
-        print("사용법: uv run python -m app.rag.ingest <문서 경로>...")
+        print("사용법: uv run python -m app.rag.ingest [--store pgvector|qdrant] <문서 경로>...")
         print("예:     uv run python -m app.rag.ingest ../CLAUDE.md ../SETUP.md")
+        print("        uv run python -m app.rag.ingest --store qdrant ../CLAUDE.md")
         raise SystemExit(1)
 
     # 존재 검증을 먼저 전부 끝낸다 — 세 번째 경로의 오타 때문에, 몇 분짜리
@@ -107,10 +107,18 @@ def main() -> None:
     if missing:
         raise SystemExit(f"파일이 없다:{','.join(missing)}")
 
+    # ★ 3-4: 예고한 대로 이 한 줄만 바뀌었다 ★ (3-3a에서는 PgVectorStore() 고정)
+    #
+    # ★ 루프 "밖"에서 한 번만 만드는 것이 중요하다 ★ PgVectorStore는 상태가 없어
+    # 차이가 없었지만, QdrantStore는 HTTP 커넥션을 들고 있어서 파일마다 새로 만들면
+    # 연결이 파일 수만큼 생긴다. 3-3a에서 위치를 잡아둔 덕에 여기서 고칠 게 없었다.
+    store = get_store(store_name)
+    print(f"[저장소: {store_name or settings.vector_store}]")
+
     for path in paths:
         source = normalize_source(path)
         startd = time.perf_counter()
-        inserted, deleted = insert_file(path, source)
+        inserted, deleted = insert_file(path, source, store)
         elapsed = time.perf_counter() - startd
         print(f"{source}:청크 {inserted}개 저장 (기존 {deleted}개 삭제, {elapsed:.1f}초)")
 

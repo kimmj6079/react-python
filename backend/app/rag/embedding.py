@@ -6,7 +6,7 @@
 # 순위가 무작위에 가까워진다. 그래서 모델 이름을 여기 한 곳에만 적고 양쪽이 import한다.
 from fastembed import TextEmbedding
 
-from app.models.chunk import EMBEDDING_DIM
+from app.rag.base import EMBEDDING_DIM
 
 # scripts/probe_embedding.py 실측으로 정한 모델. 한국어 포함 다국어 + 1024차원.
 # e5 계열은 질문에 "query: ", 문서에 "passage: "를 붙여 학습된 비대칭 모델이라,
@@ -51,11 +51,11 @@ def embed_query(text: str) -> list[float]:
 
 
 def _check_dim(vectors: list[list[float]]) -> None:
-    # 모델과 스키마(vector(1024))가 어긋난 채 진행되는 것을 막는 안전핀.
-    # DB도 저장 시점에 차원을 검증하지만, 그건 임베딩 계산(느리다)을 다 마친
-    # 뒤이고 메시지도 불친절하다. 여기서 먼저, 모델 이름을 담아 죽는다.
+    # 모델과 저장소(pgvector의 vector(1024) / Qdrant 컬렉션의 size=1024)가 어긋난 채
+    # 진행되는 것을 막는 안전핀. 저장소도 저장 시점에 차원을 검증하지만, 그건 임베딩
+    # 계산(느리다)을 다 마친 뒤이고 메시지도 불친절하다. 여기서 먼저, 모델 이름을 담아 죽는다.
     if vectors and len(vectors[0]) != EMBEDDING_DIM:
         raise ValueError(
-            f"임베딩 차원 {len(vectors[0])} != 스키마 차원 {EMBEDDING_DIM} - "
-            f"모델{MODEL_NAME}과 document_chunks.embedding이 어긋났다"
+            f"임베딩 차원 {len(vectors[0])} != 계약 차원 {EMBEDDING_DIM} - "
+            f"모델 {MODEL_NAME}과 app/rag/base.py의 EMBEDDING_DIM이 어긋났다"
         )

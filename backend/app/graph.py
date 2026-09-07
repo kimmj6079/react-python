@@ -27,7 +27,7 @@ from langgraph.graph.message import add_messages
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
-from app.rag.retriever import RetrievedChunk
+from app.rag.base import RetrievedChunk
 from app.tools import TOOLS
 
 logger = logging.getLogger(__name__)

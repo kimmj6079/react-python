@@ -183,6 +183,72 @@ VITE_API_URL=http://localhost:8000
 
 > 참고: 코드에 동일한 기본값이 이미 들어 있어([`app/core/config.py`](backend/app/core/config.py), [`src/api/client.ts`](frontend/src/api/client.ts)) `.env` 없이도 로컬에서는 동작한다. 그래도 "이 앱이 어떤 환경변수를 읽는가"가 파일로 드러나는 편이 낫기 때문에 만들어 두기를 권장한다.
 
+#### B-4-1) 시크릿 복원 — `.env.enc` 복호화 (챗봇 기능을 쓸 때만)
+
+위 템플릿에는 **실제 API 키가 없다.** 챗봇(M1~)을 쓰려면 `ANTHROPIC_API_KEY`가, 트레이싱(M4)을
+쓰려면 `LANGFUSE_*`가 실값이어야 한다. 이 저장소는 그 값들을 **암호화해서 커밋해 둔다.**
+
+```bash
+# ① 개인키 가져오기 (비밀번호 관리자에 보관해 둔 파일)
+gpg --import react-python-env-secret.asc
+
+# ② 복호화 — backend/.env 가 만들어진다
+./scripts/env-decrypt.sh          # PowerShell: .\scripts\env-decrypt.ps1
+```
+
+이미 `.env`가 있으면 덮어쓰기를 거부한다. 강제하려면 `--force` / `-Force`.
+
+**값을 바꿨으면 다시 암호화해서 커밋한다:**
+```bash
+./scripts/env-encrypt.sh          # PowerShell: .\scripts\env-encrypt.ps1
+git add backend/.env.enc && git commit -m "chore: 시크릿 갱신"
+```
+
+##### 이 구조가 왜 이렇게 생겼나
+
+| 파일 | 커밋? | 정체 |
+|---|---|---|
+| `backend/.env` | ✘ (gitignore) | 평문 시크릿. 절대 커밋하지 않는다 |
+| `backend/.env.enc` | **✔** | 암호문. 개인키 없이는 못 연다 |
+| `backend/.env.pubkey.asc` | **✔** | 공개키. **공개돼도 되는 것이 공개키의 정의다** |
+| `react-python-env-secret.asc` | ✘ | 개인키. 리포 밖(비밀번호 관리자)에만 존재 |
+
+**평문 커밋은 왜 안 되나**: GitHub은 푸시할 때 내용을 스캔해 `sk-ant-…` 같은 패턴을 찾으면
+**푸시 자체를 거부**한다(실제로 이 저장소에서 겪었다). 뚫더라도 git 히스토리에 영구히 남고,
+GitHub이 Anthropic에 유출을 통보해 키가 자동 폐기될 수 있다. **파일명을 바꿔도 소용없다 —
+스캐너는 파일명이 아니라 내용을 본다.**
+
+**비대칭(공개키/개인키)을 쓰는 이유**: 암호화에는 공개키만 있으면 된다. 즉 CI나 팀원이
+"시크릿을 추가"할 수는 있어도 **"읽을" 수는 없다.** 대칭키(암호 하나)였다면 넣는 쪽과
+읽는 쪽 권한이 같아진다.
+
+> **실무에서는 보통 `age` + [SOPS](https://github.com/getsops/sops)를 쓴다.** 여기서 gpg를
+> 쓴 건 Git for Windows에 이미 들어 있어 추가 설치가 필요 없기 때문이다. SOPS의 장점은
+> **값 단위 암호화**라 `git diff`에서 "어느 키가 바뀌었는지"가 보인다는 것 — 지금 방식은
+> 파일 통째로라 매번 전체가 바뀐 것으로 나온다. 팀 규모가 커지면 그때 갈아탈 지점이다.
+
+##### ★ 개인키를 백업하지 않으면 영원히 못 연다 ★
+
+키를 잃어버리면 `.env.enc`는 **복구 불가**다. 그게 암호화의 정의다. 최초 1회 반드시:
+
+```bash
+# 개인키를 파일로 내보내 비밀번호 관리자(1Password 등)에 저장한다
+gpg --armor --export-secret-keys react-python-env > react-python-env-secret.asc
+```
+
+내보낸 파일은 `.gitignore`의 `*secret*.asc` 규칙이 막아주지만, **쓰고 나면 디스크에서
+지우는 편이 안전하다.** 키를 새로 만들어야 하면 새 키쌍을 만들고 `.env.pubkey.asc`를 교체한 뒤
+`env-encrypt`를 다시 돌린다.
+
+##### 함정 2개 (실제로 겪은 것)
+
+- **PowerShell에서 `gpg`를 못 찾는다** — Git for Windows가 gpg를 같이 깔지만 PATH에는
+  `cmd` 디렉터리만 넣는다. Git Bash에서는 보이고 PowerShell에서는 안 보이는 이유다.
+  스크립트가 `%ProgramFiles%\Git\usr\bin\gpg.exe`를 자동으로 찾도록 해뒀다.
+- **`.ps1` 파일은 UTF-8 BOM이 있어야 한다** — Windows PowerShell 5.1은 BOM이 없으면
+  스크립트를 시스템 ANSI(cp949)로 읽어서, 한글 주석이 깨지고 **파싱 에러로 죽는다.**
+  이 저장소의 `.ps1`은 전부 BOM이 있다.
+
 ### B-5) 백엔드 의존성 설치 — 이 단계에서 Python이 설치된다
 
 ```bash

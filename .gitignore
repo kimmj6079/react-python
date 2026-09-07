@@ -21,6 +21,16 @@ nginx-proxy/ssl/*.pem
 nginx-proxy/ssl/*.key
 nginx-proxy/ssl/*.crt
 
+# --- 암호화된 시크릿 (backend/.env.enc) ---
+# backend/.env.enc 와 backend/.env.pubkey.asc 는 ★ 커밋해야 하는 ★ 파일이라 여기 없다.
+#   .env.enc      = 암호문. 개인키 없이는 못 연다
+#   .env.pubkey.asc = 공개키. 공개돼도 되는 것이 공개키의 정의다(암호화만 가능, 복호화 불가)
+# 절대 들어오면 안 되는 것은 "개인키를 내보낸 파일" 하나뿐이다.
+# 백업하려고 export한 뒤 리포 안에 두고 잊어버리는 사고를 막는다 — SETUP.md 참고.
+*secret*.asc
+*private*.asc
+*.gpg-key
+
 # --- Editors / OS ---
 .vscode/
 .idea/

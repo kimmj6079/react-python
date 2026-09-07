@@ -14,12 +14,21 @@ services:	# 이 파일에서 정의할 컨테이너 서비스 목록 시작
     volumes:	# 데이터 영속화를 위한 볼륨 마운트
       - db-data:/var/lib/postgresql/data	# 명명된 볼륨을 postgres 데이터 디렉토리에 연결
 
+  qdrant:	# 전용 벡터 DB (M3-3). pgvector와 검색 품질/사용성을 비교하기 위해 둘 다 띄운다
+    image: qdrant/qdrant:v1.19.1	# ★ 태그를 고정한다 — latest는 어제와 오늘이 다른 버전이라 "실측 결과의 유효기간"을 말할 수 없다
+    ports:	# 포트 매핑
+      - "6333:6333"	# REST API + 웹 대시보드 (http://localhost:6333/dashboard)
+      - "6334:6334"	# gRPC API (qdrant-client가 prefer_grpc=True일 때 쓰는 포트)
+    volumes:	# 데이터 영속화
+      - qdrant-data:/qdrant/storage	# 명명된 볼륨. pgvector의 db-data와 같은 역할
+
   backend:	# FastAPI 백엔드 서비스
     build:	# 이미지를 빌드해서 사용
       context: ./backend	# 빌드 컨텍스트 경로
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload	# 개발 서버 실행 커맨드 (핫리로드 활성화)
     environment:	# 백엔드에 주입할 환경변수
       DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/app	# DB 접속 문자열 (서비스명 db로 접근)
+      QDRANT_URL: http://qdrant:6333	# 컨테이너 안에서는 localhost가 아니라 서비스명으로 접근한다
       BACKEND_CORS_ORIGINS: http://localhost:5173	# CORS 허용할 프론트엔드 origin
     volumes:	# 소스 코드 바인드 마운트 (핫리로드용)
       - ./backend/app:/app/app	# 로컬 app 디렉토리를 컨테이너에 동기화
@@ -46,3 +55,4 @@ services:	# 이 파일에서 정의할 컨테이너 서비스 목록 시작
 
 volumes:	# 명명된 볼륨 정의
   db-data:	# postgres 데이터 영속화용 볼륨
+  qdrant-data:	# qdrant 데이터 영속화용 볼륨

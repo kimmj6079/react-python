@@ -31,6 +31,14 @@ class Settings(BaseSettings):
     # 생성이 실패하지 않게 하기 위함.
     anthropic_api_key: str = ""
 
+    # 평가 하네스의 LLM-as-judge가 쓰는 모델. (M6-b)
+    # ★ 채점자는 피채점자보다 약하면 안 된다 ★ 답변은 haiku가 만들지만 "이 답이 문맥에
+    # 근거하는가"를 판정하려면 더 좋은 모델이 필요하다 — 약한 채점자는 잡음을 만들고,
+    # 그 잡음 위에서 M7~M13의 개선을 판단하면 계측기가 없는 것만 못하다.
+    # 채점은 지연이 상관없는 배치 작업이라 비싼 모델을 써도 되고(M13에서 Batches API로
+    # 50% 더 절감), 골든셋이 24건뿐이라 실행당 비용도 작다.
+    judge_model: str = "claude-opus-5"
+
     # --- RAG 저장소 설정 (M3-3c / M3-4) ---
     # ★ 어느 벡터 저장소를 쓸 것인가 ★ "pgvector" 또는 "qdrant".
     # 이 값 하나로 인입·검색·챗봇이 통째로 갈아끼워진다(app/rag/factory.py의 get_store).

@@ -1227,10 +1227,44 @@ FastAPI가 LLM을 직접 호출해 SSE로 스트리밍, 프론트는 `ai`/`@ai-s
 - [x] `api/routes/chat.py`의 `config`에 `callbacks`·`metadata` 추가 (**예고대로 한 줄**)
 - [x] `.env.example` · `docker-compose.yml`에 키 이름 추가
 - [x] 테스트 7개 (`tests/test_tracing.py` 6 + `test_chat.py`의 config 캡처 1) → **46 passed**
-- [ ] **cloud.langfuse.com 가입 → 프로젝트 생성 → API Keys 발급 → `backend/.env`에 추가** ← 사용자 작업
-- [ ] `uv run python scripts/probe_langfuse.py` 재실행 → `auth_check()` True + 트레이스 1건 전송 확인
-- [ ] 브라우저에서 대화 → 대시보드 Traces에서 `retrieve` / `call_model` / `tools` 중첩 트리 확인
-- [ ] Sessions 뷰에서 `thread_id` 단위로 묶이는지 확인
+- [x] cloud.langfuse.com 가입 → API Keys 발급 → `backend/.env`에 등록 (2026-09-07)
+- [x] `scripts/probe_langfuse.py` 재실행 → **`auth_check(): True`** + 트레이스 1건 전송 확인
+- [x] 실제 챗봇 2턴(RAG 1 + 도구 1)을 돌리고 **Langfuse 공개 API로 도착을 확인** (아래 결과)
+- [ ] 대시보드 UI에서 중첩 트리·Sessions 뷰 육안 확인 ← 눈으로 한 번 보면 M4 종료
+
+**검증 결과 (2026-09-07)** — 대시보드를 열기 전에 **`GET /api/public/traces`로 먼저 확인했다.**
+"대시보드에 보이더라" 대신 숫자로 확인하는 편이 재현 가능하고, 나중에 M6에서 자동화할 때
+그대로 쓸 수 있는 경로이기도 하다.
+
+| trace | session | observations | latency | cost |
+|---|---|---|---|---|
+| `LangGraph` (도구 턴 "서울 지금 몇 시야?") | `t-langfuse-demo` | **10** | 2.38s | $0.008248 |
+| `LangGraph` (RAG 턴 "VITE_API_URL…") | `t-langfuse-demo` | **5** | 9.34s | $0.004453 |
+| `RunnableSequence` (probe) | `probe-session` | 3 | 0.005s | $0 |
+
+**여기서 읽어낼 것 4가지 — 이게 M4를 붙인 값이다**
+
+1. **두 턴이 같은 `session`으로 묶였다.** `langfuse_session_id`에 `thread_id`를 넣은 한 줄이
+   실제로 동작한다 = Sessions 뷰의 묶음이 우리 체크포인터의 대화 단위와 일치한다.
+2. **도구 턴의 observation이 10개 vs RAG 턴 5개.** 2c에서 *"경로 B는 모델을 두 번 부른다 —
+   토큰 비용도 지연도 대략 두 배"* 라고 적어둔 것이 **처음으로 숫자로 보인다.**
+   비용도 $0.0082 vs $0.0045로 거의 두 배다. 추측이 계측으로 바뀐 지점.
+3. **★ latency가 뒤집혀 있다 ★** 모델을 두 번 부른 도구 턴이 2.38s인데 한 번 부른 RAG 턴이
+   9.34s다. 원인은 **첫 요청에서 fastembed 모델(2.24GB)을 처음 로딩**했기 때문이다 —
+   `embedding.py`의 lazy 싱글턴이 첫 검색에서 깨어난다. **"모델 호출 횟수"만 보고 지연을
+   설명하려 들면 완전히 틀린 결론에 도달했을 자리**이고, 트레이스가 없었으면 그냥
+   "가끔 느리네"로 넘어갔을 것이다. M13의 지연 예산에서 콜드스타트를 따로 다뤄야 한다는 근거.
+4. **비용이 자동으로 계산된다.** 모델명과 토큰 수로 Langfuse가 환산한다. M13의 비용 절감
+   (프롬프트 캐싱·Batches)이 before/after를 말할 수 있는 기준선이 이 숫자다.
+
+**함정 기록**
+- 사용자가 준 값의 키 이름이 `LANGFUSE_BASE_URL`이었는데 이 저장소의 설정 필드는
+  `langfuse_host`(→ `LANGFUSE_HOST`)다. SDK는 `base_url`·`host` 둘 다 받지만
+  **`Settings` 필드명이 곧 환경변수 이름이므로**(M1-1c의 pydantic 함정과 같은 성질)
+  `.env`에는 `LANGFUSE_HOST`로 넣어야 읽힌다. 값이 기본값과 같아서 틀렸어도 동작했을
+  케이스라 더 위험했다 — 조용히 무시되는 설정이 가장 찾기 어렵다.
+- **스크립트는 `flush()`가 필수, 서버는 불필요.** 전송이 백그라운드 스레드 + 배치라
+  짧은 프로세스는 보내기 전에 죽는다. 서버를 죽이기 전에 몇 초 기다린 이유도 같다.
 
 **★ 실측이 특히 중요했던 이유 ★** Langfuse 파이썬 SDK는 **v2 → v3에서 OpenTelemetry 기반으로
 아키텍처를 갈아엎으면서 import 경로와 `CallbackHandler`의 생성자가 통째로 바뀌었다.** 인터넷 예제는

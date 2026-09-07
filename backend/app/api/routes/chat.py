@@ -10,6 +10,7 @@ from app.core.ai_sdk import (
     latest_user_text,
     ui_message_stream,
 )
+from app.core.tracing import get_callbacks, trace_metadata
 from app.schemas.chat import ChatRequest
 
 router = APIRouter(tags=["chat"])
@@ -49,7 +50,22 @@ async def chat(payload: ChatRequest, graph: Graph) -> StreamingResponse:
     # 인증 자체가 없어 학습용으로 그냥 두지만, 실무라면 서버가 발급하고 소유권을
     # 검증하거나 최소한 f"{user_id}:{payload.id}"처럼 사용자 식별자를 접두어로
     # 섞는다. M12(멀티테넌시)에서 정면으로 다룬다.
-    config = {"configurable": {"thread_id": payload.id}}
+    #
+    # ★ M4에서 예고한 대로 "여기 한 줄"이었다 ★
+    # 2b에서 "M4의 Langfuse callbacks도 같은 dict에 들어간다"고 적어뒀던 그 자리다.
+    # graph.py도 ai_sdk.py도 프론트도 안 바뀐다 — RunnableConfig가 LangChain 공통
+    # 규약이라, 그래프 안의 모든 노드·모델·도구 호출이 이 콜백을 자동으로 상속한다.
+    # 우리가 노드마다 계측 코드를 심을 일이 없다는 뜻이고, 그게 이 배선의 값이다.
+    #
+    # metadata는 트레이스에 붙는 꼬리표다. langfuse_session_id로 thread_id를 넘겨
+    # Langfuse Sessions 뷰의 묶음이 우리 대화 단위와 일치하게 만든다.
+    # 키가 없으면 get_callbacks()가 빈 리스트를 주고, 빈 callbacks는 LangChain이
+    # 그냥 무시한다 → 트레이싱 없이도 이 코드 경로가 똑같이 동작한다.
+    config = {
+        "configurable": {"thread_id": payload.id},
+        "callbacks": get_callbacks(),
+        "metadata": trace_metadata(payload.id),
+    }
 
     # 이 제너레이터는 "텍스트 델타 문자열"만 내보낸다. SSE 포맷은 전혀 모른다.
     # M1-1c에서 이렇게 잘라둔 덕에 core/ai_sdk.py는 2a에 이어 2b에서도

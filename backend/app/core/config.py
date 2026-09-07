@@ -50,6 +50,23 @@ class Settings(BaseSettings):
     # 이 값이 바뀔 수 있어야 한다. (pgvector에서 같은 걸 하려면 마이그레이션이 필요하다)
     qdrant_collection: str = "document_chunks"
 
+    # --- 관측성 (Langfuse, M4) ---
+    # 트레이싱은 "있으면 좋은 것"이지 앱의 필수 경로가 아니다. 그래서 기본값이 빈
+    # 문자열이고, 비어 있으면 core/tracing.py가 아예 핸들러를 안 만든다(no-op).
+    # 키가 없는 CI·pytest·새로 클론한 로컬에서 앱이 그대로 뜬다.
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+
+    # Cloud가 기본. self-host로 옮길 때 이 한 줄만 바꾼다(예: http://localhost:3000).
+    # 데이터가 어디로 나가는지를 결정하는 값이라 코드 상수가 아니라 설정에 둔다.
+    langfuse_host: str = "https://cloud.langfuse.com"
+
+    @property
+    def langfuse_enabled(self) -> bool:
+        # ★ "켜졌는가"를 한 곳에서만 판단한다 ★ 이 표현이 여러 곳에 흩어지면
+        # "public만 넣고 secret은 깜빡한" 반쪽 설정에서 곳곳이 다르게 행동한다.
+        return bool(self.langfuse_public_key and self.langfuse_secret_key)
+
     @property
     def cors_origins(self) -> list[str]:
         # "a, b, c" 형태의 문자열을 ["a", "b", "c"] 리스트로 변환해서 CORSMiddleware에 넘긴다.

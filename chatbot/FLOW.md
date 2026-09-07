@@ -3,7 +3,8 @@
 > 메시지 하나가 브라우저에서 출발해 화면에 글자로 돌아오기까지, **어느 파일의 어느 줄을 지나는지**
 > 정리한 문서다. 스터디 중 "이건 어디서 하는 거지?"가 생길 때 여기서 찾는다.
 >
-> **기준 시점: M3 완료 (3-4, 2026-09-07)** — 마일스톤이 끝날 때마다 갱신한다.
+> **기준 시점: M4 코드 완료 (2026-09-07)** — 마일스톤이 끝날 때마다 갱신한다.
+> (M4는 Langfuse 키 등록·대시보드 육안 확인만 남았고 배선은 끝났다.)
 > 진행 순서와 각 단계의 결정·함정 기록은 [README.md](./README.md)에 있다.
 
 ---
@@ -60,8 +61,28 @@ useChat 파서 → messages[].parts → 화면 렌더
   방금 도구가 만든 것인지 모른다
 - `rag/base.py`(계약)는 **아무것도 import하지 않는다** — 그게 "계약"의 실체다
 - `tools.py`는 그래프도 HTTP도 모른다 → 그냥 파이썬 함수다
+- **아무도 "관측되고 있다"는 것을 모른다**(M4) → 트레이싱을 꺼도 코드 경로가 똑같다
 
-### M2·M3에서 바뀐 것 여섯 줄
+### M4의 트레이싱은 이 그림 "옆"이 아니라 "위"에 있다
+
+위 흐름도에 `tracing.py`가 안 보이는 게 정상이다. Langfuse는 데이터가 지나가는 길목에 끼어드는
+것이 아니라, `chat.py`가 `RunnableConfig`에 콜백을 하나 얹어두면 **LangChain이 그래프 안의 모든
+노드·모델·도구 호출에 그 콜백을 자동으로 상속시킨다.** 그래서:
+
+```
+POST /chat ── config = { configurable, callbacks, metadata } ──▶ graph.astream(...)
+                              │
+                              └── 이 하나가 아래 전부에 상속된다
+                                    retrieve → call_model → tools → call_model
+                                       │          │          │
+                                       └──────────┴──────────┴──▶ Langfuse (비동기 배치 전송)
+```
+
+- **노드마다 계측 코드를 심을 일이 없다** — `graph.py`에 Langfuse라는 단어가 없다
+- **트레이스 전송은 요청 응답과 분리돼 있다**(백그라운드 스레드 + 배치) — 사용자는 기다리지 않는다
+- **키가 없으면 `callbacks`가 빈 리스트라 LangChain이 콜백을 아예 안 부른다** → 오버헤드 0
+
+### M2~M4에서 바뀐 것 일곱 줄
 
 | | 무엇이 바뀌었나 |
 |---|---|
@@ -71,6 +92,7 @@ useChat 파서 → messages[].parts → 화면 렌더
 | **3-1/3-2a** | 문서 → 청킹 → 임베딩 → pgvector 저장, 그리고 유사도 검색 |
 | **3-2b** | 그래프 앞에 **`retrieve` 노드**. 매 턴 무조건 검색해 시스템 프롬프트로만 잠깐 쓴다 |
 | **3-3/3-4** | 저장소가 **계약 하나 · 구현 둘**(pgvector/Qdrant). `deps.py` 한 줄로 갈아끼운다 |
+| **M4** | 그래프 전체가 **Langfuse로 트레이싱**된다. `chat.py`의 `config`에 두 키를 더한 것이 전부 |
 
 ---
 
@@ -86,11 +108,12 @@ useChat 파서 → messages[].parts → 화면 렌더
 | [main.py](../backend/app/main.py) | CORS + 라우터 등록 | `add_middleware`:15, `include_router`:26 | 라우터 · 허용 오리진 추가 |
 | [schemas/chat.py](../backend/app/schemas/chat.py) | 요청 본문의 **모양 계약** | `UIMessage`:12, `ChatRequest`:26 | 프론트 요청 포맷이 바뀔 때 |
 | [api/deps.py](../backend/app/api/deps.py) | 무거운 객체 **1회 생성 + 주입** | `_model`:33, `_checkpointer`:58, `_store`:68, `_retrieve`:71, `get_graph`:89 | 모델 · 저장소 교체 지점 |
-| [api/routes/chat.py](../backend/app/api/routes/chat.py) | HTTP ↔ 그래프 **접착** + **스트림 필터** | `chat`:27, 가드:36, `config`:52, 필터:80 | 무엇을 화면에 내보낼지 바뀔 때 |
+| [api/routes/chat.py](../backend/app/api/routes/chat.py) | HTTP ↔ 그래프 **접착** + **스트림 필터** | `chat`:28, 가드:37, `config`:64, 필터:96 | 무엇을 화면에 내보낼지 바뀔 때 |
 | [graph.py](../backend/app/graph.py) | 대화 **흐름** 정의 | `State`:57, `build_graph`:87, `retrieve`:124, `call_model`:152 | 노드 · 엣지가 늘 때 |
 | [tools.py](../backend/app/tools.py) | 모델이 쓸 수 있는 **능력** | `get_current_time`:14, `TOOLS`:34 | 도구를 추가·수정할 때 |
 | [core/ai_sdk.py](../backend/app/core/ai_sdk.py) | AI SDK **와이어 포맷** | `latest_user_text`:43, `sse`:75, `ui_message_stream`:86 | `ai` 패키지 버전이 바뀔 때 |
-| [core/config.py](../backend/app/core/config.py) | 설정 · 시크릿 단일 소스 | `anthropic_model`, `vector_store`, `qdrant_url` | 모델 교체 · 새 시크릿 |
+| [core/config.py](../backend/app/core/config.py) | 설정 · 시크릿 단일 소스 | `anthropic_model`, `vector_store`, `langfuse_enabled` | 모델 교체 · 새 시크릿 |
+| [core/tracing.py](../backend/app/core/tracing.py) | **관측성** 배선 (M4) | `get_langfuse_client`:32, `get_callbacks`:49, `trace_metadata`:72 | 트레이싱 대상 · 꼬리표가 바뀔 때 |
 
 ### RAG — `app/rag/` (M3에서 생긴 층)
 
@@ -126,10 +149,10 @@ useChat 파서 → messages[].parts → 화면 렌더
 | 4 | `main.py:26` 라우터 | `/api/v1` + `/chat` 매칭 | 404 |
 | 5 | `deps.py:89` `get_graph()` | 그래프 주입 (**테스트가 여기서 교체**) | — |
 | 6 | `schemas/chat.py:26` `ChatRequest` | 본문 검증 (타입 · 필수 · Literal) | **422** |
-| 7 | `chat.py:30` `latest_user_text()` | **마지막 user 메시지 하나만** 추출 | — |
-| 8 | `chat.py:36` 가드 | 텍스트가 없거나 마지막이 user가 아니면 차단 | **400** |
-| 9 | `chat.py:52` `config` | `payload.id` → `thread_id` (**어느 대화인가**) | — |
-| 10 | `chat.py:88` `return StreamingResponse` | **200 헤더 전송** | — |
+| 7 | `chat.py:31` `latest_user_text()` | **마지막 user 메시지 하나만** 추출 | — |
+| 8 | `chat.py:37` 가드 | 텍스트가 없거나 마지막이 user가 아니면 차단 | **400** |
+| 9 | `chat.py:64` `config` | `payload.id` → `thread_id` (**어느 대화인가**) + `callbacks`·`metadata`(M4) | — |
+| 10 | `chat.py:104` `return StreamingResponse` | **200 헤더 전송** | — |
 
 ### ⚠ 10번이 분기점이다
 
@@ -137,7 +160,7 @@ useChat 파서 → messages[].parts → 화면 렌더
 10번 **후에** 터지면 클라이언트에는 "200 헤더 + 빈 본문 + 연결 끊김"으로 보인다 — HTTP에서 가장
 진단하기 어려운 실패 형태다.
 
-`chat.py:30`의 추출과 `chat.py:36`의 가드가 **일부러 10번 앞에** 있는 이유가 이것이다.
+`chat.py:31`의 추출과 `chat.py:37`의 가드가 **일부러 10번 앞에** 있는 이유가 이것이다.
 async generator는 lazy해서 안에 넣으면 200이 나간 뒤에야 실행된다.
 
 **`graph.py:147`의 `except Exception`도 같은 이유로 존재한다** — 검색은 10번 뒤에 일어나므로,
@@ -154,7 +177,7 @@ DB가 죽었을 때 예외를 그대로 올리면 정확히 저 진단 불가능
 | # | 위치 | 하는 일 |
 |---|---|---|
 | 11 | `ai_sdk.py:95~101` | `start` → `start-step` → `text-start` 3개를 먼저 내보냄 |
-| 12 | `chat.py:70` `graph.astream(input, config, stream_mode="messages")` | 그래프 실행 시작 |
+| 12 | `chat.py:86` `graph.astream(input, config, stream_mode="messages")` | 그래프 실행 시작 |
 | 13 | **`InMemorySaver`** | `thread_id`로 **이전 대화 복원** |
 | 14 | `graph.py:75` `add_messages` 리듀서 | 복원된 히스토리 **뒤에** 새 메시지를 이어붙임 |
 | 15 | `graph.py:124` **`retrieve` 노드** | `state["messages"][-1].content` = 이번 질문 |
@@ -172,8 +195,8 @@ DB가 죽었을 때 예외를 그대로 올리면 정확히 저 진단 불가능
 | # | 위치 | 하는 일 |
 |---|---|---|
 | 24 | `graph.py:199` `tools_condition` | `tool_calls`가 비었다 → **`"__end__"`** |
-| 25 | `chat.py:80` 필터 | `AIMessageChunk`이므로 통과 |
-| 26 | `chat.py:86` `yield chunk.text` | 텍스트만 추출 |
+| 25 | `chat.py:96` 필터 | `AIMessageChunk`이므로 통과 |
+| 26 | `chat.py:102` `yield chunk.text` | 텍스트만 추출 |
 | 27 | `ai_sdk.py:109` | `data: {"type":"text-delta",...}\n\n` |
 
 ### 경로 B — 모델이 도구를 부른 경우 ("서울 지금 몇 시야?")
@@ -183,10 +206,10 @@ DB가 죽었을 때 예외를 그대로 올리면 정확히 저 진단 불가능
 | 24 | Anthropic | 텍스트 대신 **`tool_use` 블록** → 청크의 `.text`가 전부 `''` |
 | 25 | `graph.py:199` `tools_condition` | `tool_calls`가 있다 → **`"tools"`** |
 | 26 | `graph.py:185` `ToolNode` | `tools.py:14`의 **진짜 함수를 실행** |
-| 27 | `chat.py:80` 필터 | **`ToolMessage`라서 `continue`** ← 여기서 막지 않으면 화면에 샌다 |
+| 27 | `chat.py:96` 필터 | **`ToolMessage`라서 `continue`** ← 여기서 막지 않으면 화면에 샌다 |
 | 28 | `graph.py:206` `add_edge("tools","call_model")` | **사이클** — 결과를 들고 모델로 복귀 |
 | 29 | `graph.py:152` `call_model` (2회차) | 도구 결과가 포함된 히스토리로 다시 호출 |
-| 30 | `chat.py:86` | 이번엔 진짜 텍스트가 나온다 → `yield` |
+| 30 | `chat.py:102` | 이번엔 진짜 텍스트가 나온다 → `yield` |
 
 **사이클은 `retrieve`를 다시 거치지 않는다** (`graph.py:206`이 `call_model`로 직행).
 검색은 "이번 턴 사용자의 질문"에 대한 것이라 **턴당 한 번**이면 된다.
@@ -253,7 +276,7 @@ DB가 죽었을 때 예외를 그대로 올리면 정확히 저 진단 불가능
 
 **② `ToolMessage`가 스트림으로 샌다.**
 `stream_mode="messages"`는 이름 그대로 "메시지"를 흘리지 LLM 토큰만 준다고 약속한 적이 없다.
-`chat.py:80`에서 `isinstance(chunk, AIMessageChunk)`로 막는다. **안 막으면 채팅창에
+`chat.py:96`에서 `isinstance(chunk, AIMessageChunk)`로 막는다. **안 막으면 채팅창에
 `2026-08-27T11:46:37+09:00` 같은 원시 결과가 찍힌다 — 에러도 없고 200도 정상이다.**
 
 **③ `content`는 도구를 쓰든 안 쓰든 **항상** 리스트다.**
@@ -314,7 +337,7 @@ return "__end__"
 
 | 단계 | 바뀌는 파일 | 안 바뀌는 파일 |
 |---|---|---|
-| **M4** 트레이싱 | `core/tracing.py` 신규 · `chat.py` 한 줄(`config`에 `callbacks`) | 대부분 |
+| **M4** 트레이싱 ✅ | `core/tracing.py` 신규 · `chat.py`의 `config`에 두 키 | `graph.py` · `ai_sdk.py` · `rag/*` · 프론트 |
 | **M6** 평가 하네스 | `evals/*` 신규 (`app/` 밖) | `app/` 전부 |
 | **M7** 청킹 | `rag/chunking.py` 신규 · `ingest.py` | **`base.py` 계약 · 두 store · `graph.py`** |
 | **M8** 하이브리드 | `rag/hybrid.py`·`rerank.py` · **계약에 sparse가 들어올 수 있다** | `chat.py` · `ai_sdk.py` · 프론트 |
@@ -331,9 +354,20 @@ return "__end__"
 
 ### `config`가 확장 지점이다
 
-`chat.py:52`의 `{"configurable": {"thread_id": ...}}`는 LangGraph 전용이 아니라 LangChain 공통의
-`RunnableConfig`다. M4의 Langfuse `callbacks`, `tags`, `recursion_limit`이 전부 **같은 dict에**
-들어간다 — 그래서 M4가 "`chat.py` 한 줄"로 끝난다.
+`chat.py:64`의 dict는 LangGraph 전용이 아니라 LangChain 공통의 `RunnableConfig`다.
+**M4가 예고대로 여기 두 키를 더한 것으로 끝났다** — `callbacks`(Langfuse 핸들러)와
+`metadata`(`langfuse_session_id`). `tags`·`recursion_limit`도 같은 dict에 들어간다.
+
+```python
+config = {
+    "configurable": {"thread_id": payload.id},   # 2b — 어느 대화인가
+    "callbacks": get_callbacks(),                 # M4 — 키가 없으면 [] (no-op)
+    "metadata": trace_metadata(payload.id),       # M4 — {"langfuse_session_id": ...}
+}
+```
+
+**그래프 안의 모든 노드·모델·도구 호출이 이 콜백을 자동으로 상속한다.** 노드마다 계측 코드를
+심을 일이 없다는 뜻이고, 그게 `RunnableConfig`에 배선한 값이다.
 
 ### `build_graph`의 시그니처가 확장 지점이다
 
@@ -350,17 +384,18 @@ build_graph(model, retrieve_fn, checkpointer=None, tools=None)
 
 | 테스트 | 교체하는 것 | 검증 범위 | 개수 |
 |---|---|---|---|
-| [tests/test_chat.py](../backend/tests/test_chat.py) | `get_graph` → 가짜 모델 + 새 `InMemorySaver` + 가짜 `retrieve_fn` | 3~34번 전 구간 (Anthropic·저장소만 제외) | 21 |
+| [tests/test_chat.py](../backend/tests/test_chat.py) | `get_graph` → 가짜 모델 + 새 `InMemorySaver` + 가짜 `retrieve_fn` | 3~34번 전 구간 (Anthropic·저장소만 제외) | 22 |
 | [tests/test_rag_store.py](../backend/tests/test_rag_store.py) | 없음 (모양·규칙만) | 계약 준수 · 팩토리 · CLI 플래그 | 9 |
+| [tests/test_tracing.py](../backend/tests/test_tracing.py) | `settings`의 키를 monkeypatch | 켜짐/꺼짐 분기 · 싱글턴 · 메타데이터 키 | 6 |
 | [tests/test_ingest.py](../backend/tests/test_ingest.py) | 없음 (순수 함수) | `chunk_text` 경계 | 4 |
 | [tests/test_items.py](../backend/tests/test_items.py) · [test_health.py](../backend/tests/test_health.py) | SQLite 인메모리 | 기존 CRUD | 5 |
 | [transport.test.ts](../frontend/src/components/chat/transport.test.ts) | 없음 (순수 함수) | 2번 — 본문 조립 | 3 |
 | [App.test.tsx](../frontend/src/App.test.tsx) | 없음 (스모크) | 화면이 그려지는지만 | 1 |
 | [capture-wire.mjs](../frontend/scripts/capture-wire.mjs) | 가짜 LLM | AI SDK의 **정답 바이트** 캡처 | — |
-| [probe_tools.py](../backend/scripts/probe_tools.py) · [probe_embedding.py](../backend/scripts/probe_embedding.py) · [probe_qdrant.py](../backend/scripts/probe_qdrant.py) | 없음 (실측용) | 라이브러리 실제 동작 | — |
+| [probe_tools.py](../backend/scripts/probe_tools.py) · [probe_embedding.py](../backend/scripts/probe_embedding.py) · [probe_qdrant.py](../backend/scripts/probe_qdrant.py) · [probe_langfuse.py](../backend/scripts/probe_langfuse.py) | 없음 (실측용) | 라이브러리 실제 동작 | — |
 | [compare_stores.py](../backend/scripts/compare_stores.py) | 없음 (관찰용) | 두 저장소가 같은 답을 주는가 | — |
 
-**백엔드 합계 39.** 같은 것을 두 곳에서 검증하지 않는다 — 와이어 포맷은 백엔드 테스트가
+**백엔드 합계 46.** 같은 것을 두 곳에서 검증하지 않는다 — 와이어 포맷은 백엔드 테스트가
 바이트로, 요청 본문은 `transport.test.ts`가 순수 함수로, 화면은 `App.test.tsx`가 본다.
 
 ### ★ pytest는 실제 DB·임베딩·LLM·Qdrant를 절대 부르지 않는다 ★
@@ -382,6 +417,7 @@ build_graph(model, retrieve_fn, checkpointer=None, tools=None)
 | `retrieve_fn=lambda _: []` | 검색 결과 **없음** | 기존 테스트가 **"검색 없던 시절"과 동일**하게 동작 |
 | `retrieve_fn=lambda _: FAKE_CHUNKS` | 검색 결과 **있음** | 컨텍스트가 모델까지 가는가 |
 | `failing_retrieve` | 항상 **예외** | 검색 장애가 챗봇 장애로 안 번지는가 |
+| `ConfigCapturingGraph` | 진짜 그래프에 **위임하며 config를 기록** | `RunnableConfig`에 무엇이 실렸는가(M4) |
 
 가짜 모델 둘 다 `bind_tools`를 구현해야 한다 — `BaseChatModel.bind_tools`의 기본 구현이
 `raise NotImplementedError`라서, 없으면 **전부 ERROR로 죽는다**(실측).
@@ -393,6 +429,7 @@ build_graph(model, retrieve_fn, checkpointer=None, tools=None)
 | `test_tool_call_round_trip` ↔ `test_tool_result_does_not_leak_into_the_stream` | 전자만: 결과가 새도 통과 / 후자만: 도구가 안 돌아도 통과 |
 | `..._reaches_the_model_as_a_system_message` ↔ `..._does_not_leak_into_checkpointed_history` | 전자만: 매 턴 누적돼도 통과 / 후자만: 검색이 안 돌아도 통과 |
 | `test_pop_store_arg`의 "이름" ↔ "남은 인자" | 이름만 보면 `--store`가 파일 경로로 남는 버그를 못 잡는다 |
+| `test_enabled_with_keys` ↔ `test_half_configured_counts_as_disabled` | 전자만: public만 넣은 반쪽 설정이 "켜짐"으로 통과 |
 
 ---
 
@@ -406,7 +443,7 @@ build_graph(model, retrieve_fn, checkpointer=None, tools=None)
 | **이전 턴을 기억 못 함** | ① Payload의 `id`가 매 요청 같은가 ② `deps.py:58`에 체크포인터가 있는가 |
 | **갑자기 기억을 잃음** | `--reload`가 재시작했다. `InMemorySaver`는 프로세스 메모리다 — 코드 문제가 아니다 |
 | **새 대화인데 옛날 얘기를 함** | `Chat.tsx:127`이 `setMessages([])`로 되돌아갔는가 |
-| **화면에 원시 타임스탬프가 찍힘** | `chat.py:80`의 `isinstance(chunk, AIMessageChunk)` 필터가 빠졌다 |
+| **화면에 원시 타임스탬프가 찍힘** | `chat.py:96`의 `isinstance(chunk, AIMessageChunk)` 필터가 빠졌다 |
 | **도구를 안 부름 / 너무 자주 부름** | `tools.py:14`의 **docstring**을 고친다. 코드가 아니다 |
 | `GraphRecursionError` | 사이클이 25바퀴를 넘었다 |
 | 글자가 흐르지 않고 **툭** 나타남 | `deps.py:33` — `ChatAnthropic(streaming=True)` 확인 |
@@ -420,6 +457,11 @@ build_graph(model, retrieve_fn, checkpointer=None, tools=None)
 | **검색 결과에 같은 내용이 여러 번** | Qdrant point id에 `uuid4`를 쓰고 있다 → `uuid5`(결정론적)여야 한다 |
 | **순위가 거꾸로** | `qdrant_store.py:150`의 `1.0 - point.score` 변환이 빠졌다 |
 | `NotImplementedError` (테스트) | 가짜 모델에 `bind_tools`가 없다 |
+| **Langfuse에 트레이스가 안 쌓임** | ① `.env`에 키 둘 다 있는가(하나만이면 꺼진다) ② `uv run python scripts/probe_langfuse.py`로 `auth_check()` 확인 ③ `LANGFUSE_HOST`가 맞는가 |
+| **Sessions 뷰에서 대화가 안 묶임** | `metadata` 키가 `langfuse_session_id`인가. 오타는 에러가 아니라 평범한 메타데이터로 저장된다 |
+| `ImportError: langfuse.callback` | v2 예제를 베꼈다. v3/v4는 `langfuse.langchain` |
+| "Please install langchain to ..." | `langchain-core`만으로는 안 된다. `uv add langchain` |
+| 스크립트에서만 트레이스가 안 감 | `client.flush()`를 안 했다. 전송이 배치라 프로세스가 먼저 죽는다 |
 | `UnicodeEncodeError: 'cp949'` | Windows 콘솔. 스크립트에 `sys.stdout.reconfigure(encoding="utf-8")` |
 | curl이 한글 본문에 **400** | Git Bash 코드페이지. UTF-8 파일에 담아 `-d @req.json` |
 
@@ -491,6 +533,7 @@ grep -n "^def \|^async def \|^UI_MESSAGE\|^DONE\|yield sse" app/core/ai_sdk.py
 grep -n "class \|def \|bind_tools\|add_node\|add_edge\|add_conditional\|compile\|SYSTEM_PROMPT\|retrieved_context\|to_thread" app/graph.py
 grep -n "@tool\|^def \|^TOOLS" app/tools.py
 grep -n "^_model\|^_graph\|^_checkpointer\|^_store\|^def \|^Graph" app/api/deps.py
+grep -n "^_client\|^def " app/core/tracing.py
 grep -n "^TOP_K\|^EMBEDDING_DIM\|^class \|    def \|^def \|^_BUILDERS\|^TIMEOUT" app/rag/*.py
 
 cd ../frontend

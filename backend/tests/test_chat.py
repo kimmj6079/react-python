@@ -237,6 +237,58 @@ def _state(graph, chat_id="test-chat"):
     return [(type(m).__name__, m.content) for m in snapshot.values.get("messages", [])]
 
 
+class ConfigCapturingGraph:
+    """astream에 넘어간 config를 기록하고 진짜 그래프에 그대로 위임하는 얇은 껍데기.
+
+    ★ 왜 이런 대역이 필요한가 (M4) ★
+    chat.py가 config에 무엇을 실어 보내는지는 **바깥에서 관찰할 수 없다.** 콜백이
+    빠져도, 메타데이터 키를 틀려도 응답 바이트는 완전히 똑같다 — 대시보드에서
+    "트레이스가 안 쌓인다 / 세션이 안 묶인다"로만 드러나는 종류의 실패다.
+    그래서 그래프에 들어가기 직전의 config를 붙잡아 본다.
+
+    dependency_overrides로 그래프를 통째로 갈아끼우는 기존 방식(2a부터)이 여기서도
+    그대로 통한다 — get_graph를 함수로 한 겹 감싸둔 M1의 설계가 계속 값을 하는 자리다.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.configs = []
+
+    def astream(self, *args, **kwargs):
+        # chat.py는 config를 2번째 "위치" 인자로 넘긴다(실측한 시그니처).
+        # 키워드로 바뀌어도 잡히도록 양쪽을 다 본다.
+        self.configs.append(kwargs.get("config") if len(args) < 2 else args[1])
+        return self._inner.astream(*args, **kwargs)
+
+
+@pytest.fixture
+def config_capturing_graph():
+    CALLS.clear()
+    inner = build_graph(FakeChatModel(), retrieve_fn=lambda _: [], checkpointer=InMemorySaver())
+    graph = ConfigCapturingGraph(inner)
+    app.dependency_overrides[get_graph] = lambda: graph
+    yield graph
+    del app.dependency_overrides[get_graph]
+
+
+def test_run_config_carries_thread_id_callbacks_and_session_metadata(
+    client, config_capturing_graph
+):
+    response = client.post("/api/v1/chat", json=_wire(_msg("m1", "user", "안녕"), chat_id="t-42"))
+    assert response.status_code == 200
+
+    config = config_capturing_graph.configs[0]
+
+    # 2b — 어느 대화인가
+    assert config["configurable"]["thread_id"] == "t-42"
+    # M4 — 콜백 자리가 실제로 있다. 키가 없는 테스트 환경이라 내용은 빈 리스트여야 한다
+    # (있으면 pytest가 진짜 Langfuse로 트레이스를 보내고 있다는 뜻이다).
+    assert config["callbacks"] == []
+    # M4 — thread_id가 Langfuse session_id로 연결된다. 키 이름 오타는 에러가 아니라
+    # "Sessions 뷰에서 대화가 안 묶임"으로만 드러나므로 문자열을 못 박는다.
+    assert config["metadata"] == {"langfuse_session_id": "t-42"}
+
+
 def test_chat_health(client):
     response = client.get("/api/v1/chat/health")
     assert response.status_code == 200

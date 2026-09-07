@@ -29,6 +29,9 @@ services:	# 이 파일에서 정의할 컨테이너 서비스 목록 시작
     environment:	# 백엔드에 주입할 환경변수
       DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/app	# DB 접속 문자열 (서비스명 db로 접근)
       QDRANT_URL: http://qdrant:6333	# 컨테이너 안에서는 localhost가 아니라 서비스명으로 접근한다
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}	# 호스트 셸/루트 .env에서 전달. 비어 있으면 트레이싱 꺼짐(no-op)
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}	# ★ 시크릿은 compose 파일에 직접 적지 않는다 — 커밋되는 파일이다
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-https://cloud.langfuse.com}	# self-host면 이 값만 바꾼다
       BACKEND_CORS_ORIGINS: http://localhost:5173	# CORS 허용할 프론트엔드 origin
     volumes:	# 소스 코드 바인드 마운트 (핫리로드용)
       - ./backend/app:/app/app	# 로컬 app 디렉토리를 컨테이너에 동기화

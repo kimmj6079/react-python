@@ -1212,10 +1212,98 @@ FastAPI가 LLM을 직접 호출해 SSE로 스트리밍, 프론트는 `ai`/`@ai-s
 > 판단한다. pgvector도 `tsvector` + `WHERE`로 같은 일을 할 수 있지만 설계가 다르다.
 
 ### M4 — Langfuse 연동 (트레이싱)
-Langfuse Cloud 가입 → 프로젝트 생성 → Key 발급. `langfuse.langchain.CallbackHandler`를 그래프 호출 `config`의
-`callbacks`에 전달, `thread_id`를 Langfuse `session_id`로도 연결.
-**검증**: Langfuse 대시보드 Traces에서 retrieve/generation 중첩 트리 확인, 프롬프트/토큰/비용/지연시간 확인,
-Sessions 뷰에서 세션 그룹핑 확인.
+
+**왜 지금인가**: 2a에서 LangChain을 도입하며 *"추상화 층이 하나 늘어 무슨 요청이 나가는지가 한 겹
+가려진다"* 를 대가로 적어뒀다. M3에서 `retrieve` 노드가 붙으면서 가려진 것이 더 늘었다 —
+**검색이 무엇을 가져왔는지, 시스템 프롬프트가 실제로 어떻게 조립됐는지, 도구 왕복에 토큰이 얼마나
+들었는지를 볼 방법이 없다.** M4가 그 가림막을 걷는다. 그리고 M6 평가 하네스가 Langfuse Datasets를
+쓰기로 되어 있으므로, 여기서 붙여두면 M6가 공짜로 얻어간다.
+
+**체크리스트 (코드는 완료 · 키 등록만 남음)**:
+- [x] **실측 먼저** — `scripts/probe_langfuse.py` (2026-09-07)
+- [x] `uv add langfuse langchain` → `langfuse 4.15.1` / `langchain 1.4.0`
+- [x] `core/config.py`에 `langfuse_public_key`·`langfuse_secret_key`·`langfuse_host` + `langfuse_enabled`
+- [x] `core/tracing.py`(신규) — 클라이언트 싱글턴 + 요청별 핸들러 + 메타데이터 변환
+- [x] `api/routes/chat.py`의 `config`에 `callbacks`·`metadata` 추가 (**예고대로 한 줄**)
+- [x] `.env.example` · `docker-compose.yml`에 키 이름 추가
+- [x] 테스트 7개 (`tests/test_tracing.py` 6 + `test_chat.py`의 config 캡처 1) → **46 passed**
+- [ ] **cloud.langfuse.com 가입 → 프로젝트 생성 → API Keys 발급 → `backend/.env`에 추가** ← 사용자 작업
+- [ ] `uv run python scripts/probe_langfuse.py` 재실행 → `auth_check()` True + 트레이스 1건 전송 확인
+- [ ] 브라우저에서 대화 → 대시보드 Traces에서 `retrieve` / `call_model` / `tools` 중첩 트리 확인
+- [ ] Sessions 뷰에서 `thread_id` 단위로 묶이는지 확인
+
+**★ 실측이 특히 중요했던 이유 ★** Langfuse 파이썬 SDK는 **v2 → v3에서 OpenTelemetry 기반으로
+아키텍처를 갈아엎으면서 import 경로와 `CallbackHandler`의 생성자가 통째로 바뀌었다.** 인터넷 예제는
+대부분 v2 기준이라 그대로 베끼면 죽는다. 이 README가 M4를 계획할 때 적어둔
+`langfuse.langchain.CallbackHandler`조차 "그 경로가 지금도 맞는지"를 확인해야 했다.
+
+**실측 4가지** (`scripts/probe_langfuse.py`, `langfuse 4.15.1` 기준)
+
+1. **`langfuse.callback`(v2 경로)은 아예 없다.** 옛 예제는 전부 `ImportError`.
+   현재 경로는 `langfuse.langchain.CallbackHandler`(실제 클래스명은 `LangchainCallbackHandler`).
+2. **★ 함정: `langchain-core`만으로는 안 된다 ★** `langfuse/langchain/CallbackHandler.py`가
+   `import langchain` 후 `langchain.__version__.startswith("1")`로 v0/v1을 분기한다. 실제로 쓰는
+   심볼은 **전부 `langchain_core`에 있는데도** 메타 패키지가 필요하다. 이 저장소는
+   `langchain-anthropic`만 있었으므로 `uv add langchain`이 따라왔다.
+   안 넣으면 `ModuleNotFoundError`가 아니라 친절한 메시지로 죽는다 —
+   *"Please install langchain to use the Langfuse langchain integration"*.
+3. **★ 핵심: `CallbackHandler`가 자격증명을 안 받는다 ★**
+   ```python
+   CallbackHandler.__init__(self, *, public_key=None, trace_context=None)   # 실측
+   ```
+   v2는 `CallbackHandler(public_key=..., secret_key=..., host=...)`였다. v3/v4에서는 자격증명이
+   `Langfuse` 클라이언트로 옮겨갔고 핸들러는 `get_client()`로 전역 싱글턴을 찾는다.
+   **즉 배선이 두 단계다** — ① `Langfuse(...)`를 한 번 만들고 ② `CallbackHandler()`를 config에 넣는다.
+4. **키가 없어도 예외가 아니다.** `CallbackHandler()`가 stderr에 경고 한 줄
+   (*"Authentication error: ... Client will be disabled"*)을 찍고 **핸들러는 만들어진다.**
+   그대로 써도 앱은 돌아가고 트레이스만 조용히 안 쌓인다.
+
+**설계 결정 3개**
+
+- **키가 없으면 "빈 핸들러"가 아니라 "빈 리스트"를 준다** (`tracing.py`의 `get_callbacks`).
+  실측 4처럼 그대로 써도 동작은 하지만, ⓐ 요청마다 그 경고가 찍혀 로그가 더러워지고
+  ⓑ "트레이싱이 켜졌는가"가 코드 어디에서도 분명하지 않다. 빈 리스트면 LangChain이 콜백을 아예
+  안 부르므로 **오버헤드가 진짜 0**이다.
+- **클라이언트는 싱글턴, 핸들러는 요청마다 새로.** 클라이언트는 백그라운드 전송 스레드와 큐를
+  들고 있어 요청마다 만들면 스레드가 요청 수만큼 생긴다(`deps.py`의 `_model`·`_store`와 같은 이유).
+  반대로 핸들러는 실행 중인 run들을 `self._runs`·`self.last_trace_id`에 들고 다녀서(실측),
+  **하나를 공유하면 동시 요청의 트레이스가 섞인다** — 에러가 아니라 "대시보드에서 남의 대화가 내
+  트레이스 안에 보이는" 형태로만 드러난다.
+- **자격증명을 `Langfuse(...)`에 명시적으로 넘긴다.** 안 넘기면 SDK가 환경변수를 직접 읽는데,
+  그러면 *"설정은 Settings 한 곳에서만"* 이라는 이 저장소의 원칙(`alembic/env.py`,
+  `ChatAnthropic(api_key=...)`)이 깨진다. 값이 어디서 왔는지 추적할 수 있어야 "왜 트레이스가
+  안 쌓이지"를 5분 안에 푼다.
+
+**★ 예고했던 "한 줄"이 실제로 한 줄이었다 ★**
+2b에서 *"M4의 Langfuse `callbacks`도 같은 dict에 들어간다"* 고 적어둔 그 자리
+(`chat.py:52`의 `RunnableConfig`)에 두 키가 추가된 것이 전부다. `graph.py`·`ai_sdk.py`·
+`rag/*`·프론트엔드는 한 줄도 안 바뀌었다. **RunnableConfig가 LangChain 공통 규약이라 그래프 안의
+모든 노드·모델·도구 호출이 이 콜백을 자동으로 상속한다** — 노드마다 계측 코드를 심을 일이 없다.
+
+**`langfuse_session_id`라는 키 이름을 테스트로 못 박은 이유**: 핸들러가 특별 취급하는 메타데이터
+키는 `langfuse_session_id`·`langfuse_user_id`·`langfuse_tags` 셋뿐이다
+(`CallbackHandler.py:496~520` 실측). **오타를 내면 에러가 아니라 그냥 평범한 메타데이터로
+저장되고**, 대시보드 Sessions 뷰에서 대화가 안 묶이는 것으로만 드러난다.
+(`langfuse_user_id`는 넣을 값이 없어 비워뒀다 — 인증이 없기 때문이고, M12에서 함께 들어온다.)
+
+**`ConfigCapturingGraph`를 만든 이유**: `chat.py`가 config에 무엇을 실어 보내는지는 **바깥에서
+관찰할 수 없다.** 콜백이 빠져도, 메타데이터 키를 틀려도 **응답 바이트는 완전히 똑같다.**
+그래서 그래프에 들어가기 직전의 config를 붙잡는 얇은 껍데기를 씌웠다. `get_graph`를 함수로 한 겹
+감싸둔 M1의 설계가 여기서 또 값을 한다.
+
+**알고 남겨둔 것**
+1. **`flush()`를 앱에서 부르지 않는다.** 전송이 백그라운드 스레드 + 배치라, 짧은 **스크립트**는
+   끝나기 전에 flush해야 한다(`probe_langfuse.py`가 그렇게 한다). 장수하는 uvicorn은 필요 없지만,
+   **실무라면 종료 시그널에서 flush하는 shutdown 훅을 단다** — 안 그러면 배포 때 마지막 몇 초의
+   트레이스가 사라진다.
+2. **비용·지연 오버헤드를 아직 안 쟀다.** 콜백은 요청 경로 안에서 돈다. M13의 지연 예산 표에서
+   `sample_rate`(전량이 아니라 표본만 보내기)와 함께 다룬다.
+3. **프롬프트/응답 본문이 그대로 Langfuse로 나간다.** 학습용 문서라 상관없지만, 실무에서 개인정보가
+   섞이는 순간 `mask` 옵션이나 self-host가 필수다. `LANGFUSE_HOST` 한 줄로 옮길 수 있게 해둔 이유다.
+
+**검증**: 대시보드 Traces에서 `retrieve` / `call_model` / `tools` 중첩 트리, 프롬프트·토큰·비용·
+지연시간, Sessions 뷰의 `thread_id` 그룹핑. **반증 케이스도 본다** — `.env`에서 키를 지우면
+앱이 그대로 뜨고 트레이스만 안 쌓이는지(트레이싱이 필수 경로가 아님을 확인).
 
 ### M5 (선택) — CI/배포 반영 + 확장
 - `ci.yml`의 pytest가 chat 엔드포인트를 목 기반으로 통과하는지 확인(M1에서 이미 설계했다면 여기선 점검만).

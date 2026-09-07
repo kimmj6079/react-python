@@ -1440,22 +1440,90 @@ API를 안 부르는 순수 함수라 **이것만은 pytest로 유닛 테스트�
 확인한다. 안 떨어지면 골든셋이 너무 쉽거나 채점이 고장난 것이다. 이 단계를 건너뛰면 M7~M13 내내 "왜 지표가
 안 변하지?"를 붙들게 된다.
 
-**체크리스트**:
-- [ ] 평가할 샘플 문서 확정 — **자기가 내용을 아는 문서**여야 정답 판정이 된다 (이 저장소의 `CLAUDE.md`,
-  `SETUP.md`, `DEPLOYMENT.md`가 좋은 후보다. 길고, 구조가 있고, 내용을 이미 안다)
-- [ ] `backend/evals/dataset.jsonl` 손으로 작성 —
-  `{"id":…, "question":…, "expected_source":…, "expected_answer":…, "kind":"normal"|"keyword"|"unanswerable"}`
-  20~30건. `unanswerable`은 `expected_source: null`
-- [ ] `backend/evals/metrics.py` — `hit_at_k(ranked_sources, expected)`, `mrr(...)`를 순수 함수로 구현
-- [ ] `backend/tests/test_metrics.py` — 위 두 함수 유닛 테스트 (API 안 부르므로 CI에 넣어도 안전)
-- [ ] `backend/evals/run_retrieval.py` — 골든셋 전체를 retriever에 통과시켜 `hit@1`/`hit@5`/`MRR`을 **종류별로
-  쪼개서** 출력 (전체 평균만 보면 `keyword`가 망해도 안 보인다)
-- [ ] `backend/evals/judge.py` — Claude로 faithfulness/answer relevance 채점.
-  **structured output(`output_config: {format: …}`)으로 점수 형식을 강제** — 자유 텍스트로 받으면 파싱이 깨진다
+**체크리스트 (검색 층 완료 · 생성 층 진행 중)**:
+- [x] 평가할 샘플 문서 확정 — `CLAUDE.md` · `SETUP.md` · `DEPLOYMENT.md` (78청크)
+- [x] `backend/evals/dataset.jsonl` **24건** (normal 12 · keyword 7 · unanswerable 5)
+- [x] `backend/evals/metrics.py` — `hit_at_k` · `reciprocal_rank` · `mean` 순수 함수
+- [x] `backend/tests/test_metrics.py` — 17개 (API를 안 부르므로 CI에 넣어도 안전)
+- [x] `backend/evals/run_retrieval.py` — 종류별로 쪼갠 `hit@1`/`hit@k`/`MRR`
+- [ ] `backend/evals/judge.py` — LLM-as-judge (faithfulness / answer relevance)
 - [ ] Langfuse Dataset 업로드 + 실행마다 run 기록
-- [ ] `backend/evals/results/<timestamp>.md` 표로 저장하고 **커밋** — 추이를 git에 남긴다
-- [ ] **하네스 검증**: `top_k=1` 등 나쁜 설정으로 실행 → 지표가 실제로 떨어지는지 확인
-- [ ] **baseline 못 박기** — M3 상태의 숫자를 기록. M7~M13은 전부 이 숫자와 비교한다
+- [x] `backend/evals/results/` — 실행 3건 + 해설(`BASELINE.md`) 커밋
+- [x] **하네스 검증** — `--top-k 1`, `--shuffle` 대조군으로 지표가 실제로 떨어지는 것 확인
+- [x] **baseline 못 박기** — [`evals/results/BASELINE.md`](../backend/evals/results/BASELINE.md)
+
+### 6a. 검색 층 (2026-09-07 완료)
+
+**★ 설계 결정 ①: 정답을 "청크 번호"가 아니라 "내용"으로 정의했다 ★**
+README 초안은 `expected_source`(파일명)만 적게 되어 있었는데, 실제로 만들어보니 그걸로는
+아무것도 구분할 수 없었다 — **문서가 3개뿐이라 찍어도 33%**고, 실측에서 `hit@5(source)`가
+그냥 **1.00**이 나왔다. "완벽하다"가 아니라 **"이 지표는 눈금이 없다"** 는 뜻이다.
+그래서 `expected_substrings`(정답이 실제로 적힌 문장 조각)를 추가하고 두 판정을 나란히 본다.
+
+`chunk_index`로 적지 않은 이유가 더 중요하다: **M7에서 청킹을 바꾸는 순간 골든셋 전체가
+무효가 되는데, M7의 before/after를 재는 것이 M6를 만든 이유다.** 내용으로 정의하면 청크
+경계가 어떻게 바뀌든 "그 문장을 담은 청크가 왔나"를 그대로 물을 수 있다.
+
+**★ 설계 결정 ②: "무엇이 정답인가"와 "어떻게 점수 매기나"를 분리했다 ★**
+`metrics.py`는 검색 결과가 무엇인지 전혀 모른다. 받는 건 `[False, True, ...]` bool 리스트뿐이고,
+판정은 `run_retrieval.py`가 한다. M8에서 하이브리드가 들어와 판정 방식이 바뀌어도 지표
+코드는 안 바뀐다 — `graph.py`가 `retrieve_fn`을 인자로 받는 것과 같은 사고방식이다.
+
+**★ 설계 결정 ③: 골든셋 자체를 검증한다 ★** `validate_dataset()`이 각 정답 문자열이 실제로
+그 문서에 존재하는지 시작 전에 확인하고, 없으면 죽는다. **오타 하나면 그 질문은 영원히
+0점이 되고, 검색이 아무리 좋아져도 지표가 안 오른다** — 그러면 M7~M13 내내 "왜 안 오르지"를
+붙들게 된다. 문서를 고쳤을 때도 여기서 시끄럽게 걸린다(조용히 0점보다 낫다).
+
+**베이스라인** (자세한 해설은 [`BASELINE.md`](../backend/evals/results/BASELINE.md))
+
+| 종류 | n | hit@1 (cnt) | hit@5 (cnt) | MRR (cnt) |
+|---|---|---|---|---|
+| normal | 12 | 0.67 | 0.83 | 0.736 |
+| keyword | 7 | 0.86 | 1.00 | 0.886 |
+| **전체** | 19 | **0.74** | **0.89** | **0.791** |
+
+**★ 하네스 검증 — M6에서 가장 중요한 절 ★** 지표가 안 움직이는 하네스로 이후 7개
+마일스톤을 헛돌 수 있다. 일부러 나쁜 설정으로 돌렸다:
+
+| 실행 | hit@1 (cnt) | hit@5 (cnt) | MRR (cnt) | MRR (src) |
+|---|---|---|---|---|
+| 베이스라인 | 0.74 | 0.89 | **0.791** | 0.932 |
+| `--top-k 1` | 0.74 | 0.74 | 0.737 | 0.895 |
+| `--shuffle` | **0.37** | 0.89 | **0.552** | 0.939 |
+| `--store qdrant` | 0.74 | 0.89 | 0.791 | 0.932 |
+
+- **`--shuffle`에서 hit@5는 그대로인데 MRR만 붕괴했다.** 정확히 예측한 패턴이다 — 같은 5개가
+  순서만 바뀌었으니 "들어왔나"는 안 변하고 "얼마나 위에 있나"만 무너진다.
+  **이 패턴이 안 나왔다면 지표 계산이 고장난 것이었다.**
+- **`MRR (src)`는 셔플에도 안 움직였다(0.932 → 0.939).** 느슨한 지표가 품질 저하를 탐지하지
+  못한다는 직접 증거 — 설계 결정 ①이 옳았다는 확인이다.
+- **Qdrant가 소수점까지 동일하다.** M3-4의 "겹침 25/25"를 정식 지표로 재확인했다.
+
+**★ 베이스라인이 M7·M8의 타깃을 이미 짚어냈다 ★** — "측정기를 먼저 만든다"의 값이 여기서 나온다.
+
+| id | 증상 | 담당 |
+|---|---|---|
+| `n02` 마이그레이션 자동 실행? | 문서는 1등인데 **정답 대목이 top5에 없음** | **M7** |
+| `n05` alembic은 접속 문자열을 어디서? | 같은 증상 | **M7** |
+| `k04` `read:packages` | **5등**, top1이 무관한 청크 | **M8** |
+
+`n02`·`n05`의 *"문서는 맞고 대목은 틀리다"* 가 청킹 실패의 전형이다 — 600자로 기계적으로
+자르면 그 문장이 든 청크에 상위 제목이 없어서 임베딩 공간에서 어디에도 못 간다(M7의 실패 ②).
+**개선 후 이 두 건의 순위가 ✗에서 숫자로 바뀌면 성공이다.**
+`k04`는 벡터 검색이 고유명사에 약한 교과서적 사례로, M8 하이브리드의 효과가 오직 여기서만 드러난다.
+
+**unanswerable은 검색 지표로 못 잰다 — 대신 거리 분포를 봤다.** 답할 수 있는 질문의 최악
+top1 거리(0.2170)가 답할 수 없는 질문의 최선(0.1838)보다 **멀다** = 두 분포가 겹친다.
+→ **M10의 그라운딩은 거리 임계값이 아니라 생성 단계에서 해야 한다**는 근거가 숫자로 나왔다.
+
+**함정 기록**
+- `evals/`가 `app/` 밖인데도 `python -m evals.run_retrieval`이 되는 건 cwd가 `sys.path`에
+  들어가기 때문이고, `tests/test_metrics.py`가 `from evals.metrics import ...`를 할 수 있는 건
+  `pyproject.toml`의 `pythonpath = ["."]` 덕이다. **pytest는 `evals/`를 수집하지 않는다** —
+  `test_*.py`가 없기 때문이고, 그게 의도다(실제 API를 부르는 코드는 CI에서 돌면 안 된다).
+- E501은 문자열이 길면 `ruff format`이 못 고친다(3-1의 함정 재발). 표 헤더를 인접 문자열
+  연결로 손수 나눴다.
+- `--shuffle`의 시드를 42로 고정했다. **"나쁜 설정"도 재현 가능해야** 대조군으로 쓸 수 있다.
 
 **검증**: 같은 설정으로 두 번 돌려 검색 지표가 **완전히 동일**한지(결정론적이어야 한다 — 다르면 어딘가에 랜덤이
 섞였다), 나쁜 설정에서 지표가 떨어지는지, Langfuse에서 두 run 비교가 보이는지.

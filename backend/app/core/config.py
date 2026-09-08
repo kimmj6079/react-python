@@ -91,6 +91,15 @@ class Settings(BaseSettings):
     # M1에서 스트리밍으로 얻은 체감 속도를 여기서 일부 잃고, M13에서 회수한다.
     rerank_candidates: int = 20
 
+    # ★ M9: 대화형 질의 재작성 ★ 재작성·멀티쿼리도 Haiku면 충분하다. 여기에 Opus를
+    # 쓰면 품질은 거의 그대로인데 TTFT만 먹는다 — 이 단계는 사용자가 기다리는
+    # 경로의 맨 앞에 있어서 지연이 그대로 체감된다.
+    anthropic_rewrite_model: str = "claude-haiku-4-5"
+
+    # 히스토리가 있을 때만 재작성한다(rewrite.py의 조건부 실행). 이 플래그는
+    # "기능 자체를 끄는" 스위치이고, M6 하네스로 before/after를 재려고 뒀다.
+    query_rewrite_enabled: bool = True
+
     # --- 관측성 (Langfuse, M4) ---
     # 트레이싱은 "있으면 좋은 것"이지 앱의 필수 경로가 아니다. 그래서 기본값이 빈
     # 문자열이고, 비어 있으면 core/tracing.py가 아예 핸들러를 안 만든다(no-op).

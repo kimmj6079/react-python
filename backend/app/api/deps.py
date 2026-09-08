@@ -15,6 +15,7 @@ from app.rag.base import TOP_K, RetrievedChunk
 from app.rag.factory import get_store
 from app.rag.rerank import rerank
 from app.rag.retriever import retrieve
+from app.rag.rewrite import rewrite_query
 
 # DbSession이라는 타입 별칭을 만들어두면, 라우터 함수 파라미터에서
 # `db: DbSession`이라고만 써도 FastAPI가 자동으로 get_db()를 호출해 세션을 주입해준다.
@@ -93,7 +94,21 @@ async def _retrieve(query: str) -> list[RetrievedChunk]:
     return await rerank(query, candidates, TOP_K)
 
 
-_graph = build_graph(_model, retrieve_fn=_retrieve, checkpointer=_checkpointer)
+async def _rewrite(question: str, history: list[dict[str, str]]) -> str:
+    # graph.py가 받는 rewrite_fn의 구현체. 설정이 꺼져 있으면 원문을 그대로 쓴다 —
+    # "기능을 끈다"와 "히스토리가 없다"는 다른 이유이고, 전자는 여기서, 후자는
+    # rewrite_query() 안에서 각각 판단한다.
+    if not settings.query_rewrite_enabled:
+        return question
+    return await rewrite_query(question, history)
+
+
+_graph = build_graph(
+    _model,
+    retrieve_fn=_retrieve,
+    checkpointer=_checkpointer,
+    rewrite_fn=_rewrite,
+)
 
 
 def get_graph() -> CompiledStateGraph:

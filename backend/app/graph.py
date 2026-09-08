@@ -84,12 +84,19 @@ class State(TypedDict):
     # 히스토리 자체는 검색 결과로 오염되지 않는다.
     retrieved_context: str
 
+    # ★ M9에서 늘었다 ★ 검색에 실제로 쓴 질문. 재작성이 있었으면 원문과 다르다.
+    # State에 따로 두는 이유: 원문은 messages에 그대로 남아 있어야 하고(모델은 사용자가
+    # 실제로 한 말을 봐야 한다), 검색은 재작성본을 써야 한다 — **두 값이 다른 일을 한다.**
+    # 하나로 합치면 "왜 이 질문에서 검색이 실패했지"를 추적할 때 원문을 잃는다.
+    search_query: str
+
 
 def build_graph(
     model: BaseChatModel,
     retrieve_fn: Callable[[str], list[RetrievedChunk]],
     checkpointer: BaseCheckpointSaver | None = None,
     tools: list[BaseTool] | None = None,
+    rewrite_fn: Callable[[str, list[dict[str, str]]], str] | None = None,
 ) -> CompiledStateGraph:
     # 모델을 인자로 받는 이유는 M1의 get_anthropic_client()와 같다 —
     # 테스트에서 가짜 모델로 갈아끼우기 위해서다. 이 모듈 안에서
@@ -122,6 +129,41 @@ def build_graph(
     # .text를 써둔 덕에 chat.py는 이 변화에 아무 영향이 없다.
     model_with_tools = model.bind_tools(tools)
 
+    async def rewrite(state: State) -> dict[str, Any]:
+        """대화 히스토리를 보고 검색용 질문을 다시 쓴다. (M9)
+
+        ★ 노드 하나 + 엣지 두 개면 끝난다 ★ M2에서 StateGraph를 직접 조립한 값이
+        여기서 회수된다 — 함수 호출 사슬로 짜놨다면 이 삽입이 아팠을 것이다.
+
+        rewrite_fn이 없으면(테스트·기능 off) 원문을 그대로 search_query에 넣는다.
+        그러면 아래 retrieve는 M8까지와 완전히 같게 동작한다.
+        """
+        messages = state["messages"]
+        question = messages[-1].content
+
+        if rewrite_fn is None or len(messages) <= 1:
+            # 첫 턴은 재작성할 게 없다. LLM을 아예 안 부르는 것이 핵심이다 —
+            # 항상 재작성하면 첫 턴에서 지연만 늘고 얻는 게 없다.
+            return {"search_query": question}
+
+        # 마지막 발화를 뺀 나머지가 히스토리다. LangChain 메시지 객체를 재작성 함수가
+        # 모르게 dict로 바꿔서 넘긴다 — rewrite.py는 LangGraph를 몰라야 한다.
+        history = [
+            {"role": "assistant" if m.type == "ai" else "user", "content": m.text or m.content}
+            for m in messages[:-1]
+            if m.type in ("human", "ai") and (m.text or m.content)
+        ]
+        try:
+            if inspect.iscoroutinefunction(rewrite_fn):
+                rewritten = await rewrite_fn(question, history)
+            else:
+                rewritten = await asyncio.to_thread(rewrite_fn, question, history)
+        except Exception:
+            # 재작성 실패가 턴 전체를 죽이면 안 된다 — retrieve의 try/except와 같은 판단.
+            logger.exception("질의 재작성 실패 - 원문으로 검색한다")
+            rewritten = question
+        return {"search_query": rewritten}
+
     async def retrieve(state: State) -> dict[str, Any]:
         # 이번 턴의 질문은 항상 state["messages"]의 마지막 원소다 — START
         # 직후 실행되는 이 노드가 도는 시점엔 이미 체크포인터 복원 +
@@ -148,7 +190,9 @@ def build_graph(
         # 그래서 "어느 쪽인가"를 물어보고 각각에 맞는 방식으로 부른다 —
         # retriever.retrieve()가 저장소 능력을 물어보고 분기하는 것과 같은 사고방식이다.
         # (테스트의 가짜 retrieve_fn은 동기 람다라 아래쪽 경로로 간다)
-        query = state["messages"][-1].content
+        # ★ M9: 검색은 재작성본을 쓴다 ★ rewrite 노드가 항상 먼저 돌아 search_query를
+        # 채우므로 여기서는 그것만 보면 된다(없으면 원문으로 폴백).
+        query = state.get("search_query") or state["messages"][-1].content
         try:
             if inspect.iscoroutinefunction(retrieve_fn):
                 chunks = await retrieve_fn(query)
@@ -181,6 +225,7 @@ def build_graph(
         return {"messages": [response]}
 
     builder = StateGraph(State)
+    builder.add_node("rewrite", rewrite)
     builder.add_node("retrieve", retrieve)
     builder.add_node("call_model", call_model)
 
@@ -199,7 +244,12 @@ def build_graph(
     # 검색은 "이번 턴 사용자의 질문"에 대한 것이지 도구 호출 중간 결과에
     # 대한 게 아니라서, 한 턴에 한 번만 하면 된다 — 그래서 사이클 엣지는
     # retrieve를 거치지 않고 곧장 call_model로 돌아간다(아래 tools→call_model).
-    builder.add_edge(START, "retrieve")
+    # ★ M9: START가 rewrite로 바뀌고 엣지가 하나 늘었다 ★
+    # 도구 왕복(tools -> call_model)에는 rewrite도 retrieve도 다시 태우지 않는다.
+    # 재작성과 검색은 "이번 턴 사용자의 질문"에 대한 것이지 도구 호출 중간 결과에
+    # 대한 게 아니라서, 한 턴에 각각 한 번이면 된다.
+    builder.add_edge(START, "rewrite")
+    builder.add_edge("rewrite", "retrieve")
     builder.add_edge("retrieve", "call_model")
 
     # ★ 2c의 핵심 ② — 여기가 분기다 ★

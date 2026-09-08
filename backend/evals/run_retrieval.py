@@ -18,7 +18,7 @@ import asyncio
 import json
 import random
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -30,6 +30,7 @@ from app.rag.factory import get_store
 from app.rag.ingest import REPO_ROOT
 from app.rag.rerank import rerank
 from app.rag.retriever import retrieve
+from app.rag.rewrite import rewrite_query
 from evals.metrics import hit_at_k, mean, reciprocal_rank
 
 EVALS_DIR = Path(__file__).resolve().parent
@@ -40,7 +41,11 @@ RESULTS_DIR = EVALS_DIR / "results"
 # 24건 중 keyword가 7건뿐이라, keyword가 전멸해도 전체 hit@5는 0.7 근처로 멀쩡해 보인다.
 # M8 하이브리드 검색의 효과는 오직 keyword에서만 드러나므로, 쪼개지 않으면 M8을 넣고도
 # "효과 없네"라고 잘못 결론 낸다.
-KINDS = ["normal", "keyword", "unanswerable"]
+# ★ M9에서 multiturn이 늘었다 — 골든셋도 로드맵과 함께 자란다 ★
+# M6~M8의 케이스는 전부 단발 질문이라 **대화형 실패를 한 번도 잡아내지 못했다.**
+# "그거 프로덕션에서는?"을 그대로 임베딩하면 검색이 완전히 실패하는데, 그 실패가
+# 지표에 안 나타나면 없는 문제처럼 보인다.
+KINDS = ["normal", "keyword", "unanswerable", "multiturn"]
 
 
 @dataclass
@@ -50,6 +55,8 @@ class Case:
     question: str
     expected_sources: list[str]
     expected_substrings: list[str]
+    # M9: 이 질문 앞에 있었던 대화. multiturn이 아니면 빈 리스트다.
+    history: list[dict[str, str]] = field(default_factory=list)
 
     @property
     def answerable(self) -> bool:
@@ -75,6 +82,7 @@ def load_dataset(path: Path = DATASET) -> list[Case]:
                 question=row["question"],
                 expected_sources=row.get("expected_sources") or [],
                 expected_substrings=row.get("expected_substrings") or [],
+                history=row.get("history") or [],
             )
         )
     return cases
@@ -99,6 +107,11 @@ def validate_dataset(cases: list[Case]) -> None:
 
         if case.kind not in KINDS:
             problems.append(f"[{case.id}] 모르는 kind: {case.kind!r} (가능: {KINDS})")
+
+        if case.kind == "multiturn" and not case.history:
+            # multiturn인데 히스토리가 없으면 그냥 normal이다. 그런 케이스가 섞이면
+            # "재작성 효과"를 재는 집합이 오염된다.
+            problems.append(f"[{case.id}] multiturn인데 history가 비어 있다")
 
         if case.kind == "unanswerable" and case.answerable:
             problems.append(f"[{case.id}] unanswerable인데 정답이 적혀 있다")
@@ -156,6 +169,11 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--save", action="store_true", help="evals/results/에 마크다운 저장")
     parser.add_argument(
+        "--no-rewrite",
+        action="store_true",
+        help="대화형 질의 재작성을 끈다 (M9 A/B용). multiturn 케이스만 영향받는다",
+    )
+    parser.add_argument(
         "--rerank",
         action="store_true",
         help="★ 실제 LLM을 부른다 ★ 후보를 넉넉히 뽑아 리랭킹 (M8-b A/B용)",
@@ -183,6 +201,8 @@ def main() -> None:
     mode = "hybrid" if (not args.dense and isinstance(store, HybridStore)) else "dense"
     if args.rerank:
         mode += "+rerank"
+    if not args.no_rewrite:
+        mode += "+rewrite"
     print(f"골든셋 {len(cases)}건 · store={store_name} · 검색={mode} · top_k={args.top_k}\n")
 
     # ★ 하네스 검증용 대조군 ★ 지표가 안 움직이는 하네스로 M7~M13을 헛돌 수 있다.
@@ -193,6 +213,16 @@ def main() -> None:
 
     rows = []
     for case in cases:
+        # ★ M9: 검색 전에 재작성한다 ★ 프로덕션 그래프의 rewrite 노드와 같은 일을
+        # 하네스에서도 한다 — M8에서 "하네스가 프로덕션 경로를 우회하면 개선을
+        # 측정할 수 없다"를 겪은 뒤로는 이 원칙을 먼저 챙긴다.
+        # history가 없으면 rewrite_query가 LLM을 안 부르고 원문을 돌려주므로,
+        # normal/keyword 케이스는 이 줄이 있어도 비용이 0이다.
+        question = (
+            case.question
+            if args.no_rewrite
+            else asyncio.run(rewrite_query(case.question, case.history))
+        )
         # ★ M8에서 고친 버그 ★ 여기서 store.search()를 직접 불렀었다. 그러면
         # retriever.retrieve()가 하는 일(하이브리드 분기, 임베딩 짝 규칙)을 전부
         # 건너뛴다 — 실제로 M8의 하이브리드를 붙이고도 지표가 1도 안 움직여서
@@ -203,10 +233,10 @@ def main() -> None:
             # ★ 리랭킹은 프로덕션과 같은 2단이어야 한다 ★ 넉넉히 뽑아서 다시 정렬한다.
             # top_k만 뽑아 리랭킹하면 "순서만 바꾸기"라 hit@5가 절대 안 오른다 —
             # 재현율은 1단이 담당한다는 역할 분담이 여기서도 그대로다.
-            pool = retrieve(store, case.question, settings.rerank_candidates, hybrid=not args.dense)
-            chunks = asyncio.run(rerank(case.question, pool, args.top_k))
+            pool = retrieve(store, question, settings.rerank_candidates, hybrid=not args.dense)
+            chunks = asyncio.run(rerank(question, pool, args.top_k))
         else:
-            chunks = retrieve(store, case.question, args.top_k, hybrid=not args.dense)
+            chunks = retrieve(store, question, args.top_k, hybrid=not args.dense)
         if args.shuffle:
             rng.shuffle(chunks)
         rows.append(

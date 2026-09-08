@@ -360,9 +360,9 @@ return "__end__"
 
 ```python
 config = {
-    "configurable": {"thread_id": payload.id},   # 2b — 어느 대화인가
-    "callbacks": get_callbacks(),                 # M4 — 키가 없으면 [] (no-op)
-    "metadata": trace_metadata(payload.id),       # M4 — {"langfuse_session_id": ...}
+    "configurable": {"thread_id": payload.id},  # 2b — 어느 대화인가
+    "callbacks": get_callbacks(),  # M4 — 키가 없으면 [] (no-op)
+    "metadata": trace_metadata(payload.id),  # M4 — {"langfuse_session_id": ...}
 }
 ```
 

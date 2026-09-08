@@ -1,4 +1,5 @@
 # FastAPI 라우터에서 공통으로 쓰는 의존성(dependency)을 모아두는 파일.
+import asyncio
 from typing import Annotated
 
 from fastapi import Depends
@@ -10,8 +11,9 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.db.session import get_db
 from app.graph import build_graph
-from app.rag.base import RetrievedChunk
+from app.rag.base import TOP_K, RetrievedChunk
 from app.rag.factory import get_store
+from app.rag.rerank import rerank
 from app.rag.retriever import retrieve
 
 # DbSession이라는 타입 별칭을 만들어두면, 라우터 함수 파라미터에서
@@ -68,7 +70,7 @@ _checkpointer = InMemorySaver()
 _store = get_store()
 
 
-def _retrieve(query: str) -> list[RetrievedChunk]:
+async def _retrieve(query: str) -> list[RetrievedChunk]:
     # graph.py가 받는 retrieve_fn의 실제 구현체.
     #
     # ★ 이 함수에서 SQLAlchemy가 사라졌다 ★ 3-2b에는 with SessionLocal()이 있었다 —
@@ -80,7 +82,15 @@ def _retrieve(query: str) -> list[RetrievedChunk]:
     # Callable[[str], list[RetrievedChunk]]라 "질문 하나 받아 청크 리스트를 주는"
     # 모양이어야 하는데, store.search는 벡터를 받는다. 임베딩을 끼워 넣는 이 한 줄이
     # 두 모양을 잇는 어댑터다.
-    return retrieve(_store, query)
+    # ★ M8-b: 검색이 2단이 됐다 ★
+    #   1) 하이브리드로 넉넉히 뽑는다(재현율)  2) 리랭킹으로 순서를 바로잡는다(정밀도)
+    # 리랭킹이 꺼져 있으면 1단만 돌고 예전과 완전히 같다 — 켜고 끄는 것이 설정 한 줄이라
+    # M6 하네스로 A/B를 돌릴 수 있다.
+    if not settings.rerank_enabled:
+        return await asyncio.to_thread(retrieve, _store, query, TOP_K)
+
+    candidates = await asyncio.to_thread(retrieve, _store, query, settings.rerank_candidates)
+    return await rerank(query, candidates, TOP_K)
 
 
 _graph = build_graph(_model, retrieve_fn=_retrieve, checkpointer=_checkpointer)

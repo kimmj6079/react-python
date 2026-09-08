@@ -14,6 +14,7 @@
 # 프롬프트가 나쁜 건지"를 구분하려면 지표가 분리돼 있어야 한다. 하나로 뭉치면 원인
 # 추적이 불가능해진다.
 import argparse
+import asyncio
 import json
 import random
 import sys
@@ -21,11 +22,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from app.core.config import settings
 from app.rag.base import HybridStore, RetrievedChunk
 from app.rag.chunking import MAX_TOKENS, OVERLAP_TOKENS
 from app.rag.embedding import MODEL_NAME
 from app.rag.factory import get_store
 from app.rag.ingest import REPO_ROOT
+from app.rag.rerank import rerank
 from app.rag.retriever import retrieve
 from evals.metrics import hit_at_k, mean, reciprocal_rank
 
@@ -153,6 +156,11 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--save", action="store_true", help="evals/results/에 마크다운 저장")
     parser.add_argument(
+        "--rerank",
+        action="store_true",
+        help="★ 실제 LLM을 부른다 ★ 후보를 넉넉히 뽑아 리랭킹 (M8-b A/B용)",
+    )
+    parser.add_argument(
         "--dense",
         action="store_true",
         help="하이브리드를 끄고 dense-only로 (M8 A/B용)",
@@ -173,6 +181,8 @@ def main() -> None:
     # HybridStore가 아니면 dense로 내려간다. 결과 파일 이름에도 이 값이 들어가야
     # 3주 뒤에 "이 숫자가 hybrid였나"를 알 수 있다.
     mode = "hybrid" if (not args.dense and isinstance(store, HybridStore)) else "dense"
+    if args.rerank:
+        mode += "+rerank"
     print(f"골든셋 {len(cases)}건 · store={store_name} · 검색={mode} · top_k={args.top_k}\n")
 
     # ★ 하네스 검증용 대조군 ★ 지표가 안 움직이는 하네스로 M7~M13을 헛돌 수 있다.
@@ -189,7 +199,14 @@ def main() -> None:
         # 발견했다. **평가 하네스가 프로덕션 경로를 우회하면 개선을 측정하지 못한다.**
         # judge.py가 처음부터 프로덕션 그래프를 그대로 돌린 것과 같은 이유이고,
         # 검색 층에서만 그 원칙을 어기고 있었다.
-        chunks = retrieve(store, case.question, args.top_k, hybrid=not args.dense)
+        if args.rerank:
+            # ★ 리랭킹은 프로덕션과 같은 2단이어야 한다 ★ 넉넉히 뽑아서 다시 정렬한다.
+            # top_k만 뽑아 리랭킹하면 "순서만 바꾸기"라 hit@5가 절대 안 오른다 —
+            # 재현율은 1단이 담당한다는 역할 분담이 여기서도 그대로다.
+            pool = retrieve(store, case.question, settings.rerank_candidates, hybrid=not args.dense)
+            chunks = asyncio.run(rerank(case.question, pool, args.top_k))
+        else:
+            chunks = retrieve(store, case.question, args.top_k, hybrid=not args.dense)
         if args.shuffle:
             rng.shuffle(chunks)
         rows.append(

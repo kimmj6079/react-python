@@ -14,6 +14,7 @@
 # 생겨도 이 파일은 한 글자도 안 바뀐다 — model·checkpointer·tools를 인자로
 # 받는 것과 정확히 같은 이유다.
 import asyncio
+import inspect
 import logging
 from collections.abc import Callable
 from typing import Annotated, Any, TypedDict
@@ -141,9 +142,18 @@ def build_graph(
         # 챗봇 자체의 필수 경로가 아니므로, 검색이 실패하면 빈 컨텍스트로
         # 대체하고 계속 진행한다 — 문서 근거 없는 답이 나갈 수 있지만, 최소한
         # 챗봇은 응답한다.
+        # ★ M8-b: retrieve_fn이 async일 수도 있다 ★
+        # 리랭킹은 LLM을 병렬로 부르므로 코루틴이다. 그걸 to_thread에 넣으면 새 스레드
+        # 안에 이벤트 루프가 없어 죽고, 반대로 동기 함수를 await하면 TypeError다.
+        # 그래서 "어느 쪽인가"를 물어보고 각각에 맞는 방식으로 부른다 —
+        # retriever.retrieve()가 저장소 능력을 물어보고 분기하는 것과 같은 사고방식이다.
+        # (테스트의 가짜 retrieve_fn은 동기 람다라 아래쪽 경로로 간다)
         query = state["messages"][-1].content
         try:
-            chunks = await asyncio.to_thread(retrieve_fn, query)
+            if inspect.iscoroutinefunction(retrieve_fn):
+                chunks = await retrieve_fn(query)
+            else:
+                chunks = await asyncio.to_thread(retrieve_fn, query)
         except Exception:
             logger.exception("retrieve_fn 실패 - 컨텍스트 없이 진행한다")
             chunks = []

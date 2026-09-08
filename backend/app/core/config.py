@@ -71,6 +71,26 @@ class Settings(BaseSettings):
     # 만들어내지는 않는다. M6 하네스로 dense vs hybrid를 A/B 하려고 플래그로 뒀다.
     hybrid_search: bool = True
 
+    # ★ M8-b: 리랭킹 ★ 하이브리드가 재현율(넉넉히 뽑기)이라면 리랭킹은 정밀도(순서 바로잡기)다.
+    # 채팅 모델과 별도 필드로 둔 이유: 나중에 한쪽만 바꾸고 싶어진다. 리랭킹은 짧은
+    # 프롬프트 × N개라 Haiku로 충분하고, 여기에 Opus를 쓰면 품질은 거의 그대로인데
+    # TTFT만 먹는다.
+    anthropic_rerank_model: str = "claude-haiku-4-5"
+
+    # ★ 측정하고 켰다 ★ 기본값을 False로 두고 M6 하네스로 먼저 확인했다:
+    #   hybrid          hit@1 0.79 · hit@5 0.95 · MRR 0.860
+    #   hybrid+rerank   hit@1 0.95 · hit@5 1.00 · MRR 0.974
+    # hit@1이 +0.16이다. 대가를 알고 켠다 — **요청마다 Haiku를 20번 부른다.**
+    #   비용: 프롬프트가 짧아 요청당 수십 원 수준(Haiku $1/$5 per MTok)
+    #   지연: 리랭킹이 끝나야 생성 스트리밍이 시작된다. M1에서 스트리밍으로 얻은
+    #         체감 속도를 여기서 일부 잃는다 — M13의 지연 예산에서 계측하고 회수한다.
+    rerank_enabled: bool = True
+
+    # 리랭킹에 넘길 후보 수. 하이브리드의 top-30보다 줄인 값이다 — README의 함정:
+    # "리랭킹이 끝나야 생성 스트리밍이 시작되므로 사용자가 체감하는 침묵이 길어진다."
+    # M1에서 스트리밍으로 얻은 체감 속도를 여기서 일부 잃고, M13에서 회수한다.
+    rerank_candidates: int = 20
+
     # --- 관측성 (Langfuse, M4) ---
     # 트레이싱은 "있으면 좋은 것"이지 앱의 필수 경로가 아니다. 그래서 기본값이 빈
     # 문자열이고, 비어 있으면 core/tracing.py가 아예 핸들러를 안 만든다(no-op).

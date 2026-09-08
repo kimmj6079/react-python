@@ -875,9 +875,9 @@ FastAPI가 LLM을 직접 호출해 SSE로 스트리밍, 프론트는 `ai`/`@ai-s
   messages = state["messages"]
   context = state.get("retrieved_context")
   if context:
-      messages = [SystemMessage(content=...), *messages]   # 새 리스트를 만들 뿐
+      messages = [SystemMessage(content=...), *messages]  # 새 리스트를 만들 뿐
   response = await model_with_tools.ainvoke(messages)
-  return {"messages": [response]}                          # 반환에는 시스템 메시지가 없다
+  return {"messages": [response]}  # 반환에는 시스템 메시지가 없다
   ```
   **모델에게는 가지만 체크포인터에는 안 남는다.** 파이썬 리스트 언패킹이 원본을 안 건드린다는
   성질에 기대고 있어서, 무심코 `messages.insert(0, ...)`로 바꾸면 그 순간 ②의 누적이 되살아난다.
@@ -946,9 +946,9 @@ FastAPI가 LLM을 직접 호출해 SSE로 스트리밍, 프론트는 `ai`/`@ai-s
   **무엇이 문제였나**: 3-2b에서 "그래프는 저장소를 모른다"고 써놓고 바로 옆 파일이 알고 있었다.
   ```python
   # deps.py (3-2b)
-  def _retrieve(query): 
-      with SessionLocal() as db:      # ← SQLAlchemy Session
-          return search(db, query)    # ← search(db: Session, ...)
+  def _retrieve(query):
+      with SessionLocal() as db:  # ← SQLAlchemy Session
+          return search(db, query)  # ← search(db: Session, ...)
   ```
   `search()`의 첫 인자가 `db: Session`이다. **이 시그니처로는 Qdrant 구현을 만들 수 없다** —
   Qdrant에 Session이라는 개념이 없기 때문이다. 인터페이스에 특정 구현의 타입이 새어나오는 것을
@@ -1856,6 +1856,37 @@ M6 골든셋에 `keyword` 종류를 넣어둔 이유가 여기다.
 - [ ] 그래프의 `retrieve` 노드를 검색→리랭킹 2단으로 교체
 - [ ] **M6 실행: hybrid vs hybrid+rerank**
 - [ ] 순위 변동량 로깅 + Langfuse에 리랭킹 span 남기기
+
+### ✅ M8 완료 (2026-09-08) — 3단 비교표
+
+| 단계 | hit@1 | hit@5 | **MRR** |
+|---|---|---|---|
+| M3 베이스라인 (dense, 600자 고정) | 0.74 | 0.89 | 0.791 |
+| M7 (구조 인식 청킹 + 작은 청크 병합) | 0.74 | 0.95 | 0.816 |
+| **M8-a 하이브리드** (dense + BM25 RRF) | 0.79 | 0.95 | **0.860** |
+| **M8-b + 리랭킹** (Haiku, 후보 20 → 5) | **0.95** | **1.00** | **0.974** |
+
+**예상이 맞은 것**: 하이브리드는 `keyword`에서만 올랐다(MRR 0.893 → **1.000**, 7건 전부 1위)
+— `normal`은 0.771 → 0.778로 제자리. **M6 골든셋에 `keyword`를 섞어둔 값이 여기서 회수됐다.**
+
+**예상과 달랐던 것**: 리랭킹이 `hit@5`도 올렸다(0.95 → 1.00). "정밀도 담당이라 hit@5는
+거의 안 바뀐다"가 예상이었는데, **후보를 20개로 넓혀 5개로 줄이는 방식**이라 6~20위의
+정답이 top-5로 들어왔다. 순수 재정렬이었다면 정의상 안 변했을 값이다.
+
+**`k04`(`read:packages`)의 여정**: 5위(M6) → ✗(M7-1) → 4위(M7 병합) → **1위**(M8 하이브리드).
+dense가 "권한 이야기 비슷한 문단"을 가져오는 동안 BM25는 **철자 그대로**를 찾는다.
+
+**★ 하네스가 프로덕션 경로를 우회하고 있었다 ★** 하이브리드를 다 붙이고 돌렸는데 숫자가
+소수점까지 똑같았다. `run_retrieval.py`가 `retrieve()`를 건너뛰고 `store.search()`를 직접
+불렀기 때문이다. **평가 하네스가 프로덕션 경로를 우회하면 개선을 측정할 수 없고, 더
+나쁘게는 "효과 없다"는 틀린 결론을 낸다.** M6의 `--shuffle` 대조군은 *지표 계산*이 맞는지는
+봤지만 *하네스가 올바른 코드를 부르는지*는 못 봤다 — 계측기의 검증에도 사각지대가 있다.
+
+**저장소 기본값이 pgvector → qdrant로 바뀌었다.** M3-4에 "Qdrant가 값을 하는 지점은
+(c) DB 레벨 하이브리드이고 M8에서 다시 판단한다"고 적어둔 그 판단을 **데이터가 정했다**
+(0.816 vs 0.860). pgvector 구현은 그대로 남고 `VECTOR_STORE` 한 줄로 되돌아간다.
+
+자세한 기록: [`BASELINE-M8.md`](../backend/evals/results/BASELINE-M8.md)
 
 **검증**: dense-only → hybrid → hybrid+rerank **3단 비교표**를 M6 하네스로 만든다. 예상 결과는
 "`keyword` 종류에서 hybrid가 크게 오르고 `normal`에서는 비슷" — 그대로 나오면 하이브리드가 제대로 붙은 것이다.

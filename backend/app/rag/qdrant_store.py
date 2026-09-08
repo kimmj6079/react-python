@@ -15,7 +15,14 @@ import uuid
 from qdrant_client import QdrantClient, models
 
 from app.core.config import settings
-from app.rag.base import EMBEDDING_DIM, TOP_K, Chunk, RetrievedChunk
+from app.rag.base import (
+    EMBEDDING_DIM,
+    HYBRID_CANDIDATES,
+    TOP_K,
+    Chunk,
+    RetrievedChunk,
+    SparseVector,
+)
 
 # ★ 타임아웃을 반드시 명시한다 ★ (3-3a의 "알고 남겨둔 것" ①이 여기서 회수된다)
 # pgvector는 db/session.py의 statement_timeout=5000이 지켜주지만 Qdrant는 HTTP다.
@@ -28,6 +35,13 @@ TIMEOUT_SECONDS = 5
 # ★ 한 번 정하면 절대 바꾸면 안 된다 ★ — 바꾸는 순간 같은 청크가 다른 id를 갖게 되어
 # 재인입이 "덮어쓰기"가 아니라 "중복 삽입"이 된다(에러 없이).
 ID_NAMESPACE = uuid.NAMESPACE_URL
+
+# ★ M8: 벡터에 이름이 생겼다 ★
+# 3-3c에서는 이름 없는 dense 벡터 하나였다. 하이브리드는 한 point가 dense와 sparse를
+# 둘 다 갖고 질의할 때 "어느 쪽으로 찾을지"를 지목해야 하므로(prefetch의 using=),
+# 이름이 필수다. 이름이 바뀌면 기존 컬렉션과 호환되지 않아 재생성 + 재인입이 필요하다.
+DENSE_NAME = "dense"
+SPARSE_NAME = "bm25"
 
 
 class QdrantStore:
@@ -58,9 +72,21 @@ class QdrantStore:
                 # 같은 출처를 쓰므로 두 저장소의 차원이 어긋날 수가 없다.
                 # distance=COSINE은 e5 임베딩 + pgvector의 cosine_distance와 짝을 맞춘 것이다.
                 # 여기만 EUCLID로 바꾸면 에러 없이 순위만 달라진다.
-                vectors_config=models.VectorParams(
-                    size=EMBEDDING_DIM, distance=models.Distance.COSINE
-                ),
+                vectors_config={
+                    DENSE_NAME: models.VectorParams(
+                        size=EMBEDDING_DIM, distance=models.Distance.COSINE
+                    )
+                },
+                # ★ M8: sparse 벡터 슬롯 ★ 실측으로 확인한 것 두 가지:
+                #   - update_collection(sparse_vectors_config=)로 기존 컬렉션에도 붙일 수
+                #     있다. 다만 이름 없는 dense를 named로 바꾸는 것은 불가라 어차피
+                #     재생성이 필요했다(README가 "먼저 확인하라"던 지점).
+                #   - modifier=IDF가 핵심이다. fastembed의 BM25는 원시 TF만 주고,
+                #     **IDF 가중은 Qdrant가 컬렉션 전체 통계로 계산한다.** 이걸 빼면
+                #     에러 없이 "흔한 단어일수록 중요"가 되어 순위가 조용히 망가진다.
+                sparse_vectors_config={
+                    SPARSE_NAME: models.SparseVectorParams(modifier=models.Modifier.IDF)
+                },
             )
         self._collection_ready = True
 
@@ -84,7 +110,13 @@ class QdrantStore:
             must=[models.FieldCondition(key="source", match=models.MatchValue(value=source))]
         )
 
-    def upsert_document(self, source: str, chunks: list[Chunk], vectors: list[list[float]]) -> int:
+    def upsert_document(
+        self,
+        source: str,
+        chunks: list[Chunk],
+        vectors: list[list[float]],
+        sparse_vectors: list[SparseVector] | None = None,
+    ) -> int:
         self._ensure_collection()
         flt = self._source_filter(source)
 
@@ -110,12 +142,16 @@ class QdrantStore:
             collection_name=self._collection,
             points_selector=models.FilterSelector(filter=flt),
         )
+        # sparse가 안 오면 dense만 넣는다 — 하이브리드 없이도 동작해야 하고,
+        # 그래야 "sparse를 붙이기 전/후" A/B가 같은 코드로 가능하다.
+        sparse_list = sparse_vectors or [None] * len(chunks)
+
         self._client.upsert(
             collection_name=self._collection,
             points=[
                 models.PointStruct(
                     id=self._point_id(source, chunk.chunk_index),
-                    vector=vector,
+                    vector=self._vector_payload(vector, sparse),
                     # payload = pgvector에서 source/chunk_index/content 컬럼이 하던 일.
                     # ★ 원문(content)을 반드시 같이 저장한다 ★ 벡터는 비가역이라
                     # 원문이 없으면 검색에 성공해도 모델에게 붙여줄 게 없다(3-1과 동일 원칙).
@@ -132,10 +168,18 @@ class QdrantStore:
                         "token_count": chunk.token_count,
                     },
                 )
-                for chunk, vector in zip(chunks, vectors, strict=True)
+                for chunk, vector, sparse in zip(chunks, vectors, sparse_list, strict=True)
             ],
         )
         return deleted
+
+    @staticmethod
+    def _vector_payload(dense: list[float], sparse: SparseVector | None) -> dict:
+        payload: dict = {DENSE_NAME: dense}
+        if sparse is not None:
+            indices, values = sparse
+            payload[SPARSE_NAME] = models.SparseVector(indices=indices, values=values)
+        return payload
 
     def search(self, query_vector: list[float], top_k: int = TOP_K) -> list[RetrievedChunk]:
         self._ensure_collection()
@@ -147,10 +191,53 @@ class QdrantStore:
         response = self._client.query_points(
             collection_name=self._collection,
             query=query_vector,
+            # ★ M8에서 늘었다 ★ 벡터에 이름이 생겼으므로 "어느 벡터로 찾을지"를
+            # 지목해야 한다. 안 주면 이름 없는 기본 벡터를 찾다가 실패한다.
+            using=DENSE_NAME,
             limit=top_k,
             with_payload=True,
         )
+        return self._to_chunks(response)
 
+    def search_hybrid(
+        self,
+        query_vector: list[float],
+        query_sparse: SparseVector,
+        top_k: int = TOP_K,
+        candidates: int = HYBRID_CANDIDATES,
+    ) -> list[RetrievedChunk]:
+        """dense top-N과 BM25 top-N을 각각 뽑아 서버가 RRF로 융합한다. (M8)
+
+        ★ 융합을 직접 구현하지 않는다 ★ 두 랭킹은 점수 스케일이 완전히 다르다
+        (코사인 유사도 0~1 vs BM25 점수 0~수십). 점수를 정규화해 더하려 들면
+        "어떻게 정규화할 것인가"라는 답 없는 문제가 생긴다.
+        RRF(Reciprocal Rank Fusion)는 **점수를 아예 안 보고 순위만** 쓴다 —
+        각 랭킹에서 r위면 1/(k+r)을 주고 합친다. 정규화 고민이 통째로 사라진다.
+        Qdrant가 서버에서 해주므로 우리가 짤 코드도 없다.
+        """
+        self._ensure_collection()
+        indices, values = query_sparse
+
+        response = self._client.query_points(
+            collection_name=self._collection,
+            # prefetch = "융합하기 전에 각각 이만큼 뽑아둬라". 재현율 담당이라
+            # top_k보다 훨씬 넉넉하게(기본 30) 뽑는다.
+            prefetch=[
+                models.Prefetch(query=query_vector, using=DENSE_NAME, limit=candidates),
+                models.Prefetch(
+                    query=models.SparseVector(indices=indices, values=values),
+                    using=SPARSE_NAME,
+                    limit=candidates,
+                ),
+            ],
+            query=models.FusionQuery(fusion=models.Fusion.RRF),
+            limit=top_k,
+            with_payload=True,
+        )
+        return self._to_chunks(response)
+
+    @staticmethod
+    def _to_chunks(response) -> list[RetrievedChunk]:
         return [
             RetrievedChunk(
                 source=point.payload["source"],
@@ -166,6 +253,11 @@ class QdrantStore:
                 # distance = 1 - score 가 정확히 성립한다(probe에서 손계산과 대조 확인).
                 # 이 한 줄이 없으면 두 저장소의 숫자가 정반대 의미가 되어, M6 평가
                 # 하네스가 Qdrant에서만 순위를 거꾸로 매긴다 — 에러 없이.
+                # ★ 하이브리드에서는 이 값이 코사인 거리가 아니다 ★
+                # RRF 점수(순위의 역수 합, 보통 0~0.03)를 뒤집은 값이라 1에 가깝게
+                # 몰린다. **정렬에는 쓸 수 있어도 절대값 비교(임계값)에는 못 쓴다.**
+                # M6 하네스의 unanswerable 거리 분석이 하이브리드에서 의미가 달라지는
+                # 이유이고, 그쪽 보고서에 주석을 달아뒀다.
                 distance=1.0 - point.score,
             )
             for point in response.points

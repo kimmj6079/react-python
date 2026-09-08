@@ -15,9 +15,9 @@ import time
 from pathlib import Path
 
 from app.core.config import settings
-from app.rag.base import Chunk, VectorStore
+from app.rag.base import Chunk, HybridStore, VectorStore
 from app.rag.chunking import MAX_TOKENS, OVERLAP_TOKENS, split_markdown
-from app.rag.embedding import embed_passages
+from app.rag.embedding import embed_passages, embed_sparse_passages
 from app.rag.factory import get_store, pop_store_arg
 
 # source 키의 기준점: …/backend/app/rag/ingest.py에서 세 단계 위 = 저장소 루트
@@ -97,13 +97,18 @@ def insert_file(
     # 배치 분할은 fastembed가 내부에서 알아서 한다(기본 batch_size=256).
     vectors = embed_passages(texts)
 
+    # ★ M8: 저장소가 하이브리드를 할 수 있을 때만 BM25를 계산한다 ★
+    # pgvector에 넣을 때 sparse를 계산하면 CPU만 쓰고 버려진다. "능력을 물어보고
+    # 분기한다"는 retriever.py의 판단과 같은 것을 인입 쪽에서도 한다.
+    sparse = embed_sparse_passages(texts) if isinstance(store, HybridStore) else None
+
     # ★ 3-3a: "지우고 새로 넣기"를 이 함수가 더 이상 모른다 ★
     # 3-1에서 여기 있던 delete + add_all + commit은 pgvector_store.py로 옮겼다.
     # Postgres는 그 셋을 한 트랜잭션으로 묶을 수 있지만 Qdrant는 못 한다 —
     # "어떻게 멱등을 달성하는가"는 저장소마다 다른 구현 세부라 계약에 두면 안 된다.
     # 이 함수에 남은 것은 "무엇을 하는가"(읽기 → 청킹 → 임베딩 → 업서트)뿐이고,
     # 그 넷은 저장소가 바뀌어도 같다.
-    deleted = store.upsert_document(source, chunks, vectors)
+    deleted = store.upsert_document(source, chunks, vectors, sparse)
     return len(chunks), deleted, [c.token_count for c in chunks]
 
 

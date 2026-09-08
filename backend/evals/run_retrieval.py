@@ -21,11 +21,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from app.rag.base import RetrievedChunk
+from app.rag.base import HybridStore, RetrievedChunk
 from app.rag.chunking import MAX_TOKENS, OVERLAP_TOKENS
-from app.rag.embedding import MODEL_NAME, embed_query
+from app.rag.embedding import MODEL_NAME
 from app.rag.factory import get_store
 from app.rag.ingest import REPO_ROOT
+from app.rag.retriever import retrieve
 from evals.metrics import hit_at_k, mean, reciprocal_rank
 
 EVALS_DIR = Path(__file__).resolve().parent
@@ -152,6 +153,11 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--save", action="store_true", help="evals/results/에 마크다운 저장")
     parser.add_argument(
+        "--dense",
+        action="store_true",
+        help="하이브리드를 끄고 dense-only로 (M8 A/B용)",
+    )
+    parser.add_argument(
         "--shuffle",
         action="store_true",
         help="★ 하네스 검증용 ★ 검색 결과 순서를 무작위로 섞는다 (지표가 떨어져야 정상)",
@@ -163,7 +169,11 @@ def main() -> None:
     store = get_store(args.store)
     store_name = args.store or "pgvector"
 
-    print(f"골든셋 {len(cases)}건 · store={store_name} · top_k={args.top_k}\n")
+    # ★ 설정이 아니라 "실제로 무엇을 썼는가"를 찍는다 ★ --dense를 안 줬어도 저장소가
+    # HybridStore가 아니면 dense로 내려간다. 결과 파일 이름에도 이 값이 들어가야
+    # 3주 뒤에 "이 숫자가 hybrid였나"를 알 수 있다.
+    mode = "hybrid" if (not args.dense and isinstance(store, HybridStore)) else "dense"
+    print(f"골든셋 {len(cases)}건 · store={store_name} · 검색={mode} · top_k={args.top_k}\n")
 
     # ★ 하네스 검증용 대조군 ★ 지표가 안 움직이는 하네스로 M7~M13을 헛돌 수 있다.
     # 순서를 무작위로 섞으면 hit@k는 그대로여야 하고(같은 5개가 그대로 있으니)
@@ -173,8 +183,13 @@ def main() -> None:
 
     rows = []
     for case in cases:
-        # compare_stores.py와 같은 이유로 질문당 임베딩은 한 번만.
-        chunks = store.search(embed_query(case.question), args.top_k)
+        # ★ M8에서 고친 버그 ★ 여기서 store.search()를 직접 불렀었다. 그러면
+        # retriever.retrieve()가 하는 일(하이브리드 분기, 임베딩 짝 규칙)을 전부
+        # 건너뛴다 — 실제로 M8의 하이브리드를 붙이고도 지표가 1도 안 움직여서
+        # 발견했다. **평가 하네스가 프로덕션 경로를 우회하면 개선을 측정하지 못한다.**
+        # judge.py가 처음부터 프로덕션 그래프를 그대로 돌린 것과 같은 이유이고,
+        # 검색 층에서만 그 원칙을 어기고 있었다.
+        chunks = retrieve(store, case.question, args.top_k, hybrid=not args.dense)
         if args.shuffle:
             rng.shuffle(chunks)
         rows.append(
@@ -186,19 +201,21 @@ def main() -> None:
             }
         )
 
-    report = build_report(rows, store_name, args.top_k, args.shuffle)
+    report = build_report(rows, store_name, args.top_k, args.shuffle, mode)
     print(report)
 
     if args.save:
         RESULTS_DIR.mkdir(exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         suffix = "-shuffled" if args.shuffle else ""
-        out = RESULTS_DIR / f"{stamp}-{store_name}-k{args.top_k}{suffix}.md"
+        out = RESULTS_DIR / f"{stamp}-{store_name}-{mode}-k{args.top_k}{suffix}.md"
         out.write_text(report, encoding="utf-8")
         print(f"\n저장: {out.relative_to(REPO_ROOT)}")
 
 
-def build_report(rows: list[dict], store_name: str, top_k: int, shuffled: bool = False) -> str:
+def build_report(
+    rows: list[dict], store_name: str, top_k: int, shuffled: bool = False, mode: str = "dense"
+) -> str:
     lines: list[str] = []
     add = lines.append
 
@@ -209,6 +226,7 @@ def build_report(rows: list[dict], store_name: str, top_k: int, shuffled: bool =
     add("| 설정 | 값 |")
     add("|---|---|")
     add(f"| store | `{store_name}` |")
+    add(f"| 검색 방식 | `{mode}` |")
     add(f"| top_k | {top_k} |")
     add(f"| 임베딩 모델 | `{MODEL_NAME}` |")
     # ★ M7-1부터 단위가 "자"가 아니라 "토큰"이다 ★ 결과 파일에 단위를 남기지

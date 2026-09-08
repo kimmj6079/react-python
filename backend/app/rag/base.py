@@ -11,6 +11,15 @@
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
+# 희소(sparse) 벡터 하나. BM25가 만드는 "어떤 토큰이 얼마나 중요한가"의 목록이다.
+# dense 벡터가 1024개 실수를 빽빽이 채우는 것과 달리, 문서에 등장한 토큰만 (인덱스, 값)
+# 쌍으로 듬성듬성 갖는다 — 그래서 sparse다.
+#
+# dict가 아니라 튜플 두 개인 이유: Qdrant의 SparseVector와 fastembed의 SparseEmbedding이
+# 둘 다 indices/values 두 배열로 표현하고, 계약이 둘 중 어느 라이브러리 타입도
+# import하지 않으려면 표준 타입이어야 한다.
+SparseVector = tuple[list[int], list[float]]
+
 # ★ 임베딩 차원. 3-3c에서 models/chunk.py에서 여기로 옮겼다 ★
 # 원래 있던 자리(document_chunks 테이블 모델)는 사실 틀린 자리였다 — 1024는 Postgres
 # 테이블의 성질이 아니라 임베딩 모델(intfloat/multilingual-e5-large)의 성질이고,
@@ -29,6 +38,12 @@ EMBEDDING_DIM = 1024
 # 크면 정답이 낄 확률(재현율)은 오르지만 프롬프트가 길어져 비용과 잡음이 는다.
 # 5는 관례적 기본값일 뿐이고, "우리 문서에서의 최적"은 M6 평가 하네스가 생겨야 숫자로 정해진다.
 TOP_K = 5
+
+# ★ 융합 전에 각 랭킹에서 몇 개를 뽑을 것인가 (M8) ★
+# 하이브리드의 역할은 "재현율" — 정답을 후보 안에 들여놓는 것이다. 그래서 top_k(5)보다
+# 훨씬 넉넉하게 뽑아 융합한 뒤 상위 5개만 남긴다. 30은 관례적 출발점이고, 키우면
+# 재현율은 오르지만 리랭킹(M8 후반) 비용과 지연이 그만큼 는다.
+HYBRID_CANDIDATES = 30
 
 
 @dataclass
@@ -93,7 +108,13 @@ class VectorStore(Protocol):
     구현이 이 파일을 상속해야 한다.
     """
 
-    def upsert_document(self, source: str, chunks: list[Chunk], vectors: list[list[float]]) -> int:
+    def upsert_document(
+        self,
+        source: str,
+        chunks: list[Chunk],
+        vectors: list[list[float]],
+        sparse_vectors: list[SparseVector] | None = None,
+    ) -> int:
         """같은 source의 기존 청크를 지우고 새 청크로 통째로 교체한다(멱등).
 
         ★ M7-2에서 list[str] -> list[Chunk]로 바뀌었다 ★ 본문만으로는 부족해졌다.
@@ -107,7 +128,46 @@ class VectorStore(Protocol):
         ★ "어떻게" 멱등을 달성하는지는 계약에 없다 ★ Postgres는 삭제+삽입을 한
         트랜잭션으로 묶을 수 있지만 Qdrant에는 트랜잭션이 없다. 저장소마다 방법이
         다른 것을 계약에 적으면 한쪽이 반드시 억지를 쓰게 된다.
+
+        ★ M8: sparse_vectors는 선택 인자다 ★ 하이브리드 검색(BM25)을 지원하는 구현만
+        쓰고, pgvector 구현은 조용히 무시한다. 계약은 "최대공약수"여야 한다고 3-3a에
+        적었는데 여기서 예외를 하나 만든 셈이다 — 대신 **필수가 아니라 선택**으로 두어
+        "이걸 못 하는 구현도 계약을 지킨다"는 성질은 유지했다.
         """
 
     def search(self, query_vector: list[float], top_k: int = TOP_K) -> list[RetrievedChunk]:
         """질문 벡터와 가장 가까운 청크 top_k개를 distance 오름차순으로 돌려준다."""
+
+
+@runtime_checkable
+class HybridStore(Protocol):
+    """dense + sparse 두 랭킹을 융합해 검색할 수 있는 저장소. (M8)
+
+    ★ VectorStore를 확장하지 않고 별도 프로토콜로 둔 이유 ★
+    하이브리드는 **모든 저장소가 할 수 있는 일이 아니다.** Qdrant는 한 컬렉션에 named
+    vector로 dense와 sparse를 같이 두고 서버가 RRF로 융합해주지만, pgvector에는 그
+    개념이 없다(tsvector + ts_rank는 BM25가 아니라 다른 메커니즘이라, 같은 것을
+    구현했다고 말할 수 없다).
+
+    필수 메서드로 VectorStore에 넣었다면 pgvector 구현이 NotImplementedError를 던지는
+    "구현했지만 못 하는" 상태가 된다. 별도 프로토콜로 두면 **호출자가 능력을 물어보고
+    분기한다**(retriever.py의 isinstance 검사) — 없는 능력을 있는 척하지 않는다.
+
+    M3-4에서 "Qdrant가 값을 하기 시작하는 지점은 (c) DB 레벨 하이브리드 검색"이라고
+    적어둔 예고가 여기서 실현된다. 저장소를 둘 다 만들어둔 값이 회수되는 자리다.
+    """
+
+    def search_hybrid(
+        self,
+        query_vector: list[float],
+        query_sparse: SparseVector,
+        top_k: int = TOP_K,
+        candidates: int = HYBRID_CANDIDATES,
+    ) -> list[RetrievedChunk]:
+        """dense top-N과 sparse top-N을 각각 뽑아 RRF로 융합한 top_k.
+
+        ★ 반환되는 distance는 코사인 거리가 아니다 ★ RRF 점수(순위의 역수 합)를
+        1 - score로 뒤집은 값이라, **정렬에는 쓸 수 있어도 절대값 비교(임계값)에는
+        쓸 수 없다.** M6 하네스의 unanswerable 거리 분석이 하이브리드에서는 의미가
+        달라지는 이유다 — 그쪽 보고서에 주석을 달아뒀다.
+        """

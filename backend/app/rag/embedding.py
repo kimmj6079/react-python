@@ -4,9 +4,9 @@
 # 규칙"을 써야 한다. 다르면 에러가 아니라 검색 품질 붕괴로 나타난다 — 서로 다른
 # 모델이 만든 벡터는 같은 의미 공간에 있지 않아서, 유사도 숫자는 멀쩡히 나오는데
 # 순위가 무작위에 가까워진다. 그래서 모델 이름을 여기 한 곳에만 적고 양쪽이 import한다.
-from fastembed import TextEmbedding
+from fastembed import SparseTextEmbedding, TextEmbedding
 
-from app.rag.base import EMBEDDING_DIM
+from app.rag.base import EMBEDDING_DIM, SparseVector
 
 # scripts/probe_embedding.py 실측으로 정한 모델. 한국어 포함 다국어 + 1024차원.
 # e5 계열은 질문에 "query: ", 문서에 "passage: "를 붙여 학습된 비대칭 모델이라,
@@ -59,3 +59,40 @@ def _check_dim(vectors: list[list[float]]) -> None:
             f"임베딩 차원 {len(vectors[0])} != 계약 차원 {EMBEDDING_DIM} - "
             f"모델 {MODEL_NAME}과 app/rag/base.py의 EMBEDDING_DIM이 어긋났다"
         )
+
+
+# ★ M8: BM25 희소 임베딩 ★
+# dense 임베딩이 구조적으로 못하는 것은 **정확한 토큰 일치**다. "read:packages"를 물으면
+# dense는 "비슷하게 생긴 다른 권한 이야기"를 가져온다 — 의미 공간에서는 그게 가깝기 때문이다.
+# BM25는 반대로 철자 그대로를 찾는다. 둘은 서로의 약점을 메운다.
+#
+# ★ torch를 안 끌고 온다 ★ fastembed의 BM25는 onnxruntime 기반이다. 로컬 cross-encoder
+# 리랭커를 안 쓰기로 한 이유가 정확히 torch로 인한 이미지 비대화인데, BM25에는 그 문제가
+# 없다 — 같은 기준을 적용한 서로 다른 결론이다.
+SPARSE_MODEL_NAME = "Qdrant/bm25"
+
+_sparse_model: SparseTextEmbedding | None = None
+
+
+def get_sparse_model() -> SparseTextEmbedding:
+    global _sparse_model
+    if _sparse_model is None:
+        _sparse_model = SparseTextEmbedding(model_name=SPARSE_MODEL_NAME)
+    return _sparse_model
+
+
+def _to_sparse(embedding) -> SparseVector:
+    # fastembed는 numpy 배열을 주고 Qdrant는 파이썬 리스트를 원한다. 계약(base.py)이
+    # 어느 라이브러리 타입도 모르게 하려면 여기서 표준 타입으로 바꿔야 한다.
+    return (embedding.indices.tolist(), embedding.values.tolist())
+
+
+def embed_sparse_passages(texts: list[str]) -> list[SparseVector]:
+    return [_to_sparse(e) for e in get_sparse_model().embed(texts)]
+
+
+def embed_sparse_query(text: str) -> SparseVector:
+    # ★ query_embed와 embed가 다르다 ★ BM25에서 질의는 문서와 다르게 처리된다
+    # (문서는 TF를 세지만 질의는 등장 여부만 본다). e5의 passage/query 접두어와
+    # 같은 성질의 비대칭이고, 짝을 어기면 여기서도 에러 없이 품질만 떨어진다.
+    return _to_sparse(next(iter(get_sparse_model().query_embed([text]))))

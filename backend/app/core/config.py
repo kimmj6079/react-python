@@ -47,7 +47,14 @@ class Settings(BaseSettings):
     # get_store()가 "pgvector|qdrant 중 하나여야 한다"고 이름을 담아 죽는 편이 낫다.
     # (Literal로 하면 앱 부팅 자체가 pydantic ValidationError로 죽는데, 메시지가
     #  Settings 전체 검증 실패로 나와서 원인 필드를 찾기가 오히려 번거롭다.)
-    vector_store: str = "pgvector"
+    # ★ M8에서 기본값이 pgvector -> qdrant로 바뀌었다 ★
+    # M3-4에서 "Qdrant가 값을 하기 시작하는 지점은 (c) DB 레벨 하이브리드 검색이고,
+    # M8에서 이 판단을 다시 한다"고 적어뒀다. 지금이 그때이고, 데이터가 정했다:
+    #   pgvector(dense-only)  MRR 0.816
+    #   qdrant(hybrid)        MRR 0.860   ← keyword MRR은 0.893 -> 1.000
+    # pgvector 구현은 그대로 남는다. 하이브리드가 필요 없는 환경(Postgres만 있는 서버)
+    # 에서는 여전히 한 줄로 되돌릴 수 있고, 그 선택지가 있다는 것 자체가 3-3의 값이다.
+    vector_store: str = "qdrant"
 
     # Qdrant 접속 주소. 로컬은 docker-compose의 qdrant 서비스(포트 6333),
     # 컨테이너 안에서는 docker-compose.yml이 http://qdrant:6333으로 덮어쓴다.
@@ -57,6 +64,12 @@ class Settings(BaseSettings):
     # M7에서 청킹 전략을 바꿀 때 docs_v1 / docs_v2로 나란히 두고 A/B 비교를 하려면
     # 이 값이 바뀔 수 있어야 한다. (pgvector에서 같은 걸 하려면 마이그레이션이 필요하다)
     qdrant_collection: str = "document_chunks"
+
+    # ★ M8: 하이브리드 검색(dense + BM25)을 쓸 것인가 ★
+    # 저장소가 HybridStore 능력을 갖고 있을 때만 의미가 있다(지금은 Qdrant만).
+    # 능력이 없으면 dense-only로 조용히 내려간다 — 설정이 켜져 있다고 없는 능력을
+    # 만들어내지는 않는다. M6 하네스로 dense vs hybrid를 A/B 하려고 플래그로 뒀다.
+    hybrid_search: bool = True
 
     # --- 관측성 (Langfuse, M4) ---
     # 트레이싱은 "있으면 좋은 것"이지 앱의 필수 경로가 아니다. 그래서 기본값이 빈

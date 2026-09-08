@@ -11,16 +11,31 @@
 import sys
 
 from app.core.config import settings
-from app.rag.base import TOP_K, RetrievedChunk, VectorStore
-from app.rag.embedding import embed_query
+from app.rag.base import TOP_K, HybridStore, RetrievedChunk, VectorStore
+from app.rag.embedding import embed_query, embed_sparse_query
 from app.rag.factory import get_store, pop_store_arg
 
 
-def retrieve(store: VectorStore, query: str, top_k: int = TOP_K) -> list[RetrievedChunk]:
+def retrieve(
+    store: VectorStore,
+    query: str,
+    top_k: int = TOP_K,
+    *,
+    hybrid: bool | None = None,
+) -> list[RetrievedChunk]:
     # store를 인자로 받는 이유는 build_graph가 model·checkpointer·retrieve_fn을
     # 인자로 받는 것과 완전히 같다 — 이 함수가 어느 저장소인지 몰라야 3-4에서
     # 설정 한 줄로 갈아끼워진다. 타입을 PgVectorStore가 아니라 VectorStore로 잡은 것도
     # 같은 맥락이다(구현이 아니라 계약에 의존한다).
+    #
+    # ★ M8: 능력을 물어보고 분기한다 ★
+    # "설정이 켜져 있는가"와 "이 저장소가 할 수 있는가"는 다른 질문이다. 둘 다 참일
+    # 때만 하이브리드로 가고, 아니면 dense-only로 조용히 내려간다.
+    # isinstance(store, HybridStore)는 상속이 아니라 **메서드가 있는가**를 본다
+    # (runtime_checkable Protocol) — pgvector 구현이 base.py를 몰라도 되는 이유다.
+    use_hybrid = settings.hybrid_search if hybrid is None else hybrid
+    if use_hybrid and isinstance(store, HybridStore):
+        return store.search_hybrid(embed_query(query), embed_sparse_query(query), top_k)
     return store.search(embed_query(query), top_k)
 
 
@@ -44,7 +59,8 @@ def main() -> None:
 
     # 플래그가 없으면 settings.vector_store(기본 "pgvector")를 따른다.
     store = get_store(store_name)
-    print(f"[저장소: {store_name or settings.vector_store}]")
+    mode = "hybrid" if (settings.hybrid_search and isinstance(store, HybridStore)) else "dense"
+    print(f"[저장소: {store_name or settings.vector_store} · 검색: {mode}]")
     results = retrieve(store, query)
 
     if not results:

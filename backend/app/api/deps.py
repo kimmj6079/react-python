@@ -1,5 +1,6 @@
 # FastAPI 라우터에서 공통으로 쓰는 의존성(dependency)을 모아두는 파일.
 import asyncio
+from functools import partial
 from typing import Annotated
 
 from fastapi import Depends, Header
@@ -112,12 +113,30 @@ async def _retrieve(query: str, principal: Principal) -> list[RetrievedChunk]:
     #   1) 하이브리드로 넉넉히 뽑는다(재현율)  2) 리랭킹으로 순서를 바로잡는다(정밀도)
     # 리랭킹이 꺼져 있으면 1단만 돌고 예전과 완전히 같다 — 켜고 끄는 것이 설정 한 줄이라
     # M6 하네스로 A/B를 돌릴 수 있다.
-    if not settings.rerank_enabled:
-        return await asyncio.to_thread(retrieve, _store, query, principal, TOP_K)
+    # ★ M10: 그라운딩 게이트 ★ 설정이 켜져 있을 때만 임계값을 넘긴다.
+    # None이면 retrieve 안에서 게이트 자체가 없는 것과 같다 - 평가 스크립트가
+    # 게이트 없이 도는 경로와 정확히 같은 코드를 쓴다.
+    max_distance = settings.grounding_max_distance if settings.grounding_enabled else None
 
+    if not settings.rerank_enabled:
+        return await asyncio.to_thread(
+            partial(retrieve, _store, query, principal, TOP_K, max_distance=max_distance)
+        )
+
+    # ★ 게이트는 리랭킹 **앞**이다 ★ 뒤에 두면 근거도 없는 20개 후보에 LLM을
+    # 20번 부른 뒤에 버리게 된다. 거절할 질문일수록 빨리 거절하는 것이 싸다.
     candidates = await asyncio.to_thread(
-        retrieve, _store, query, principal, settings.rerank_candidates
+        partial(
+            retrieve,
+            _store,
+            query,
+            principal,
+            settings.rerank_candidates,
+            max_distance=max_distance,
+        )
     )
+    if not candidates:
+        return []
     return await rerank(query, candidates, TOP_K)
 
 

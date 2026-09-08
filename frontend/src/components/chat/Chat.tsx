@@ -9,6 +9,7 @@ import { generateId } from 'ai'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { chatTransport } from './transport'
+import { Citations } from './Citations'
 import './Chat.css'
 
 
@@ -173,6 +174,10 @@ export function Chat() {
                       <span key={i}>{part.text}</span>
                     ),
                   )}
+                  {/* ★ M10 ★ 같은 parts 배열에서 출처만 골라 카드로 그린다.
+                      본문 아래에 두는 이유: 백엔드가 text-end 뒤에 출처를 보내므로
+                      (실측 순서) 글이 다 그려진 뒤 카드가 붙는다 — 화면이 덜컹거리지 않는다. */}
+                  {message.role === 'assistant' && <Citations parts={message.parts} />}
                 </div>
               </article>
             ))}

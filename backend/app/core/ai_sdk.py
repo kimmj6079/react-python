@@ -5,7 +5,7 @@
 # 토큰을 "누가" 만들었는지(지금은 Anthropic 직접, M2에서는 LangGraph)와 무관하게
 # "어떤 모양으로 주고받는가"만 담당한다 — 그래서 라우터(api/routes/chat.py)와 분리한다.
 import json
-from collections.abc import AsyncIterable, AsyncIterator
+from collections.abc import AsyncIterable, AsyncIterator, Callable
 from typing import Any
 
 from app.schemas.chat import UIMessage
@@ -83,8 +83,47 @@ def sse(payload: dict[str, str]) -> str:
     return f"data: {body}\n\n"
 
 
+def source_part(chunk) -> dict[str, str]:
+    """RetrievedChunk 하나를 AI SDK의 source-document 파트로 바꾼다. (M10)
+
+    ★ 커스텀 data 파트를 새로 만들지 않았다 ★ UIMessage의 파트 종류에
+    'source-document'가 **이미 있다**(실측: ai/dist/index.d.ts). 커스텀 파트를 만들면
+    프론트에서 타입을 우리가 정의해야 하고 useChat이 모르는 파트라 파싱도 우리 몫이
+    된다. 이미 있는 것을 쓰면 둘 다 공짜다.
+
+    실측한 와이어 모양(scripts/capture-source-wire.mjs):
+      data: {"type":"source-document","sourceId":...,"mediaType":...,"title":...,"filename":...}
+
+    ★ title에 heading_path를 넣는 것이 M7의 회수 지점이다 ★
+    "CLAUDE.md"만으로는 850줄 문서의 어디인지 알 수 없다.
+    "CLAUDE.md > 아키텍처"면 사용자가 검증하러 갈 위치가 생긴다.
+    """
+    # ★ 테스트가 잡은 버그 ★ 처음엔 f"{source} > {heading_path}"로 썼는데
+    # "CLAUDE.md > CLAUDE.md > 아키텍처"가 나왔다. 이 저장소 문서들은 h1이 곧
+    # 파일명이라 heading_path가 이미 파일명으로 시작한다(M7의 heading_path_of는
+    # h1부터 이어붙인다). 화면에 그대로 보일 버그였다.
+    #
+    # 파일명은 filename 필드가 따로 나르므로 title은 heading_path만 쓴다 —
+    # SDK가 두 필드를 나눠둔 의도(title=사람이 읽을 이름, filename=파일)에도 맞는다.
+    where = chunk.heading_path or chunk.source
+    return {
+        "type": "source-document",
+        # ★ 모델이 아니라 우리가 만드는 값이다 = 지어낼 수 없다 ★
+        # 프롬프트에 [1][2] 번호를 쓰게 하는 방식은 모델이 없는 번호를 만들어낼 수
+        # 있지만, 이건 "실제로 프롬프트에 넣은 청크"를 그대로 내보내는 것이라
+        # 존재하지 않는 출처가 나올 수가 없다.
+        "sourceId": f"{chunk.source}#{chunk.chunk_index}",
+        "mediaType": "text/markdown",
+        "title": where,
+        "filename": chunk.source,
+    }
+
+
 async def ui_message_stream(
-    deltas: AsyncIterable[str], *, text_id: str = "0"
+    deltas: AsyncIterable[str],
+    sources_fn: Callable[[], list[dict[str, str]]] | None = None,
+    *,
+    text_id: str = "0",
 ) -> AsyncIterator[str]:
     # 이벤트 순서는 1b 캡처(chatbot/README.md)를 그대로 옮긴 것이다. 암기가 아니라 실측.
     #   start → start-step → text-start → text-delta×N → text-end
@@ -109,6 +148,14 @@ async def ui_message_stream(
         yield sse({"type": "text-delta", "id": text_id, "delta": delta})
 
     yield sse({"type": "text-end", "id": text_id})
+
+    # ★ 출처는 text-end 뒤, finish-step 앞에 온다 ★ 실측한 순서 그대로다.
+    # sources_fn을 **함수로** 받는 이유: 어떤 청크를 썼는지는 그래프가 다 돌아야
+    # 알 수 있는데, 이 제너레이터는 그 시점보다 먼저 만들어진다. 값을 받으면
+    # 비어 있고, 함수를 받으면 여기 도달했을 때(=델타를 다 소진한 뒤) 부른다.
+    if sources_fn is not None:
+        for source in sources_fn():
+            yield sse(source)
     yield sse({"type": "finish-step"})
 
     # finishReason은 camelCase다. 파이썬 관례(snake_case)와 어긋나지만 와이어 포맷이

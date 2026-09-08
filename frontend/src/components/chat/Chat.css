@@ -394,3 +394,57 @@
     display: none;
   }
 }
+
+/* ── 인용 카드 (M10) ─────────────────────────────────────────
+   답변 아래에 "무엇을 근거로 답했는지"를 붙인다. 본문보다 작고 흐리게 —
+   읽는 순서가 본문 → 근거이지 그 반대가 아니기 때문이다. */
+.cites {
+  margin-top: 0.75rem;
+  padding-top: 0.6rem;
+  border-top: 1px dashed var(--border, #d4d4d8);
+}
+
+.cites__label {
+  display: block;
+  margin-bottom: 0.35rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--muted, #71717a);
+}
+
+.cites__list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.cites__item {
+  display: flex;
+  align-items: baseline;
+  gap: 0.35rem;
+  max-width: 100%;
+  padding: 0.25rem 0.55rem;
+  border: 1px solid var(--border, #d4d4d8);
+  border-radius: 999px;
+  background: var(--surface, #fafafa);
+  font-size: 0.75rem;
+}
+
+.cites__file {
+  flex: none;
+  font-weight: 600;
+  color: var(--text, #27272a);
+}
+
+/* heading_path는 길어질 수 있다. 줄바꿈 대신 한 줄로 자른다 —
+   카드가 세로로 늘어나면 본문보다 눈에 띄어서 주객이 바뀐다. */
+.cites__where {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted, #71717a);
+}

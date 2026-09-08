@@ -10,8 +10,8 @@
 ## 1. ★ 설계 원칙 하나 — 필터를 옵션이 아니라 필수 인자로 ★
 
 ```python
-search(query_vector, filter=None)      # 언젠가 누가 빼먹고, 그 순간이 유출 사고다
-search(query_vector, principal)        # 빼먹는 것이 TypeError로 즉시 걸린다
+search(query_vector, filter=None)  # 언젠가 누가 빼먹고, 그 순간이 유출 사고다
+search(query_vector, principal)  # 빼먹는 것이 TypeError로 즉시 걸린다
 ```
 
 **RAG 지식이 아니라 그냥 좋은 API 설계인데, 효과가 가장 큰 지점이 여기다.**

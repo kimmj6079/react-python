@@ -8,6 +8,7 @@ from app.api.deps import CurrentPrincipal, Graph
 from app.core.ai_sdk import (
     UI_MESSAGE_STREAM_HEADERS,
     latest_user_text,
+    source_part,
     ui_message_stream,
 )
 from app.core.tracing import get_callbacks, trace_metadata
@@ -106,8 +107,32 @@ async def chat(
             if chunk.text:
                 yield chunk.text
 
+    def sources() -> list[dict[str, str]]:
+        """스트림이 끝난 뒤 "무엇을 근거로 답했나"를 그래프 상태에서 꺼낸다. (M10)
+
+        ★ 함수로 넘기는 이유 ★ ui_message_stream은 응답을 만들기 시작할 때 생성되는데,
+        그 시점에는 아직 검색이 안 끝났다. 값을 넘기면 항상 빈 리스트가 된다 —
+        에러 없이 인용 카드만 안 나오는, 찾기 어려운 종류의 버그다.
+
+        get_state는 체크포인터에서 이번 턴의 최종 State를 읽는다. 2b에서 상태의
+        주인을 서버로 옮겨둔 덕에 "방금 그 턴이 무엇을 봤는지"를 물어볼 곳이 있다.
+        """
+        snapshot = graph.get_state(config)
+        chunks = snapshot.values.get("retrieved") or []
+        # ★ 중복 제거 ★ 같은 문서의 여러 청크가 top-5에 들어오는 일이 흔하다.
+        # 인용 카드에 같은 파일이 세 번 뜨면 사용자에게는 잡음이다.
+        seen: set[str] = set()
+        parts = []
+        for chunk in chunks:
+            part = source_part(chunk)
+            if part["sourceId"] in seen:
+                continue
+            seen.add(part["sourceId"])
+            parts.append(part)
+        return parts
+
     return StreamingResponse(
-        ui_message_stream(text_deltas()),
+        ui_message_stream(text_deltas(), sources),
         media_type="text/event-stream",
         headers=UI_MESSAGE_STREAM_HEADERS,
     )

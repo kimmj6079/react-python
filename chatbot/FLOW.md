@@ -28,28 +28,34 @@ transport.ts
                                                          │
                                                    routes/chat.py   추출 · 가드 · thread_id
                                                          │
-                                    ┌────────────────────▼────────────────────┐
-                                    │  graph.py                                │
-                                    │    START → retrieve → call_model ⇄ tools │
-                                    │              │           │    ▲          │
-                                    │              │           ▼    └ 결과 복귀 │
-                                    │              │          END              │
-                                    │              │                           │
-                                    │    ▲         └─ retrieved_context (State) │
-                                    │    └─ InMemorySaver (복원 · 저장)         │
-                                    └──────┬─────────────────┬────────────────┘
-                                           │                 │
-                                  rag/retriever.py     ChatAnthropic ──▶ Anthropic API
-                                    embed_query()            │
-                                           │                 │
-                                  rag/factory.py       routes/chat.py   AIMessageChunk만 통과
-                                    get_store()              │
-                                     ╱        ╲        core/ai_sdk.py   SSE 포맷
-                            pgvector_store  qdrant_store     │
-                                 │              │            │
-                            Postgres        Qdrant           │
-     ◀──────────── text/event-stream ────────────────────────┘
-useChat 파서 → messages[].parts → 화면 렌더
+                                    ┌──────────────────────▼──────────────────────┐
+                                    │  graph.py                                    │
+                                    │   START → rewrite → retrieve → call_model ⇄ tools│
+                                    │              │         │          │    ▲     │
+                                    │              │         │          ▼    └ 결과 복귀│
+                                    │              │         │         END          │
+                                    │              │         │                      │
+                                    │              │         ├─ retrieved_context(str)│
+                                    │              │         └─ retrieved(청크 목록)  │
+                                    │    ▲         └─ search_query (재작성본)        │
+                                    │    └─ InMemorySaver (복원 · 저장)              │
+                                    └──────┬───────────────────────┬───────────────┘
+                                           │                       │
+                                  rag/retriever.py           ChatAnthropic ──▶ Anthropic API
+                                    ① 임베딩 (dense+sparse)         │
+                                    ② 그라운딩 게이트 (M10)          │
+                                    ③ 하이브리드 검색               │
+                                    ④ 리랭킹 (rag/rerank.py)        │
+                                           │                       │
+                                  rag/factory.py             routes/chat.py  AIMessageChunk만 통과
+                                    get_store()                    │         + sources() (M10)
+                                     ╱        ╲              core/ai_sdk.py  SSE 포맷
+                            pgvector_store  qdrant_store           │         + source_part (M10)
+                                 │              │                  │
+                            Postgres        Qdrant                 │
+     ◀──────────── text/event-stream ──────────────────────────────┘
+useChat 파서 → messages[].parts ─┬─ text          → 본문 렌더
+                                 └─ source-document → Citations.tsx (인용 카드)
 ```
 
 핵심은 **각 층이 옆 층의 관심사를 모른다**는 것이다.
@@ -93,6 +99,13 @@ POST /chat ── config = { configurable, callbacks, metadata } ──▶ graph
 | **3-2b** | 그래프 앞에 **`retrieve` 노드**. 매 턴 무조건 검색해 시스템 프롬프트로만 잠깐 쓴다 |
 | **3-3/3-4** | 저장소가 **계약 하나 · 구현 둘**(pgvector/Qdrant). `deps.py` 한 줄로 갈아끼운다 |
 | **M4** | 그래프 전체가 **Langfuse로 트레이싱**된다. `chat.py`의 `config`에 두 키를 더한 것이 전부 |
+| **M6** | 흐름은 안 바뀌고 **평가 하네스**(`evals/`)가 옆에 생겼다. 이후 모든 변경의 판정 기준 |
+| **M7** | 청킹이 "600자 자르기"에서 **구조 인식**으로. `heading_path`가 청크마다 붙는다 |
+| **M8** | 검색이 **2단**이 됐다: 하이브리드(dense+BM25 RRF)로 넓게 → LLM 리랭킹으로 좁게 |
+| **M9** | 그래프 맨 앞에 **`rewrite` 노드**. "그거 프로덕션에서는?"을 홀로 서는 질문으로 바꾼다 |
+| **M10** | 근거를 **화면에 낸다**(인용 카드) + 근거가 약하면 컨텍스트를 비운다(그라운딩 게이트) |
+| **M11** | 문서 인입이 **API**가 됐다. 업로드 · 멱등 업서트 · 백그라운드 잡 |
+| **M12** | 검색에 **권한 필터**가 필수 인자로 들어간다. `Principal`이 요청부터 저장소까지 관통 |
 
 ---
 
@@ -102,30 +115,36 @@ POST /chat ── config = { configurable, callbacks, metadata } ──▶ graph
 
 | 파일 | 한 줄 역할 | 핵심 심볼 | 이 파일을 고칠 때 |
 |---|---|---|---|
-| [Chat.tsx](../frontend/src/components/chat/Chat.tsx) | 화면 · 입력 · **세션 id 소유** | `chatId`:38, `useChat`:43, `submit`:74 | UI/UX가 바뀔 때 |
+| [Chat.tsx](../frontend/src/components/chat/Chat.tsx) | 화면 · 입력 · **세션 id 소유** | `useChat`:44, `submit`:75, `<Citations>`:180 | UI/UX가 바뀔 때 |
+| [Citations.tsx](../frontend/src/components/chat/Citations.tsx) | **인용 카드** (M10) | `Citations`:17 | 출처를 어떻게 보여줄지 |
 | [transport.ts](../frontend/src/components/chat/transport.ts) | **무엇을 보낼지**(와이어 계약) | `prepareChatRequest`:18, `chatTransport`:44 | 요청 본문이 바뀔 때 |
 | [client.ts](../frontend/src/api/client.ts) | 백엔드 **주소**만 관리 | `CHAT_API_URL`:12 | 엔드포인트가 늘 때 |
 | [main.py](../backend/app/main.py) | CORS + 라우터 등록 | `add_middleware`:15, `include_router`:26 | 라우터 · 허용 오리진 추가 |
 | [schemas/chat.py](../backend/app/schemas/chat.py) | 요청 본문의 **모양 계약** | `UIMessage`:12, `ChatRequest`:26 | 프론트 요청 포맷이 바뀔 때 |
-| [api/deps.py](../backend/app/api/deps.py) | 무거운 객체 **1회 생성 + 주입** | `_model`:33, `_checkpointer`:58, `_store`:68, `_retrieve`:71, `get_graph`:89 | 모델 · 저장소 교체 지점 |
-| [api/routes/chat.py](../backend/app/api/routes/chat.py) | HTTP ↔ 그래프 **접착** + **스트림 필터** | `chat`:28, 가드:37, `config`:64, 필터:96 | 무엇을 화면에 내보낼지 바뀔 때 |
-| [graph.py](../backend/app/graph.py) | 대화 **흐름** 정의 | `State`:57, `build_graph`:87, `retrieve`:124, `call_model`:152 | 노드 · 엣지가 늘 때 |
+| [api/deps.py](../backend/app/api/deps.py) | 무거운 객체 **1회 생성 + 주입** + **검색 전략 조립** | `get_principal`:27, `_model`:62, `_checkpointer`:87, `_store`:97, `_retrieve`:100, `_rewrite`:143, `get_graph`:160 | 모델 · 저장소 교체, 검색 단계 추가 |
+| [api/routes/chat.py](../backend/app/api/routes/chat.py) | HTTP ↔ 그래프 **접착** + **스트림 필터** | `chat`:29, `text_deltas`:76, `sources`:110 | 무엇을 화면에 내보낼지 바뀔 때 |
+| [graph.py](../backend/app/graph.py) | 대화 **흐름** 정의 | `SYSTEM_PROMPT_TEMPLATE`:53, `NO_CONTEXT_PROMPT`:81, `State`:100, `build_graph`:148, `rewrite`:186, `retrieve`:221, `call_model`:261 | 노드 · 엣지가 늘 때 |
 | [tools.py](../backend/app/tools.py) | 모델이 쓸 수 있는 **능력** | `get_current_time`:14, `TOOLS`:34 | 도구를 추가·수정할 때 |
-| [core/ai_sdk.py](../backend/app/core/ai_sdk.py) | AI SDK **와이어 포맷** | `latest_user_text`:43, `sse`:75, `ui_message_stream`:86 | `ai` 패키지 버전이 바뀔 때 |
-| [core/config.py](../backend/app/core/config.py) | 설정 · 시크릿 단일 소스 | `anthropic_model`, `vector_store`, `langfuse_enabled` | 모델 교체 · 새 시크릿 |
+| [core/ai_sdk.py](../backend/app/core/ai_sdk.py) | AI SDK **와이어 포맷** | `latest_user_text`:43, `sse`:75, `source_part`:86, `ui_message_stream`:122 | `ai` 패키지 버전이 바뀔 때 |
+| [core/config.py](../backend/app/core/config.py) | 설정 · 시크릿 단일 소스 | `vector_store`, `hybrid_search`, `rerank_enabled`, `query_rewrite_enabled`, `grounding_max_distance`, `langfuse_enabled` | 모델 교체 · 기능 on/off · 새 시크릿 |
 | [core/tracing.py](../backend/app/core/tracing.py) | **관측성** 배선 (M4) | `get_langfuse_client`:32, `get_callbacks`:49, `trace_metadata`:72 | 트레이싱 대상 · 꼬리표가 바뀔 때 |
 
 ### RAG — `app/rag/` (M3에서 생긴 층)
 
 | 파일 | 한 줄 역할 | 핵심 심볼 | 무엇을 아는가 |
 |---|---|---|---|
-| [rag/base.py](../backend/app/rag/base.py) | **계약**. import가 없다 | `EMBEDDING_DIM`:24, `TOP_K`:31, `RetrievedChunk`:35, `VectorStore`:52 | 아무것도 |
-| [rag/embedding.py](../backend/app/rag/embedding.py) | 임베딩 모델 단일 소스 | `MODEL_NAME`:18, `embed_passages`:36, `embed_query`:45 | fastembed |
+| [rag/base.py](../backend/app/rag/base.py) | **계약**. import가 없다 | `EMBEDDING_DIM`:35, `TOP_K`:42, `HYBRID_CANDIDATES`:48, `Chunk`:52, `RetrievedChunk`:79, `VectorStore`:110, `HybridStore`:170 | 아무것도 |
+| [rag/access.py](../backend/app/rag/access.py) | **누가 요청했나** (M12) | `PUBLIC_ROLE`:18, `Principal`:25 | 권한 모델이 바뀔 때 |
+| [rag/embedding.py](../backend/app/rag/embedding.py) | 임베딩 모델 단일 소스 (dense + sparse) | `MODEL_NAME`:18, `embed_passages`:36, `embed_query`:45, `SPARSE_MODEL_NAME`:72, `embed_sparse_query`:94 | fastembed |
+| [rag/chunking.py](../backend/app/rag/chunking.py) | **구조 인식 청킹** (M7) | `MAX_TOKENS`:41, `MIN_TOKENS`:51, `token_length`:89, `heading_path_of`:94, `split_markdown`:131 | 청킹 전략이 바뀔 때 |
 | [rag/factory.py](../backend/app/rag/factory.py) | **어느 저장소인가**를 정하는 유일한 곳 | `_BUILDERS`:18, `get_store`:24, `pop_store_arg`:38 | 구현 둘 다 |
-| [rag/pgvector_store.py](../backend/app/rag/pgvector_store.py) | Postgres 구현 | `upsert_document`:27, `search`:47 | SQLAlchemy |
-| [rag/qdrant_store.py](../backend/app/rag/qdrant_store.py) | Qdrant 구현 | `TIMEOUT_SECONDS`:25, `_ensure_collection`:48, `_point_id`:68, `search`:131 | qdrant-client |
-| [rag/retriever.py](../backend/app/rag/retriever.py) | 질문 → 임베딩 → store (짝 규칙) | `retrieve`:19 | 계약만 |
-| [rag/ingest.py](../backend/app/rag/ingest.py) | 파일 → 청킹 → 임베딩 → store | `chunk_text`:31, `insert_file`:65 | 계약만 |
+| [rag/pgvector_store.py](../backend/app/rag/pgvector_store.py) | Postgres 구현 | `upsert_document`:28, `search`:71 | SQLAlchemy |
+| [rag/qdrant_store.py](../backend/app/rag/qdrant_store.py) | Qdrant 구현 (+ 하이브리드) | `_ensure_collection`:68, `_create_access_indexes`:106, `upsert_document`:149, `_access_filter`:232, `search`:251, `search_hybrid`:272 | qdrant-client |
+| [rag/retriever.py](../backend/app/rag/retriever.py) | 임베딩 → **게이트** → 검색 (짝 규칙) | `retrieve`:23 | 계약만 |
+| [rag/rerank.py](../backend/app/rag/rerank.py) | LLM으로 **다시 줄 세우기** (M8) | `Relevance`:21, `_score`:49, `rerank`:71 | 정밀도를 손볼 때 |
+| [rag/rewrite.py](../backend/app/rag/rewrite.py) | 대화형 질문 → **홀로 서는 질문** (M9) | `Rewritten`:24, `format_history`:50, `rewrite_query`:55 | 대화 맥락 처리 |
+| [rag/ingest.py](../backend/app/rag/ingest.py) | 파일 → 청킹 → 임베딩 → store | `REPO_ROOT`:25, `ingest_text`:42, `insert_file`:129 | 계약만 |
+| [rag/documents.py](../backend/app/rag/documents.py) | 업로드 **파싱 · 멱등 업서트** (M11) | `ALLOWED_SUFFIXES`:23, `parse`:26, `content_hash`:74, `run_ingest`:78, `upsert_record`:113 | 새 파일 형식 |
 
 **저장소를 아는 파일은 정확히 셋이다** — `pgvector_store.py`(Postgres를 안다),
 `qdrant_store.py`(Qdrant를 안다), `factory.py`(둘을 안다). 나머지 전부는 계약만 본다.
@@ -163,8 +182,15 @@ POST /chat ── config = { configurable, callbacks, metadata } ──▶ graph
 `chat.py:31`의 추출과 `chat.py:37`의 가드가 **일부러 10번 앞에** 있는 이유가 이것이다.
 async generator는 lazy해서 안에 넣으면 200이 나간 뒤에야 실행된다.
 
-**`graph.py:147`의 `except Exception`도 같은 이유로 존재한다** — 검색은 10번 뒤에 일어나므로,
+**`graph.py:243`의 `except Exception`도 같은 이유로 존재한다** — 검색은 10번 뒤에 일어나므로,
 DB가 죽었을 때 예외를 그대로 올리면 정확히 저 진단 불가능한 실패가 된다.
+`graph.py:207`(재작성 실패)과 `rerank.py`의 폴백도 전부 같은 판단이다.
+
+> ★ 이 관용구의 대가를 M9~M10에서 실제로 치렀다 ★ Anthropic 크레딧이 소진됐을 때
+> 재작성도 리랭킹도 **조용히 폴백**해서 앱은 200을 계속 돌려줬다. 챗봇이 안 죽은 것은
+> 설계대로였지만, **품질이 조용히 떨어진 것을 로그를 볼 때까지 몰랐다.**
+> 실무라면 여기에 메트릭이 붙는다 — "폴백이 몇 % 발생했나"를 대시보드에서 보고
+> 임계치를 넘으면 알람이 울려야 한다. **조용한 폴백은 조용한 장애다.**
 
 ---
 
@@ -176,43 +202,65 @@ DB가 죽었을 때 예외를 그대로 올리면 정확히 저 진단 불가능
 
 | # | 위치 | 하는 일 |
 |---|---|---|
-| 11 | `ai_sdk.py:95~101` | `start` → `start-step` → `text-start` 3개를 먼저 내보냄 |
-| 12 | `chat.py:86` `graph.astream(input, config, stream_mode="messages")` | 그래프 실행 시작 |
+| 11 | `ai_sdk.py:131~140` | `start` → `start-step` → `text-start` 3개를 먼저 내보냄 |
+| 12 | `chat.py:89` `graph.astream(input, config, stream_mode="messages")` | 그래프 실행 시작 |
 | 13 | **`InMemorySaver`** | `thread_id`로 **이전 대화 복원** |
-| 14 | `graph.py:75` `add_messages` 리듀서 | 복원된 히스토리 **뒤에** 새 메시지를 이어붙임 |
-| 15 | `graph.py:124` **`retrieve` 노드** | `state["messages"][-1].content` = 이번 질문 |
-| 16 | `graph.py:146` `asyncio.to_thread(retrieve_fn, query)` | **블로킹 검색을 이벤트 루프 밖으로** |
-| 17 | `deps.py:71` `_retrieve` → `retriever.py:19` `retrieve()` | 임베딩(`embed_query`) + `store.search()` |
-| 18 | `pgvector_store.py:47` **또는** `qdrant_store.py:131` | 실제 벡터 검색 → `list[RetrievedChunk]` |
-| 19 | `graph.py:47` `_format_context` | `[출처: X]\n내용` 으로 이어붙임 (**비면 빈 문자열**) |
-| 20 | `graph.py:150` | `{"retrieved_context": ...}` 반환 — **`messages`에는 안 넣는다** |
-| 21 | `graph.py:163~168` `call_model` | 컨텍스트가 있으면 `SystemMessage`를 **맨 앞에 잠깐** 붙임 |
-| 22 | `graph.py:122` `bind_tools` 효과 | 요청에 **도구 설명서**(`tools` 파라미터)가 함께 실려 나감 |
-| 23 | `ChatAnthropic` (`streaming=True`) | Anthropic SSE 수신 → 콜백으로 토큰 방출 |
+| 14 | `graph.py:118` `add_messages` 리듀서 | 복원된 히스토리 **뒤에** 새 메시지를 이어붙임 |
+| 15 | `graph.py:186` **`rewrite` 노드** (M9) | 히스토리가 있으면 LLM으로 질문을 홀로 서게 다시 쓴다. **첫 턴이면 LLM을 아예 안 부른다** |
+| 16 | `graph.py:216` | `{"search_query": ...}` — 원문은 `messages`에 그대로 둔다 (**두 값이 다른 일을 한다**) |
+| 17 | `graph.py:221` **`retrieve` 노드** | `state["search_query"]`(없으면 원문)가 검색어 |
+| 18 | `graph.py:236~239` `iscoroutinefunction` 분기 | 리랭킹이 켜지면 `retrieve_fn`이 코루틴이다 — async면 `await`, 동기면 `to_thread` |
+| 19 | `deps.py:100` `_retrieve` | **검색 전략을 조립하는 곳.** 게이트 · 후보 수 · 리랭킹 on/off |
+| 20 | `retriever.py:23` `retrieve()` ① | `embed_query` — 임베딩은 **여기서 한 번만** |
+| 21 | `retriever.py` **그라운딩 게이트** ② (M10) | `store.search(top_k=1)`의 **dense 거리**가 `grounding_max_distance`(0.18)보다 멀면 **`[]` 반환** |
+| 22 | `qdrant_store.py:272` `search_hybrid` ③ (M8) | dense + BM25를 각각 뽑아 **RRF로 융합**. `_access_filter`(M12)가 두 prefetch **양쪽에** 걸린다 |
+| 23 | `rerank.py:71` `rerank()` ④ (M8-b) | 후보 20개를 LLM이 0~10점으로 **병렬** 채점해 다시 줄 세운다 |
+| 24 | `graph.py:90` `_format_context` | `[출처: X]\n내용` 으로 이어붙임 (**비면 빈 문자열**) |
+| 25 | `graph.py:259` | `{"retrieved_context": ..., "retrieved": chunks}` — **`messages`에는 안 넣는다.** `retrieved`는 M10 인용 카드의 재료 |
+| 26 | `graph.py:268~275` `call_model` | 컨텍스트가 있으면 `SYSTEM_PROMPT_TEMPLATE`(`<documents>`로 감쌈, M12), **없으면 `NO_CONTEXT_PROMPT`**(M10)를 맨 앞에 잠깐 붙임 |
+| 27 | `graph.py:184` `bind_tools` 효과 | 요청에 **도구 설명서**(`tools` 파라미터)가 함께 실려 나감 |
+| 28 | `ChatAnthropic` (`streaming=True`) | Anthropic SSE 수신 → 콜백으로 토큰 방출 |
+
+**19~23번이 M8~M12에서 자란 부분이다.** 흐름도에서는 노드 하나(`retrieve`)인데 그 안이
+4단계다 — 그리고 **`graph.py`는 그중 아무것도 모른다.** `retrieve_fn` 하나만 안다.
 
 ### 경로 A — 모델이 그냥 답한 경우
 
 | # | 위치 | 하는 일 |
 |---|---|---|
-| 24 | `graph.py:199` `tools_condition` | `tool_calls`가 비었다 → **`"__end__"`** |
-| 25 | `chat.py:96` 필터 | `AIMessageChunk`이므로 통과 |
-| 26 | `chat.py:102` `yield chunk.text` | 텍스트만 추출 |
-| 27 | `ai_sdk.py:109` | `data: {"type":"text-delta",...}\n\n` |
+| 29 | `graph.py:314` `tools_condition` | `tool_calls`가 비었다 → **`"__end__"`** |
+| 30 | `chat.py:102` 필터 | `AIMessageChunk`이므로 통과 |
+| 31 | `chat.py:108` `yield chunk.text` | 텍스트만 추출 |
+| 32 | `ai_sdk.py:148` | `data: {"type":"text-delta",...}\n\n` |
+| 33 | `ai_sdk.py` `text-end` 직후 (M10) | **`sources_fn()` 호출** |
+| 34 | `chat.py:110` `sources()` | `graph.get_state(config).values["retrieved"]`에서 **이번 턴이 실제로 본 청크**를 꺼내 `sourceId`로 중복 제거 |
+| 35 | `ai_sdk.py:86` `source_part` | `{"type":"source-document","sourceId":...,"title":heading_path,...}` |
+| 36 | `Citations.tsx:18` | `message.parts`에서 `source-document`만 골라 카드로 렌더 |
+
+**33~34번의 순서가 M10 설계의 핵심이다.** 인용 데이터는 그래프가 다 돌아야 알 수 있는데
+`ui_message_stream`은 그보다 **먼저** 만들어진다. 그래서 값이 아니라 **함수**(`sources_fn`)를
+넘긴다 — 값을 넘기면 항상 빈 리스트가 되고, 그러면 **에러 없이 인용 카드만 안 나온다.**
 
 ### 경로 B — 모델이 도구를 부른 경우 ("서울 지금 몇 시야?")
 
 | # | 위치 | 하는 일 |
 |---|---|---|
-| 24 | Anthropic | 텍스트 대신 **`tool_use` 블록** → 청크의 `.text`가 전부 `''` |
-| 25 | `graph.py:199` `tools_condition` | `tool_calls`가 있다 → **`"tools"`** |
-| 26 | `graph.py:185` `ToolNode` | `tools.py:14`의 **진짜 함수를 실행** |
-| 27 | `chat.py:96` 필터 | **`ToolMessage`라서 `continue`** ← 여기서 막지 않으면 화면에 샌다 |
-| 28 | `graph.py:206` `add_edge("tools","call_model")` | **사이클** — 결과를 들고 모델로 복귀 |
-| 29 | `graph.py:152` `call_model` (2회차) | 도구 결과가 포함된 히스토리로 다시 호출 |
-| 30 | `chat.py:102` | 이번엔 진짜 텍스트가 나온다 → `yield` |
+| 29 | Anthropic | 텍스트 대신 **`tool_use` 블록** → 청크의 `.text`가 전부 `''` |
+| 30 | `graph.py:314` `tools_condition` | `tool_calls`가 있다 → **`"tools"`** |
+| 31 | `graph.py:295` `ToolNode` | `tools.py`의 **진짜 함수를 실행** |
+| 32 | `chat.py:102` 필터 | **`ToolMessage`라서 `continue`** ← 여기서 막지 않으면 화면에 샌다 |
+| 33 | `graph.py:321` `add_edge("tools","call_model")` | **사이클** — 결과를 들고 모델로 복귀 |
+| 34 | `graph.py:261` `call_model` (2회차) | 도구 결과가 포함된 히스토리로 다시 호출 |
+| 35 | `chat.py:108` | 이번엔 진짜 텍스트가 나온다 → `yield` |
 
-**사이클은 `retrieve`를 다시 거치지 않는다** (`graph.py:206`이 `call_model`로 직행).
-검색은 "이번 턴 사용자의 질문"에 대한 것이라 **턴당 한 번**이면 된다.
+**사이클은 `rewrite`도 `retrieve`도 다시 거치지 않는다** (`graph.py:321`이 `call_model`로 직행).
+재작성과 검색은 "이번 턴 사용자의 질문"에 대한 것이라 **턴당 한 번씩**이면 된다.
+
+> ★ M10에서 이 경로가 한 번 죽을 뻔했다 ★ 그라운딩을 "검색 점수가 낮으면 고정 거절문을
+> 내고 END로 간다"는 **조기 반환 노드**로 만들 계획이었다. 그렇게 했으면 "서울 지금 몇 시야?"는
+> 검색 결과가 당연히 비므로 **도구를 부르기도 전에 거절**된다 — 경로 B가 통째로 죽는다.
+> 그래서 흐름을 끊는 대신 `NO_CONTEXT_PROMPT`로 **판단을 모델에게 넘겼다.**
+> 그래프에 분기를 넣을 때는 "이 분기가 기존 경로 중 무엇을 막는가"를 먼저 봐야 한다.
 
 ### 공통 — 마무리
 

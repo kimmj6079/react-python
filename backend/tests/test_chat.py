@@ -221,14 +221,23 @@ def _msg(msg_id, role, text):
     return {"id": msg_id, "role": role, "parts": [{"type": "text", "text": text}]}
 
 
-def _seen(turn=0):
+def _seen(turn=0, *, system=False):
     """가짜 모델이 turn번째 호출에서 받은 메시지를 (타입, 내용) 쌍으로 편다.
 
     LangChain 메시지 객체를 그대로 비교하면 실패 메시지가 읽기 어려워서,
     확인하고 싶은 두 가지(역할·내용)만 남긴다.
     2b부터 한 테스트가 여러 턴을 보내므로 turn 인덱스를 받는다.
+
+    ★ M10에서 system=False가 생겼다 ★ 이제 call_model은 **항상** 시스템 메시지를
+    맨 앞에 붙인다(문맥이 있으면 SYSTEM_PROMPT_TEMPLATE, 없으면 NO_CONTEXT_PROMPT).
+    여기 대부분의 테스트가 묻는 것은 "사용자 메시지가 어떻게 변환돼 모델에 닿는가"라
+    시스템 메시지는 잡음이다. 그래서 기본값은 빼고 보고, 시스템 프롬프트 자체를
+    검사하는 테스트만 system=True로 켠다.
     """
-    return [(type(m).__name__, m.content) for m in CALLS[turn]]
+    messages = CALLS[turn]
+    if not system:
+        messages = [m for m in messages if type(m).__name__ != "SystemMessage"]
+    return [(type(m).__name__, m.content) for m in messages]
 
 
 def _state(graph, chat_id="test-chat"):
@@ -253,6 +262,12 @@ class ConfigCapturingGraph:
     def __init__(self, inner):
         self._inner = inner
         self.configs = []
+
+    def get_state(self, config):
+        # ★ M10에서 늘었다 ★ chat.py가 스트림이 끝난 뒤 "무엇을 근거로 답했나"를
+        # 물어보므로 대역도 그 질문에 답할 수 있어야 한다. 위임만 한다 —
+        # 이 대역의 관심사는 config를 붙잡는 것 하나뿐이고, 나머지는 진짜가 한다.
+        return self._inner.get_state(config)
 
     def astream(self, *args, **kwargs):
         # chat.py는 config를 2번째 "위치" 인자로 넘긴다(실측한 시그니처).
@@ -548,10 +563,36 @@ def test_retrieved_context_reaches_the_model_as_a_system_message(client, rag_gra
     # 맨 앞에 오고, 그 안에 청크 내용이 들어 있어야 한다.
     client.post("/api/v1/chat", json=_wire(_msg("m1", "user", "테스트 질문")))
 
-    kind, content = _seen()[0]
+    # 이 테스트가 보려는 것이 시스템 메시지 자체이므로 system=True로 켠다.
+    kind, content = _seen(system=True)[0]
     assert kind == "SystemMessage"
     assert "테스트 발췌 내용" in content
     assert "test.md" in content
+
+
+def test_no_context_gets_an_explicit_dont_guess_instruction(client, fake_graph):
+    """★ M10의 핵심 ★ 근거를 못 찾았을 때 침묵하지 않는다.
+
+    M9까지는 검색 결과가 비면 시스템 프롬프트를 아예 안 붙였다 = 모델에게는
+    "평소대로 하라"는 뜻이었고, 그래서 사전지식으로 그럴듯한 답을 지어냈다.
+    이제는 "찾지 못했다, 추측하지 마라"를 명시적으로 넣는다.
+    """
+    client.post("/api/v1/chat", json=_wire(_msg("m1", "user", "질문")))
+
+    kind, content = _seen(system=True)[0]
+    assert kind == "SystemMessage"
+    assert "찾지 못했다" in content
+    assert "추측해서 답하지 말고" in content
+    # 도구·인사까지 막으면 안 된다 — 하드 거절 대신 프롬프트로 간 이유가 이것이다.
+    assert "문서가 필요 없는 질문" in content
+
+
+def test_no_context_prompt_also_stays_out_of_history(client, fake_graph):
+    # 위 프롬프트도 체크포인터에는 안 쌓여야 한다. 매 턴 붙는 값이라
+    # 히스토리에 들어가면 대화가 길어질수록 같은 문장이 반복 누적된다.
+    client.post("/api/v1/chat", json=_wire(_msg("m1", "user", "질문")))
+
+    assert all(kind != "SystemMessage" for kind, _ in _state(fake_graph))
 
 
 def test_retrieved_context_does_not_leak_into_checkpointed_history(client, rag_graph):
@@ -586,3 +627,94 @@ def test_retrieve_failure_degrades_gracefully(client, failing_rag_graph):
     assert response.text == EXPECTED_SSE
     # 컨텍스트가 없으니 시스템 메시지도 없어야 한다 — 빈 리스트로 대체됐다는 증거.
     assert _seen()[0][0] == "HumanMessage"
+
+
+# ─────────────────── M10: 인용(출처) 파트 ───────────────────
+
+CITED_CHUNKS = [
+    RetrievedChunk(
+        source="CLAUDE.md",
+        chunk_index=17,
+        content="VITE_API_URL은 빌드 타임 값이다",
+        distance=0.1,
+        heading_path="CLAUDE.md > 아키텍처",
+    ),
+    # 같은 문서의 다른 청크 — 인용 카드에서는 하나로 합쳐지지 않고 각각 나온다
+    # (대목이 다르므로). sourceId가 달라서 중복 제거에 안 걸린다.
+    RetrievedChunk(
+        source="CLAUDE.md",
+        chunk_index=18,
+        content="k8s configmap에 넣어도 효과가 없다",
+        distance=0.2,
+        heading_path="CLAUDE.md > 아키텍처",
+    ),
+]
+
+
+@pytest.fixture
+def citing_graph():
+    CALLS.clear()
+    graph = build_graph(
+        FakeChatModel(), retrieve_fn=lambda *_: CITED_CHUNKS, checkpointer=InMemorySaver()
+    )
+    app.dependency_overrides[get_graph] = lambda: graph
+    yield graph
+    del app.dependency_overrides[get_graph]
+
+
+def _source_parts(body: str) -> list[dict]:
+    import json
+
+    return [
+        json.loads(line[6:])
+        for line in body.splitlines()
+        if line.startswith("data: ") and '"source-document"' in line
+    ]
+
+
+def test_sources_are_streamed_as_source_document_parts(client, citing_graph):
+    """★ 실측한 와이어 포맷 그대로 나가는지 ★
+
+    scripts/capture-source-wire.mjs로 캡처한 모양:
+      data: {"type":"source-document","sourceId":...,"title":...,"filename":...}
+    커스텀 파트를 만들지 않고 SDK가 이미 아는 'source-document'를 쓴 덕에,
+    프론트는 useChat이 파싱해준 message.parts에서 골라 쓰기만 하면 된다.
+    """
+    body = client.post("/api/v1/chat", json=_wire(_msg("m1", "user", "질문"))).text
+    parts = _source_parts(body)
+
+    assert [p["sourceId"] for p in parts] == ["CLAUDE.md#17", "CLAUDE.md#18"]
+    # ★ M7의 heading_path가 여기서 회수된다 ★ "CLAUDE.md"만으로는 850줄 문서의
+    # 어디인지 알 수 없다. 경로가 있어야 사용자가 검증하러 갈 위치가 생긴다.
+    assert parts[0]["title"] == "CLAUDE.md > 아키텍처"
+    assert parts[0]["filename"] == "CLAUDE.md"
+
+
+def test_sources_come_after_the_text_and_before_finish(client, citing_graph):
+    # 실측한 순서다. 프론트가 텍스트를 다 그린 뒤 카드를 붙이는 것과 맞아야
+    # 화면이 덜컹거리지 않는다.
+    body = client.post("/api/v1/chat", json=_wire(_msg("m1", "user", "질문"))).text
+    assert body.index('"text-end"') < body.index('"source-document"')
+    assert body.index('"source-document"') < body.index('"finish-step"')
+
+
+def test_no_sources_means_no_source_parts(client, fake_graph):
+    # ★ 검색 결과가 없으면 파트도 없어야 한다 ★ 빈 카드가 뜨면 사용자는
+    # "출처가 있는데 안 보이나?"로 읽는다. 없는 것과 비어 있는 것은 다르다.
+    body = client.post("/api/v1/chat", json=_wire(_msg("m1", "user", "질문"))).text
+    assert _source_parts(body) == []
+    # 기존 와이어 포맷은 그대로여야 한다 — 출처가 없을 때는 M1 캡처와 완전히 같다.
+    assert body == EXPECTED_SSE
+
+
+def test_duplicate_sources_are_collapsed(client):
+    """같은 청크가 두 번 오면 카드도 두 번 뜬다 — 그건 잡음이다."""
+    CALLS.clear()
+    same = [CITED_CHUNKS[0], CITED_CHUNKS[0]]
+    graph = build_graph(FakeChatModel(), retrieve_fn=lambda *_: same, checkpointer=InMemorySaver())
+    app.dependency_overrides[get_graph] = lambda: graph
+    try:
+        body = client.post("/api/v1/chat", json=_wire(_msg("m1", "user", "질문"))).text
+        assert len(_source_parts(body)) == 1
+    finally:
+        del app.dependency_overrides[get_graph]

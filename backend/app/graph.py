@@ -64,6 +64,29 @@ SYSTEM_PROMPT_TEMPLATE = """다음 <documents> 태그 안은 사용자의 질문
 - 관련이 없거나 답하기에 근거가 부족하면 억지로 끼워 맞추지 말고 모른다고 답한다."""
 
 
+# ★ M10: 근거를 못 찾았을 때의 프롬프트 ★
+#
+# M9까지는 검색 결과가 비면 시스템 프롬프트를 **아예 안 붙였다.** 그러면 모델은
+# 평범한 챗봇이 되어 자기 사전지식으로 답한다 - 사내 문서 챗봇에서 이건
+# "모른다"가 아니라 **그럴듯한 거짓말**로 나온다. M10이 막으려는 것이 정확히 이것이다.
+#
+# ★ 그런데 노드를 끊어서 하드 거절하지 않은 이유가 있다 ★
+# retrieve → (근거 없음) → 고정 거절문 → END 로 만들면 LLM 호출 한 번이 통째로
+# 절약된다. 매력적이지만 이 그래프에는 **도구가 붙어 있다**(M2). "3 더하기 5"나
+# "안녕"은 검색 결과가 당연히 비는데, 하드 거절은 그걸 전부 "모른다"로 만들어
+# 계산기도 인사도 죽는다. 그래서 거절 여부의 판단을 모델에게 넘기고, 대신
+# **판단 기준을 프롬프트로 못박는다.**
+# (문서 Q&A 전용이고 도구가 없는 서비스라면 하드 거절이 더 낫다 - 지연도 비용도
+#  줄고 거절 문구가 결정적이다. 우리 그래프의 모양이 그 선택을 막은 것뿐이다.)
+NO_CONTEXT_PROMPT = """참고할 문서를 찾지 못했다.
+
+규칙:
+- 이 프로젝트/문서의 내용을 묻는 질문이면, **추측해서 답하지 말고** 관련 문서를
+  찾지 못했다고 밝힌다. 아는 것 같아도 이 저장소의 문서로 확인된 것이 아니다.
+- 문서가 필요 없는 질문(인사, 계산, 일반 상식, 도구로 처리할 수 있는 것)이면
+  평소대로 답한다."""
+
+
 def _format_context(chunks: list[RetrievedChunk]) -> str:
     # 검색 결과가 없으면 빈 문자열을 돌려주고, call_model은 그걸 보고 시스템
     # 프롬프트 자체를 안 붙인다. "컨텍스트 없음"과 "관련 없는 컨텍스트"를
@@ -102,6 +125,12 @@ class State(TypedDict):
     # 시스템 프롬프트 재료로만 쓰고 messages에는 넣지 않으므로, 대화
     # 히스토리 자체는 검색 결과로 오염되지 않는다.
     retrieved_context: str
+
+    # ★ M10 ★ 이번 턴에 실제로 프롬프트에 들어간 청크들. 인용 카드의 재료다.
+    # retrieved_context(문자열)와 따로 두는 이유: 문자열은 모델에게 줄 형태이고,
+    # 이건 화면에 그릴 구조다. 문자열에서 다시 파싱하는 것은 만들었다가 도로
+    # 부수는 짓이다.
+    retrieved: list
 
     # ★ M12 ★ 이 턴의 요청자. 검색 필터에 그대로 쓰인다.
     # State에 넣는 이유: retrieve 노드는 HTTP 요청을 모르므로, 라우터가 config가
@@ -227,7 +256,7 @@ def build_graph(
         except Exception:
             logger.exception("retrieve_fn 실패 - 컨텍스트 없이 진행한다")
             chunks = []
-        return {"retrieved_context": _format_context(chunks)}
+        return {"retrieved_context": _format_context(chunks), "retrieved": chunks}
 
     async def call_model(state: State) -> dict[str, Any]:
         # 2a·2b에서 한 글자도 안 바뀌었다(bind된 모델을 쓰는 것만 빼면).
@@ -241,11 +270,11 @@ def build_graph(
         # 에는 시스템 메시지가 한 번도 안 쌓인다.
         messages = state["messages"]
         context = state.get("retrieved_context")
-        if context:
-            messages = [
-                SystemMessage(content=SYSTEM_PROMPT_TEMPLATE.format(context=context)),
-                *messages,
-            ]
+        # ★ M10에서 else가 생겼다 ★ 예전에는 context가 비면 아무 프롬프트도 안 붙어서
+        # 모델이 자기 사전지식으로 답했다. 이제는 "근거를 못 찾았다"는 사실 자체를
+        # 명시적으로 알린다 - 침묵은 모델에게 "평소대로 하라"는 뜻이었다.
+        prompt = SYSTEM_PROMPT_TEMPLATE.format(context=context) if context else NO_CONTEXT_PROMPT
+        messages = [SystemMessage(content=prompt), *messages]
 
         response = await model_with_tools.ainvoke(messages)
         return {"messages": [response]}

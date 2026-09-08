@@ -26,7 +26,7 @@ from app.core.config import settings
 from app.rag.access import Principal
 from app.rag.base import HybridStore, RetrievedChunk
 from app.rag.chunking import MAX_TOKENS, OVERLAP_TOKENS
-from app.rag.embedding import MODEL_NAME
+from app.rag.embedding import MODEL_NAME, embed_query
 from app.rag.factory import get_store
 from app.rag.ingest import REPO_ROOT
 from app.rag.rerank import rerank
@@ -189,11 +189,24 @@ def main() -> None:
         help="하이브리드를 끄고 dense-only로 (M8 A/B용)",
     )
     parser.add_argument(
+        "--gate",
+        action="store_true",
+        help=(
+            "★ M10 ★ 그라운딩 게이트를 켠다. 근거가 약하면 검색 결과를 통째로 비운다 - "
+            "hit@k·MRR은 떨어지는 게 정상이고, 대신 unanswerable 거절률이 올라간다"
+        ),
+    )
+    parser.add_argument(
         "--shuffle",
         action="store_true",
         help="★ 하네스 검증용 ★ 검색 결과 순서를 무작위로 섞는다 (지표가 떨어져야 정상)",
     )
     args = parser.parse_args()
+
+    # ★ 기본값이 None = 게이트 없음이다 ★ M9까지의 숫자와 그대로 비교되어야
+    # "게이트가 무엇을 바꿨는가"를 말할 수 있다. 게이트를 기본으로 켜면 이후
+    # 모든 검색 품질 측정이 게이트 성능과 뒤섞인다.
+    max_distance = settings.grounding_max_distance if args.gate else None
 
     cases = load_dataset()
     validate_dataset(cases)
@@ -208,6 +221,8 @@ def main() -> None:
         mode += "+rerank"
     if not args.no_rewrite:
         mode += "+rewrite"
+    if args.gate:
+        mode += "+gate"
     print(f"골든셋 {len(cases)}건 · store={store_name} · 검색={mode} · top_k={args.top_k}\n")
 
     # ★ 하네스 검증용 대조군 ★ 지표가 안 움직이는 하네스로 M7~M13을 헛돌 수 있다.
@@ -239,17 +254,36 @@ def main() -> None:
             # top_k만 뽑아 리랭킹하면 "순서만 바꾸기"라 hit@5가 절대 안 오른다 —
             # 재현율은 1단이 담당한다는 역할 분담이 여기서도 그대로다.
             pool = retrieve(
-                store, question, PRINCIPAL, settings.rerank_candidates, hybrid=not args.dense
+                store,
+                question,
+                PRINCIPAL,
+                settings.rerank_candidates,
+                hybrid=not args.dense,
+                max_distance=max_distance,
             )
             chunks = asyncio.run(rerank(question, pool, args.top_k))
         else:
-            chunks = retrieve(store, question, PRINCIPAL, args.top_k, hybrid=not args.dense)
+            chunks = retrieve(
+                store,
+                question,
+                PRINCIPAL,
+                args.top_k,
+                hybrid=not args.dense,
+                max_distance=max_distance,
+            )
         if args.shuffle:
             rng.shuffle(chunks)
+
+        # ★ M10: dense 거리를 따로 잰다 ★ 위 chunks의 distance는 하이브리드일 때
+        # RRF 융합 점수라 "관련성"이 아니다. 그라운딩 판정에 쓸 수 있는 값인지
+        # 보려면 같은 질문의 dense top-1 거리를 별도로 재야 한다. 검색 경로와
+        # 무관하게 항상 재두면 --dense / --gate 어느 조합으로 돌려도 표가 나온다.
+        nearest = store.search(embed_query(question), PRINCIPAL, top_k=1)
         rows.append(
             {
                 "case": case,
                 "chunks": chunks,
+                "dense_distance": nearest[0].distance if nearest else None,
                 "by_source": relevance_by_source(case, chunks),
                 "by_content": relevance_by_content(case, chunks),
             }
@@ -369,36 +403,78 @@ def _unanswerable_section(rows: list[dict]) -> str:
     문서에 없는 것을 물어도 "가장 덜 무관한" 청크 5개가 나온다. 모델이 그걸 근거처럼
     쓰면 환각이 된다.
 
-    여기서 보는 것은 "답할 수 있는 질문"과 "없는 질문"의 top-1 거리가 실제로 갈리는가다.
-    갈린다면 거리 임계값으로 거를 수 있고, 안 갈린다면 임계값 방식은 못 쓴다는 뜻이다 —
-    **M10 그라운딩을 프롬프트로 할지 임계값으로 할지의 판단 근거가 이 숫자다.**
+    ★★ M10에서 이 함수의 결론이 뒤집혔다 — 앞선 기록이 틀렸다 ★★
+    M6~M9의 결과 파일에는 "두 그룹이 겹친다 = 거리 임계값으로는 못 거른다"가 적혀
+    있다. 그 판정은 `chunks[0].distance`로 계산했는데, **하이브리드 모드에서 그
+    값은 유사도가 아니라 RRF 융합 점수**다. RRF는 각 검색기의 **순위**만 쓰므로,
+    전혀 관련 없는 질문이라도 뭔가가 1등을 하면 높은 점수가 나온다 — 애초에
+    "얼마나 관련 있나"를 담고 있지 않은 숫자로 관련성을 판정하려 한 것이다.
+
+    같은 질문들의 **dense 코사인 거리**를 재면 두 그룹이 거의 갈린다(M10 실측).
+    그래서 아래는 두 값을 나란히 찍는다 — 어느 쪽으로 판정해야 하는지가 표에서
+    바로 보이도록.
     """
-    ans = [r["chunks"][0].distance for r in rows if r["case"].answerable and r["chunks"]]
-    una = [r["chunks"][0].distance for r in rows if not r["case"].answerable and r["chunks"]]
-    if not ans or not una:
-        return ""
+    dense = {r["case"].id: r.get("dense_distance") for r in rows}
+    have_dense = any(v is not None for v in dense.values())
+
+    def stats(answerable: bool, key: str) -> tuple[int, float, float, float] | None:
+        if key == "fused":
+            vals = [
+                r["chunks"][0].distance
+                for r in rows
+                if r["case"].answerable is answerable and r["chunks"]
+            ]
+        else:
+            vals = [
+                d
+                for r in rows
+                if r["case"].answerable is answerable and (d := dense.get(r["case"].id)) is not None
+            ]
+        if not vals:
+            return None
+        return len(vals), min(vals), mean(vals), max(vals)
 
     lines = [
         "## unanswerable — 거리로 거를 수 있나",
         "",
         "검색은 무조건 top_k개를 돌려준다. 문서에 없는 것을 물어도 '가장 덜 무관한' 청크가 나온다.",
         "",
-        "| 그룹 | n | top1 거리 최소 | 평균 | 최대 |",
-        "|---|---|---|---|---|",
-        f"| 답할 수 있음 | {len(ans)} | {min(ans):.4f} | {mean(ans):.4f} | {max(ans):.4f} |",
-        f"| 답할 수 없음 | {len(una)} | {min(una):.4f} | {mean(una):.4f} | {max(una):.4f} |",
-        "",
     ]
-    gap = min(una) - max(ans)
-    if gap > 0:
+
+    for key, label in (("fused", "검색이 돌려준 거리"), ("dense", "dense 코사인 거리")):
+        if key == "dense" and not have_dense:
+            continue
+        a, u = stats(True, key), stats(False, key)
+        if not a or not u:
+            continue
+        lines += [
+            f"### {label}",
+            "",
+            "| 그룹 | n | top1 거리 최소 | 평균 | 최대 |",
+            "|---|---|---|---|---|",
+            f"| 답할 수 있음 | {a[0]} | {a[1]:.4f} | {a[2]:.4f} | {a[3]:.4f} |",
+            f"| 답할 수 없음 | {u[0]} | {u[1]:.4f} | {u[2]:.4f} | {u[3]:.4f} |",
+            "",
+        ]
+        gap = u[1] - a[3]
+        if gap > 0:
+            lines.append(f"**겹치지 않는다(간격 {gap:+.4f})** — 이 값으로는 임계값이 선다.")
+        else:
+            lines.append(
+                f"**겹친다(간격 {gap:+.4f})** — 이 값 하나로는 못 거른다. "
+                "겹치는 폭이 좁으면 오거절을 감수하고 임계값을 쓸 수 있고, "
+                "넓으면 이 값 자체가 관련성을 담고 있지 않다는 뜻이다."
+            )
+        lines.append("")
+
+    if have_dense:
         lines.append(
-            f"**두 그룹이 겹치지 않는다(간격 {gap:+.4f})** — 거리 임계값으로 거를 수 있다."
+            "> ★ 두 표를 비교하는 것이 요점이다 ★ 하이브리드가 돌려주는 거리는 RRF "
+            "융합 점수(=순위)라 관련성을 담고 있지 않다. 그라운딩 임계값은 반드시 "
+            "dense 거리로 걸어야 한다 — M10의 게이트가 검색과 별개로 dense를 한 번 "
+            "더 보는 이유다."
         )
-    else:
-        lines.append(
-            f"**두 그룹이 겹친다(간격 {gap:+.4f})** — 단순 거리 임계값으로는 못 거른다. "
-            "M10의 그라운딩을 프롬프트/생성 단계에서 해야 한다는 근거다."
-        )
+
     return "\n".join(lines)
 
 

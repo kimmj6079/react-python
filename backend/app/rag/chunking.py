@@ -41,6 +41,15 @@ RESERVED_TOKENS = 4
 MAX_TOKENS = 220
 OVERLAP_TOKENS = 40
 
+# ★ 이보다 작은 조각은 이웃과 합친다 (M7-1b) ★
+# 안 합치면 실제로 이런 것들이 청크가 된다(실측):
+#   4토큰  "```"                     <- 닫는 코드펜스 하나. 순수 쓰레기
+#   6토큰  "## 저장소 구조"           <- 헤딩만 남고 본문은 코드펜스 경계에서 잘려나감
+#   7토큰  "## 자주 쓰는 명령어"       <- CLAUDE.md와 DEPLOYMENT.md 양쪽에 있어 서로 경쟁까지 한다
+# 전체의 4.9%였다. 이런 조각은 검색되면 top-k 한 자리를 잡아먹으면서 모델에게는
+# 아무 근거도 주지 않는다 — 잡음이자 예산 낭비다.
+MIN_TOKENS = 40
+
 
 # Chunk 타입은 app/rag/base.py(계약)에 있다 — 두 store가 같은 모양을 받아야 하므로
 # "청킹 구현의 사정"이 아니라 계약의 일부다. EMBEDDING_DIM을 계약으로 옮긴 것과 같은 이유.
@@ -88,11 +97,43 @@ def heading_path_of(metadata: dict[str, str]) -> str:
     return " > ".join(metadata[key] for _, key in HEADERS if metadata.get(key))
 
 
+def _merge_small(
+    pieces: list[tuple[str, int]],
+    measure: Callable[[str], int],
+    max_tokens: int,
+    min_tokens: int,
+) -> list[tuple[str, int]]:
+    """같은 섹션 안에서 너무 작은 조각을 이웃과 합친다.
+
+    ★ 섹션을 넘어가며 합치지 않는다 ★ heading_path가 달라지기 때문이다. 다행히 실측한
+    문제 조각들(닫는 코드펜스, 헤딩만 남은 조각)은 전부 **같은 섹션 안**에서 생긴다 —
+    RecursiveCharacterTextSplitter가 코드펜스 경계에서 자르면서 섹션의 첫 줄만 떼어놓는
+    식이라, 섹션 내 병합만으로 충분하다.
+
+    합쳐서 max_tokens를 넘으면 합치지 않는다. 작은 조각을 없애려다 e5 한도에 가까운
+    거대 청크를 만들면 본말전도다 — 그래서 일부는 작은 채로 남을 수 있고, 그게 맞다.
+    """
+    merged: list[tuple[str, int]] = []
+    for text, count in pieces:
+        if merged:
+            prev_text, prev_count = merged[-1]
+            # 앞이 작든 지금이 작든, 둘 중 하나가 작으면 붙일 후보다.
+            if prev_count < min_tokens or count < min_tokens:
+                candidate = prev_text + "\n\n" + text
+                candidate_count = measure(candidate)
+                if candidate_count <= max_tokens:
+                    merged[-1] = (candidate, candidate_count)
+                    continue
+        merged.append((text, count))
+    return merged
+
+
 def split_markdown(
     text: str,
     *,
     max_tokens: int = MAX_TOKENS,
     overlap_tokens: int = OVERLAP_TOKENS,
+    min_tokens: int = MIN_TOKENS,
     strip_headers: bool = False,
     length_function: Callable[[str], int] | None = None,
 ) -> list[Chunk]:
@@ -142,11 +183,10 @@ def split_markdown(
     chunks: list[Chunk] = []
     for section in header_splitter.split_text(text):
         path = heading_path_of(section.metadata)
-        for piece in body_splitter.split_text(section.page_content):
-            piece = piece.strip()
-            if not piece:
-                continue
-            count = measure(piece)
+        pieces = [p.strip() for p in body_splitter.split_text(section.page_content)]
+        for piece, count in _merge_small(
+            [(p, measure(p)) for p in pieces if p], measure, max_tokens, min_tokens
+        ):
             if count > budget:
                 # 여기 걸리면 분할기가 더 못 쪼갠 것이다(공백 없는 초장문 등).
                 # 조용히 잘린 채 임베딩되면 검색 품질만 무너지므로 로그로 드러낸다.

@@ -117,3 +117,56 @@ def test_max_tokens_cannot_exceed_the_embedding_limit():
     # ★ e5는 한도를 넘으면 에러가 아니라 조용히 자른다 ★ 그래서 우리가 시끄럽게 막는다.
     with pytest.raises(ValueError, match="한도"):
         split_markdown(SAMPLE, max_tokens=600, length_function=CHARS)
+
+
+def test_tiny_pieces_are_merged_into_their_neighbour():
+    # ★ 실측이 만든 테스트 ★ 코드펜스 경계에서 자르면 섹션의 첫 줄("## 제목")만
+    # 떨어져 나오고, 닫는 펜스 "```" 하나가 청크가 되기도 한다. 실제 인입에서
+    # 4~9토큰짜리 조각이 전체의 4.9%였다 — 검색되면 top-k 한 자리를 잡아먹으면서
+    # 모델에게는 아무 근거도 주지 않는 순수 잡음이다.
+    doc = "# 제목\n\n## 명령어\n\n```bash\nuv run pytest -q\n```\n\n실행하면 통과한다.\n"
+
+    # ★ max_tokens 값을 실측으로 골랐다 ★ 처음엔 40으로 썼다가 테스트가 실패했는데
+    # 버그가 아니었다 — 40에서는 합치면 한도를 넘어서 "안 합치는 것이 정답"이었다.
+    # 반대로 100으로 키우면 분할 자체가 안 일어나 비교할 대상이 없어진다. 실제로
+    # 재보니 45~50 구간에서만 "쪼개지고 + 합쳐진다"(scripts로 스윕해 확인).
+    # 병합이 max_tokens 예산 안에서만 가능하다는 성질이 이 좁은 창으로 드러난다.
+    without = split_markdown(
+        doc, max_tokens=45, overlap_tokens=0, min_tokens=0, length_function=CHARS
+    )
+    with_merge = split_markdown(
+        doc, max_tokens=45, overlap_tokens=0, min_tokens=20, length_function=CHARS
+    )
+
+    tiny_before = sum(1 for c in without if c.token_count < 20)
+    tiny_after = sum(1 for c in with_merge if c.token_count < 20)
+
+    assert tiny_before > 0  # 병합 전에는 작은 조각이 있다
+    assert tiny_after < tiny_before  # 병합이 줄였다
+    # ★ 0이 되기를 요구하지 않는다 ★ 합쳐서 한도를 넘는 조각은 작은 채로 남는 것이
+    # 정답이다. "작은 조각을 전부 없애라"는 요구는 e5 한도를 깨라는 요구가 된다.
+
+
+def test_merge_never_exceeds_max_tokens():
+    # ★ 작은 조각을 없애려다 거대 청크를 만들면 본말전도다 ★
+    # e5 한도에 가까운 청크는 뒷부분이 조용히 잘린다 — 병합이 그걸 만들면 안 된다.
+    # 그래서 일부 조각은 작은 채로 남을 수 있고, 그게 맞다.
+    doc = "# 제목\n\n## A\n\n" + ("가 " * 200)
+    chunks = split_markdown(
+        doc, max_tokens=100, overlap_tokens=10, min_tokens=90, length_function=CHARS
+    )
+
+    assert all(c.token_count <= 100 for c in chunks)
+
+
+def test_merge_does_not_cross_section_boundaries():
+    # ★ 섹션을 넘어가며 합치지 않는다 ★ heading_path가 달라지기 때문이다.
+    # 합쳐버리면 "이 청크는 어느 절인가"가 거짓이 되고, M10 인용 카드가 틀린 곳을 가리킨다.
+    doc = "# 제목\n\n## A\n\n짧다.\n\n## B\n\n이것도 짧다.\n"
+    chunks = split_markdown(
+        doc, max_tokens=500, overlap_tokens=0, min_tokens=200, length_function=CHARS
+    )
+
+    paths = [c.heading_path for c in chunks]
+    assert "제목 > A" in paths
+    assert "제목 > B" in paths

@@ -22,9 +22,10 @@ from datetime import datetime
 from pathlib import Path
 
 from app.rag.base import RetrievedChunk
+from app.rag.chunking import MAX_TOKENS, OVERLAP_TOKENS
 from app.rag.embedding import MODEL_NAME, embed_query
 from app.rag.factory import get_store
-from app.rag.ingest import CHUNK_OVERLAP, CHUNK_SIZE, REPO_ROOT
+from app.rag.ingest import REPO_ROOT
 from evals.metrics import hit_at_k, mean, reciprocal_rank
 
 EVALS_DIR = Path(__file__).resolve().parent
@@ -210,7 +211,9 @@ def build_report(rows: list[dict], store_name: str, top_k: int, shuffled: bool =
     add(f"| store | `{store_name}` |")
     add(f"| top_k | {top_k} |")
     add(f"| 임베딩 모델 | `{MODEL_NAME}` |")
-    add(f"| 청킹 | 고정 {CHUNK_SIZE}자 / 오버랩 {CHUNK_OVERLAP} |")
+    # ★ M7-1부터 단위가 "자"가 아니라 "토큰"이다 ★ 결과 파일에 단위를 남기지
+    # 않으면 3주 뒤에 220이 자인지 토큰인지 알 수 없다.
+    add(f"| 청킹 | 구조 인식 · 최대 {MAX_TOKENS}토큰 / 오버랩 {OVERLAP_TOKENS}토큰 |")
     add(f"| 골든셋 | {len(rows)}건 |")
     if shuffled:
         add("| ⚠ 대조군 | **순서 무작위 셔플** (하네스 검증용, 정상 결과 아님) |")

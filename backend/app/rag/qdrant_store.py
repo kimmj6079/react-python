@@ -15,7 +15,7 @@ import uuid
 from qdrant_client import QdrantClient, models
 
 from app.core.config import settings
-from app.rag.base import EMBEDDING_DIM, TOP_K, RetrievedChunk
+from app.rag.base import EMBEDDING_DIM, TOP_K, Chunk, RetrievedChunk
 
 # ★ 타임아웃을 반드시 명시한다 ★ (3-3a의 "알고 남겨둔 것" ①이 여기서 회수된다)
 # pgvector는 db/session.py의 statement_timeout=5000이 지켜주지만 Qdrant는 HTTP다.
@@ -84,7 +84,7 @@ class QdrantStore:
             must=[models.FieldCondition(key="source", match=models.MatchValue(value=source))]
         )
 
-    def upsert_document(self, source: str, chunks: list[str], vectors: list[list[float]]) -> int:
+    def upsert_document(self, source: str, chunks: list[Chunk], vectors: list[list[float]]) -> int:
         self._ensure_collection()
         flt = self._source_filter(source)
 
@@ -114,16 +114,25 @@ class QdrantStore:
             collection_name=self._collection,
             points=[
                 models.PointStruct(
-                    id=self._point_id(source, i),
+                    id=self._point_id(source, chunk.chunk_index),
                     vector=vector,
                     # payload = pgvector에서 source/chunk_index/content 컬럼이 하던 일.
                     # ★ 원문(content)을 반드시 같이 저장한다 ★ 벡터는 비가역이라
                     # 원문이 없으면 검색에 성공해도 모델에게 붙여줄 게 없다(3-1과 동일 원칙).
                     # Qdrant는 스키마가 없어서 dict를 그냥 넣는다 — 편한 만큼,
                     # 오타 난 키("sorce")도 조용히 저장된다는 뜻이기도 하다.
-                    payload={"source": source, "chunk_index": i, "content": chunk},
+                    payload={
+                        "source": source,
+                        "chunk_index": chunk.chunk_index,
+                        "content": chunk.content,
+                        # ★ M7-2 ★ Qdrant는 스키마가 없어서 payload에 키를 더하는 것이
+                        # 마이그레이션 없이 된다. 편한 만큼, 옛 point에는 이 키가 없어서
+                        # 읽는 쪽이 .get()으로 방어해야 한다(아래 search 참고).
+                        "heading_path": chunk.heading_path,
+                        "token_count": chunk.token_count,
+                    },
                 )
-                for i, (chunk, vector) in enumerate(zip(chunks, vectors, strict=True))
+                for chunk, vector in zip(chunks, vectors, strict=True)
             ],
         )
         return deleted
@@ -147,6 +156,11 @@ class QdrantStore:
                 source=point.payload["source"],
                 chunk_index=point.payload["chunk_index"],
                 content=point.payload["content"],
+                # ★ .get()인 이유 ★ M7-2 이전에 넣은 point에는 이 키가 없다.
+                # pgvector는 server_default=""가 컬럼 차원에서 막아주지만 Qdrant는
+                # 스키마가 없어서 "없는 키"가 그대로 KeyError가 된다 - 스키마 없는
+                # 저장소의 편함이 그대로 대가가 되는 지점이다.
+                heading_path=point.payload.get("heading_path", ""),
                 # ★ 실측 ⑤가 강제한 변환 ★ Qdrant의 score는 "유사도"(높을수록 가깝다)라
                 # pgvector의 cosine_distance와 방향이 반대다. 코사인에서는
                 # distance = 1 - score 가 정확히 성립한다(probe에서 손계산과 대조 확인).

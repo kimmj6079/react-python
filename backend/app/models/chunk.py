@@ -38,6 +38,18 @@ class DocumentChunk(Base):
     # "벡터 DB에 문서를 넣는다"는 표현 때문에 벡터만 저장하면 될 것 같지만 아니다.
     content: Mapped[str] = mapped_column(Text, nullable=False)
 
+    # ★ M7-2에서 추가 ★ "CLAUDE.md > 아키텍처 > 요청 흐름" 형태의 조상 헤딩 경로.
+    # 인입 때 이 값을 본문 앞에 붙여 임베딩하고(검색 품질), 검색 결과에도 실어 보내
+    # 프롬프트의 출처 표기와 M10 인용 카드가 쓴다.
+    # nullable=False + server_default="" 인 이유: 기존 행에도 값이 필요한데
+    # 마이그레이션이 백필할 의미 있는 값이 없다(재인입해야 채워진다).
+    heading_path: Mapped[str] = mapped_column(String(1000), nullable=False, server_default="")
+
+    # 이 청크가 e5 토크나이저 기준 몇 토큰인가. 검색에는 안 쓰이고 진단용이다 —
+    # "청크가 한도에 붙어 있나 / 너무 잘게 쪼개졌나"를 SQL로 볼 수 있어야
+    # M7의 청킹 파라미터를 숫자로 조정할 수 있다.
+    token_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+
     # 임베딩 벡터. Postgres에는 vector(1024) 타입으로 저장된다.
     embedding: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIM), nullable=False)
 

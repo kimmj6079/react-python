@@ -16,7 +16,7 @@ from sqlalchemy import delete, select
 
 from app.db.session import SessionLocal
 from app.models.chunk import DocumentChunk
-from app.rag.base import TOP_K, RetrievedChunk
+from app.rag.base import TOP_K, Chunk, RetrievedChunk
 
 
 class PgVectorStore:
@@ -24,7 +24,7 @@ class PgVectorStore:
     # 아니라 클래스로 만든 이유는 QdrantStore가 접속 URL·컬렉션 이름을 들고 있어야
     # 하기 때문이다. 두 구현의 모양이 같아야 3-4의 교체가 "한 줄"이 된다.
 
-    def upsert_document(self, source: str, chunks: list[str], vectors: list[list[float]]) -> int:
+    def upsert_document(self, source: str, chunks: list[Chunk], vectors: list[list[float]]) -> int:
         # 삭제 + 삽입을 한 트랜잭션으로 묶는다(3-1과 동일 로직, 위치만 이동).
         # 커밋 전까지 검색에는 옛 청크가 그대로 보이고, 커밋 순간 새 청크로 통째로
         # 바뀐다 — "반쯤 지워진 상태"가 밖에서 보이는 순간이 없다. 실패하면 통째로
@@ -37,8 +37,15 @@ class PgVectorStore:
             deleted = db.execute(stmt).rowcount
             db.add_all(
                 [
-                    DocumentChunk(source=source, chunk_index=i, content=c, embedding=v)
-                    for i, (c, v) in enumerate(zip(chunks, vectors, strict=True))
+                    DocumentChunk(
+                        source=source,
+                        chunk_index=c.chunk_index,
+                        content=c.content,
+                        heading_path=c.heading_path,
+                        token_count=c.token_count,
+                        embedding=v,
+                    )
+                    for c, v in zip(chunks, vectors, strict=True)
                 ]
             )
             db.commit()
@@ -67,6 +74,7 @@ class PgVectorStore:
                     chunk_index=row.DocumentChunk.chunk_index,
                     content=row.DocumentChunk.content,
                     distance=row.distance,
+                    heading_path=row.DocumentChunk.heading_path,
                 )
                 for row in rows
             ]

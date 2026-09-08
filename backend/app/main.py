@@ -2,7 +2,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import chat, health, items
+from app.api.routes import chat, documents, health, items
 from app.core.config import settings
 
 
@@ -24,6 +24,8 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(items.router, prefix=settings.api_v1_prefix)
     app.include_router(chat.router, prefix=settings.api_v1_prefix)
+    # M11: 문서 업로드/상태. chat과 같은 /api/v1 접두어를 공유한다.
+    app.include_router(documents.router, prefix=settings.api_v1_prefix)
 
     return app
 

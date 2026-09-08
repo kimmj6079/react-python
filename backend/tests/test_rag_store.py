@@ -61,3 +61,40 @@ def test_pop_store_arg(argv, expected_name, expected_rest):
     # 그대로 남아 파일 경로로 취급되는 버그("파일이 없다: --store")를 못 잡는다.
     assert pop_store_arg(argv) == expected_name
     assert argv == expected_rest
+
+
+def test_empty_chunk_list_is_a_valid_delete(monkeypatch):
+    """★ M11에서 발견한 엣지 케이스 ★
+
+    "이 문서를 통째로 지운다"는 청크 0개로 업서트하는 것과 같다. 정당한 연산인데
+    Qdrant는 points가 빈 upsert를 400 "Empty update request"로 거부한다.
+    pgvector는 add_all([])이 그냥 통과해서 이 차이가 안 보였다 —
+    **구현이 둘일 때만 드러나는 종류의 어긋남**이고, 계약을 지키려면 구현이 흡수해야 한다.
+
+    실제 Qdrant를 안 띄우고 클라이언트만 대역으로 바꿔, "upsert를 아예 안 부르는지"를 본다.
+    """
+    calls = {"upsert": 0, "delete": 0}
+
+    class FakeClient:
+        def collection_exists(self, name):
+            return True
+
+        def count(self, name, count_filter=None):
+            return type("R", (), {"count": 3})()
+
+        def delete(self, **kwargs):
+            calls["delete"] += 1
+
+        def upsert(self, **kwargs):
+            calls["upsert"] += 1
+
+    store = QdrantStore.__new__(QdrantStore)
+    store._client = FakeClient()
+    store._collection = "test"
+    store._collection_ready = True
+
+    deleted = store.upsert_document("a.md", [], [], [])
+
+    assert deleted == 3  # 지운 개수는 그대로 돌려준다
+    assert calls["delete"] == 1  # 삭제는 한다
+    assert calls["upsert"] == 0  # ★ 빈 upsert는 아예 안 부른다 ★

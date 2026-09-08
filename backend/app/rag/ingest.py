@@ -38,8 +38,8 @@ def normalize_source(path: Path) -> str:
         return resolved.name
 
 
-def insert_file(
-    path: Path,
+def ingest_text(
+    text: str,
     source: str,
     store: VectorStore,
     *,
@@ -48,13 +48,17 @@ def insert_file(
     strip_headers: bool = False,
     embed_heading_path: bool = False,
 ) -> tuple[int, int, list[int]]:
-    """읽기 → 청킹 → 임베딩 → 업서트. (청크 수, 삭제 수, 청크별 토큰 수)를 돌려준다.
+    """청킹 → 임베딩 → 업서트. (청크 수, 삭제 수, 청크별 토큰 수)를 돌려준다.
+
+    ★ M11에서 파일이 아니라 텍스트를 받도록 바꿨다 ★ 업로드 인입(documents.py)은
+    디스크의 파일이 아니라 **메모리의 바이트**에서 출발한다. "읽기"를 호출자에게
+    밀어내면 CLI(파일)와 업로드(멀티파트) 둘 다 같은 코어를 쓴다 —
+    build_graph가 model을 인자로 받는 것과 같은 사고방식이다.
 
     ★ 토큰 수를 돌려주는 이유 ★ M7의 주장은 "청크가 더 나은 경계로 잘린다"인데,
     그게 사실인지 보려면 분포를 봐야 한다. 개수만 찍으면 "청크가 늘었다/줄었다"까지만
     알 수 있고, 평균 220 토큰인지 한쪽에 쏠려 있는지는 안 보인다.
     """
-    text = path.read_text(encoding="utf-8")
     chunks = split_markdown(
         text,
         max_tokens=max_tokens,
@@ -110,6 +114,13 @@ def insert_file(
     # 그 넷은 저장소가 바뀌어도 같다.
     deleted = store.upsert_document(source, chunks, vectors, sparse)
     return len(chunks), deleted, [c.token_count for c in chunks]
+
+
+def insert_file(
+    path: Path, source: str, store: VectorStore, **kwargs
+) -> tuple[int, int, list[int]]:
+    """파일 경로용 얇은 껍데기. CLI가 쓴다."""
+    return ingest_text(path.read_text(encoding="utf-8"), source, store, **kwargs)
 
 
 def main() -> None:

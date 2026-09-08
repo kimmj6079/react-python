@@ -8,3 +8,62 @@ main {
      flexbox 스크롤 문제의 대부분이 이 한 줄이다. */
   min-height: 0;
 }
+
+/* ── M11: 상단 탭 + 문서 화면 ────────────────────────────────
+   Chat.css를 컴포넌트 옆에 둔 것과 달리 여기 있는 이유: topnav는 App.tsx의
+   것이고 .docs는 그 안에 사는 화면이라, 둘 다 App의 레이아웃 책임이다.
+   색은 전부 index.css의 CSS 변수를 쓰므로 다크모드가 공짜다. */
+
+.topnav {
+  display: flex;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border, #e5e7eb);
+}
+.topnav__btn {
+  padding: 6px 14px;
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  /* iOS Safari는 16px 미만 입력에 포커스하면 화면을 확대한다. 버튼은 해당 없지만
+     같은 화면 안에서 글자 크기가 튀지 않게 맞춰둔다. */
+  font-size: 14px;
+}
+.topnav__btn--on {
+  background: var(--accent, #2563eb);
+  color: #fff;
+  border-color: transparent;
+}
+
+.docs {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 20px 16px;
+  text-align: left;
+}
+.docs__title { margin: 0 0 4px; font-size: 18px; }
+.docs__hint { margin: 0 0 16px; opacity: 0.7; font-size: 13px; }
+.docs__busy { margin-left: 8px; font-size: 13px; opacity: 0.7; }
+.docs__error { color: #dc2626; font-size: 13px; }
+.docs__notice { color: var(--accent, #2563eb); font-size: 13px; }
+
+.docs__list { list-style: none; padding: 0; margin: 16px 0 0; }
+.docs__item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border, #e5e7eb);
+  font-size: 14px;
+}
+.docs__name { font-weight: 600; }
+.docs__status { font-size: 12px; opacity: 0.75; }
+.docs__meta { font-size: 12px; opacity: 0.6; }
+/* 실패 이유는 눈에 띄어야 한다 — 조용히 두면 "올렸는데 왜 답을 못 하지"가 된다. */
+.docs__errmsg { flex-basis: 100%; color: #dc2626; font-size: 12px; }
+.docs__item--failed .docs__status { color: #dc2626; }
+.docs__item--done .docs__status { color: #16a34a; }
+.docs__empty { padding: 10px 0; opacity: 0.6; font-size: 14px; }

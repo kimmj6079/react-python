@@ -6,11 +6,13 @@ import { ItemForm } from './components/ItemForm'
 import { ItemList } from './components/ItemList'
 import type { Item, ItemCreate } from './types/item'
 import { Chat } from './components/chat/Chat'
+import { DocumentUpload } from './components/DocumentUpload'
 import './App.css'
 
 function App() {
-  //const [view, setView] = useState<'items' | 'chat'>('chat')
-  const [view] = useState<'items' | 'chat'>('chat')
+  // M11에서 'documents'가 늘었다. items는 DB/마이그레이션 학습 소재라 코드는 남기고
+  // 화면에서만 뺐다(1f 기록) — 그래서 타입에는 있고 nav에는 없다.
+  const [view, setView] = useState<'items' | 'chat' | 'documents'>('chat')
   const [items, setItems] = useState<Item[]>([])
   const [error, setError] = useState<string | null>(null)
 
@@ -40,12 +42,23 @@ function App() {
 
   return (
     <main>
-      {/* 
-      <nav>
-        <button onClick={() => setView('items')}>Items</button>
-        <button onClick={() => setView('chat')}>Chat</button>
-      </nav> 
-      */}
+      {/* ★ M11: 문서 화면으로 가는 통로 ★ 업로드한 문서가 챗봇의 검색 대상이 되므로
+          두 화면은 사실상 한 기능의 앞뒤다. 라우터를 들이지 않고 상태 전환만 쓰는
+          이유는 1f 그대로 — 화면이 더 늘면 그때 react-router를 고민한다. */}
+      <nav className="topnav">
+        <button
+          className={view === 'chat' ? 'topnav__btn topnav__btn--on' : 'topnav__btn'}
+          onClick={() => setView('chat')}
+        >
+          채팅
+        </button>
+        <button
+          className={view === 'documents' ? 'topnav__btn topnav__btn--on' : 'topnav__btn'}
+          onClick={() => setView('documents')}
+        >
+          문서
+        </button>
+      </nav>
       {/* view 상태에 따라 다른 화면을 보여준다. (SPA)*/}
       {view === 'items' && (
         <>
@@ -57,6 +70,7 @@ function App() {
       )}
 
       {view === 'chat' && <Chat />}
+      {view === 'documents' && <DocumentUpload />}
     </main>
   )
 }

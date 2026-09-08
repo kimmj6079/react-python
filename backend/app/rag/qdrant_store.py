@@ -146,6 +146,14 @@ class QdrantStore:
         # 그래야 "sparse를 붙이기 전/후" A/B가 같은 코드로 가능하다.
         sparse_list = sparse_vectors or [None] * len(chunks)
 
+        # ★ 빈 문서는 삭제만 하고 끝낸다 (M11에서 발견) ★
+        # Qdrant는 points가 빈 upsert를 400 "Empty update request"로 거부한다.
+        # "문서를 지운다"(청크 0개로 업서트)가 정당한 연산인데 저장소가 거부하는 것이라,
+        # 계약을 지키려면 여기서 흡수해야 한다. pgvector는 add_all([])이 그냥 통과해서
+        # 이 차이가 안 보였다 — **구현이 둘일 때만 드러나는 종류의 어긋남이다.**
+        if not chunks:
+            return deleted
+
         self._client.upsert(
             collection_name=self._collection,
             points=[

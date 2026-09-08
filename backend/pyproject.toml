@@ -19,6 +19,8 @@ dependencies = [
     "langfuse>=4.15.1",
     "langchain>=1.4.0",
     "langchain-text-splitters>=1.1.2",
+    "pypdf>=6.18.0",
+    "python-multipart>=0.0.32",
 ]
 
 [dependency-groups]

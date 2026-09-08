@@ -2018,16 +2018,57 @@ M3의 인입은 "샘플 문서를 한 번 넣는 스크립트"다. 문서가 바
   반드시 남기고 프론트에 보여줄 것.
 - 업로드는 **임의 파일을 받는 엔드포인트**다. 크기 제한·확장자 화이트리스트를 처음부터 걸어둔다.
 
-**체크리스트**:
-- [ ] `backend/app/models/document.py` — 인입 상태 테이블 + `app/models/__init__.py` 등록
-- [ ] `uv run alembic revision --autogenerate -m "add documents table"` → `upgrade head` → `alembic check`
-- [ ] 결정론적 포인트 ID(`uuid5`)로 교체 + 같은 문서 두 번 인입해 포인트 수 불변 확인
-- [ ] `source` 필터 삭제 후 재삽입 (또는 `doc_hash` 스킵) 로직
-- [ ] `backend/app/rag/documents.py` — 파싱(`pypdf`/텍스트) + 청킹(M7 재사용) + 업서트 오케스트레이션
-- [ ] `backend/app/api/routes/documents.py` — 업로드(multipart, 크기·확장자 제한) + 상태 조회
-- [ ] `BackgroundTasks`로 인입 실행, 상태 전이를 DB에 기록, 실패 시 에러 메시지 저장
-- [ ] `frontend/src/components/DocumentUpload.tsx` — 업로드 + 상태 폴링 표시
-- [ ] pytest: 파싱·청킹·ID 생성은 API 없이 테스트 가능 → CI에 넣는다. Qdrant 업서트는 목킹
+**체크리스트 (2026-09-08 완료)**:
+- [x] `backend/app/models/document.py` — 인입 상태 테이블 + `app/models/__init__.py` 등록
+- [x] 마이그레이션 `e2b779038a8e` → `upgrade head` → `alembic check` 통과
+- [x] 결정론적 포인트 ID(`uuid5`) — **M3-3c에서 이미 넣어둔 것이 여기서 값을 했다**
+- [x] `source` 필터 삭제 후 재삽입 + `doc_hash` 스킵
+- [x] `backend/app/rag/documents.py` — 파싱(`pypdf`/텍스트) + 인입 오케스트레이션
+- [x] `backend/app/api/routes/documents.py` — 업로드(multipart, 10MB·확장자 화이트리스트) + 상태 조회
+- [x] `BackgroundTasks` + 상태 전이 DB 기록 + 실패 시 에러 메시지
+- [x] `frontend/src/components/DocumentUpload.tsx` — 업로드 + 조건부 폴링
+- [x] pytest 12개 (파싱·해시·source 키·스킵 조건·업로드 제한) — **API도 임베딩도 안 쓴다 → CI 안전**
+
+### 검증 (실제로 돌린 것)
+
+```
+① 업로드          -> 202, status=pending, "인입을 시작했다"
+② 상태 폴링       -> processing -> done, 청크 3개
+③ 검색            -> "오크룸 예약하려면?" -> uploads/m11-test.md#2 가 1위
+④ 같은 파일 재업로드 -> "같은 내용이 이미 인입돼 있어 건너뛴다" (doc_hash 스킵)
+⑤ .exe 업로드     -> 400
+```
+
+### ★ 테스트가 잡아낸 실제 버그 2개 ★
+
+**① 깨진 PDF가 500으로 샜다.** README가 *"일부러 깨진 PDF를 업로드해 `failed` + 에러
+메시지가 화면에 뜨는지 (성공 경로만 확인하고 넘어가면 이 항목의 절반을 놓친다)"* 라고
+경고한 바로 그 지점이다. `pypdf`는 `PdfStreamError`를 던지는데 **그건 `ValueError`가
+아니다**(MRO: `PdfStreamError → PdfReadError → PyPdfError → Exception`). 라우터의
+`except ValueError`를 그냥 지나쳐 **500 Internal Server Error**가 됐다. 사용자에게는
+"서버가 터졌다"로 보이지만 실제로는 "파일이 깨졌다"이고, 고칠 사람은 사용자다.
+→ **라이브러리 예외를 도메인 예외로 번역하는 것이 파싱 계층의 일이다.** 안 하면 예외
+타입이 상위로 새어나가 라우터가 `pypdf`를 알게 된다.
+
+**② 빈 청크 업서트가 Qdrant에서 400으로 죽었다.** *"이 문서를 통째로 지운다"* 는 청크
+0개로 업서트하는 것과 같은데, Qdrant는 `points`가 빈 요청을 `Empty update request`로
+거부한다. **pgvector는 `add_all([])`이 그냥 통과해서 이 차이가 안 보였다** —
+**구현이 둘일 때만 드러나는 종류의 어긋남**이다.
+게다가 실패 시점에 **삭제는 이미 실행된 뒤였다**(delete → upsert 순서). M8에서 적어둔
+*"Qdrant에는 트랜잭션이 없어 삭제와 삽입 사이에 창이 있다"* 가 실제로 나타난 첫 사례다.
+
+### 알고 남겨둔 것
+
+- **`BackgroundTasks`는 프로세스가 죽으면 잡이 그냥 사라진다.** 문서는 `processing`에
+  남고 아무도 되살리지 않는다. **이것이 실무가 Celery/ARQ/RQ를 쓰는 이유**이고,
+  이 항목의 진짜 목적이다(큐는 잡을 영속화하고, 죽으면 다른 워커가 집어간다).
+- **k8s 레플리카가 2개면** 같은 문서를 둘이 동시에 처리할 수 있다. 그래도 **데이터는
+  안 망가진다** — 업서트가 `uuid5` 결정론적 id라 멱등이기 때문이다(M3-3c의 두 번째 값).
+- **파싱이 가장 지저분한 곳이 될 것이다.** 지금은 md/txt/pdf 셋이고 PDF도 `pypdf` 기본
+  추출이라 **표와 다단 레이아웃은 깨진다.** 그게 M7 청킹 품질에 그대로 들어온다.
+- **업로드 source에 `uploads/` 접두어를 붙였다.** 사용자가 `CLAUDE.md`를 올렸을 때
+  저장소의 진짜 `CLAUDE.md` 청크를 지워버리면 안 되기 때문이다 —
+  `upsert_document`는 `source`로 지우고 넣는다.
 
 **검증**: 같은 문서 두 번 인입 → 포인트 수 불변. 문서에서 한 단락을 지우고 재인입 → 그 내용이 더 이상 검색되지
 않음. 업로드 → 상태가 `done`으로 바뀌고 곧바로 그 내용을 질문 가능. **일부러 깨진 PDF를 업로드해 `failed` +

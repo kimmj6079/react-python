@@ -44,6 +44,21 @@ def client():
     return TestClient(app)
 
 
+@pytest.fixture
+def db_session():
+    """테스트용 DB 세션. (M11)
+
+    ★ 라우터가 쓰는 것과 같은 인메모리 SQLite를 연다 ★ 위 _override_get_db와 같은
+    엔진이라, 이 세션으로 만든 행을 API 테스트가 그대로 본다.
+    문서 인입 로직(upsert_record 등)은 API를 안 부르므로 여기서 직접 검증할 수 있다.
+    """
+    db = TestingSessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
 @pytest.fixture(autouse=True)
 def _langfuse_off(monkeypatch):
     """★ pytest는 절대 실제 Langfuse로 트레이스를 보내지 않는다 ★ (M4)

@@ -168,7 +168,7 @@ def tool_calling_graph():
     CALLS.clear()
     graph = build_graph(
         ToolCallingFakeModel(),
-        retrieve_fn=lambda _: [],
+        retrieve_fn=lambda *_: [],
         checkpointer=InMemorySaver(),
         tools=[get_current_time],
     )
@@ -190,12 +190,12 @@ def fake_graph():
     dependency_overrides는 app 객체에 붙는 전역 상태라 지우지 않으면 다음
     테스트까지 가짜가 살아남는다. CALLS도 같은 이유로 매번 비운다.
 
-    ★ 3-2b: retrieve_fn=lambda _: [] ★ 검색 결과가 없다는 뜻이라 call_model이
+    ★ 3-2b: retrieve_fn=lambda *_: [] ★ 검색 결과가 없다는 뜻이라 call_model이
     시스템 메시지를 안 붙인다 — 이 fixture를 쓰는 기존 테스트들은 전부
     "검색이 없던 시절"과 똑같이 동작해야 하므로 의도적으로 무검색 상태로 둔다.
     """
     CALLS.clear()
-    graph = build_graph(FakeChatModel(), retrieve_fn=lambda _: [], checkpointer=InMemorySaver())
+    graph = build_graph(FakeChatModel(), retrieve_fn=lambda *_: [], checkpointer=InMemorySaver())
     app.dependency_overrides[get_graph] = lambda: graph
     yield graph
     del app.dependency_overrides[get_graph]
@@ -264,7 +264,7 @@ class ConfigCapturingGraph:
 @pytest.fixture
 def config_capturing_graph():
     CALLS.clear()
-    inner = build_graph(FakeChatModel(), retrieve_fn=lambda _: [], checkpointer=InMemorySaver())
+    inner = build_graph(FakeChatModel(), retrieve_fn=lambda *_: [], checkpointer=InMemorySaver())
     graph = ConfigCapturingGraph(inner)
     app.dependency_overrides[get_graph] = lambda: graph
     yield graph
@@ -536,7 +536,7 @@ def rag_graph():
     """검색 결과가 있는 경우를 검증하기 위한 그래프. fake_graph와 반대로 채운다."""
     CALLS.clear()
     graph = build_graph(
-        FakeChatModel(), retrieve_fn=lambda _: FAKE_CHUNKS, checkpointer=InMemorySaver()
+        FakeChatModel(), retrieve_fn=lambda *_: FAKE_CHUNKS, checkpointer=InMemorySaver()
     )
     app.dependency_overrides[get_graph] = lambda: graph
     yield graph
@@ -563,7 +563,7 @@ def test_retrieved_context_does_not_leak_into_checkpointed_history(client, rag_g
     assert all(kind != "SystemMessage" for kind, _ in _state(rag_graph))
 
 
-def failing_retrieve(_: str) -> list[RetrievedChunk]:
+def failing_retrieve(*_args) -> list[RetrievedChunk]:
     raise RuntimeError("DB down")
 
 

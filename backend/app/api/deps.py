@@ -2,7 +2,7 @@
 import asyncio
 from typing import Annotated
 
-from fastapi import Depends
+from fastapi import Depends, Header
 from langchain_anthropic import ChatAnthropic
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph.state import CompiledStateGraph
@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.db.session import get_db
 from app.graph import build_graph
+from app.rag.access import DEFAULT_TENANT, Principal
 from app.rag.base import TOP_K, RetrievedChunk
 from app.rag.factory import get_store
 from app.rag.rerank import rerank
@@ -20,6 +21,30 @@ from app.rag.rewrite import rewrite_query
 # DbSession이라는 타입 별칭을 만들어두면, 라우터 함수 파라미터에서
 # `db: DbSession`이라고만 써도 FastAPI가 자동으로 get_db()를 호출해 세션을 주입해준다.
 DbSession = Annotated[Session, Depends(get_db)]
+
+
+def get_principal(
+    x_tenant_id: Annotated[str | None, Header()] = None,
+    x_roles: Annotated[str | None, Header()] = None,
+) -> Principal:
+    """요청자의 권한. (M12)
+
+    ★★ 여기가 실제 인증이 들어갈 자리다 ★★
+    지금은 헤더를 그대로 믿는다 - 누구나 `X-Tenant-Id: other`를 보내면 남의 테넌트를
+    볼 수 있다. **이 상태는 보안이 아니라 배선일 뿐이다.**
+
+    실무에서는 이 함수가:
+      1) Authorization 헤더의 JWT를 검증하고(서명·만료·issuer)
+      2) 그 토큰의 클레임에서 tenant_id와 roles를 꺼낸다
+    헤더를 그대로 쓰는 지금 구조와 **함수 시그니처는 같다** - 그래서 인증을 붙일 때
+    이 함수 하나만 바꾸면 되고, 호출하는 쪽(chat.py)은 손대지 않는다.
+    권한을 요청 경로의 한 곳으로 모아두는 것 자체가 그 교체를 싸게 만든다.
+    """
+    roles = frozenset(r.strip() for r in (x_roles or "").split(",") if r.strip())
+    return Principal(tenant_id=x_tenant_id or DEFAULT_TENANT, roles=roles)
+
+
+CurrentPrincipal = Annotated[Principal, Depends(get_principal)]
 
 # 모델과 그래프는 모듈 레벨에 하나만 만들어 재사용한다. ChatAnthropic은 내부에
 # HTTP 커넥션 풀을 들고 있고, 그래프 컴파일도 매 요청마다 할 이유가 없다.
@@ -71,7 +96,7 @@ _checkpointer = InMemorySaver()
 _store = get_store()
 
 
-async def _retrieve(query: str) -> list[RetrievedChunk]:
+async def _retrieve(query: str, principal: Principal) -> list[RetrievedChunk]:
     # graph.py가 받는 retrieve_fn의 실제 구현체.
     #
     # ★ 이 함수에서 SQLAlchemy가 사라졌다 ★ 3-2b에는 with SessionLocal()이 있었다 —
@@ -88,9 +113,11 @@ async def _retrieve(query: str) -> list[RetrievedChunk]:
     # 리랭킹이 꺼져 있으면 1단만 돌고 예전과 완전히 같다 — 켜고 끄는 것이 설정 한 줄이라
     # M6 하네스로 A/B를 돌릴 수 있다.
     if not settings.rerank_enabled:
-        return await asyncio.to_thread(retrieve, _store, query, TOP_K)
+        return await asyncio.to_thread(retrieve, _store, query, principal, TOP_K)
 
-    candidates = await asyncio.to_thread(retrieve, _store, query, settings.rerank_candidates)
+    candidates = await asyncio.to_thread(
+        retrieve, _store, query, principal, settings.rerank_candidates
+    )
     return await rerank(query, candidates, TOP_K)
 
 

@@ -9,6 +9,7 @@
 # get_store("qdrant")를 부르는 순간 CI가 죽었을 것이다.
 import pytest
 
+from app.rag.access import Principal
 from app.rag.base import VectorStore
 from app.rag.factory import get_store, pop_store_arg
 from app.rag.pgvector_store import PgVectorStore
@@ -98,3 +99,58 @@ def test_empty_chunk_list_is_a_valid_delete(monkeypatch):
     assert deleted == 3  # 지운 개수는 그대로 돌려준다
     assert calls["delete"] == 1  # 삭제는 한다
     assert calls["upsert"] == 0  # ★ 빈 upsert는 아예 안 부른다 ★
+
+
+# ─────────────────── M12: 권한 필터 ───────────────────
+
+
+def test_principal_always_includes_the_public_role():
+    """공개 청크(allowed_roles=["*"])는 역할과 무관하게 보여야 한다.
+
+    이 처리를 각 저장소가 따로 하게 두면 한쪽만 빠뜨린다 — 그래서 Principal이
+    한 번에 책임진다. 빠뜨린 쪽은 "공개 문서가 안 보인다"로 드러나는데,
+    권한 버그 중에서는 그나마 눈에 띄는 편이다(반대 방향이 훨씬 위험하다).
+    """
+    assert Principal().role_filter_values == ["*"]
+    assert Principal(roles=frozenset({"hr"})).role_filter_values == ["*", "hr"]
+
+
+def test_principal_is_immutable():
+    # 요청 처리 도중 권한이 넓어지는 사고를 문법으로 막는다.
+    p = Principal(tenant_id="a", roles=frozenset({"hr"}))
+    with pytest.raises(Exception):
+        p.tenant_id = "b"  # type: ignore[misc]
+
+
+def test_qdrant_filter_pins_tenant_with_AND():
+    """★ 이 테스트가 지키는 것이 유출 방지의 전부다 ★
+
+    must는 AND다 — 역할이 아무리 많아도 테넌트가 다르면 못 본다. 이걸 should(OR)로
+    잘못 쓰면 "역할만 맞으면 남의 테넌트도 보이는" 상태가 되는데, **검색 결과가
+    늘어날 뿐 에러는 안 나서** 아무도 눈치채지 못한다.
+    """
+    flt = QdrantStore._access_filter(Principal(tenant_id="acme", roles=frozenset({"hr"})))
+
+    conditions = {c.key: c for c in flt.must}
+    assert set(conditions) == {"tenant_id", "allowed_roles"}
+    assert conditions["tenant_id"].match.value == "acme"
+    assert set(conditions["allowed_roles"].match.any) == {"*", "hr"}
+    # should(OR)가 아니라 must(AND)여야 한다.
+    assert not flt.should
+
+
+def test_search_requires_a_principal():
+    """★ M12의 설계 원칙을 못 박는 테스트 ★
+
+    principal에 기본값을 주면 언젠가 누가 안 넘기고, 그 호출만 조용히 전체 문서를
+    본다. 필수 인자면 그 실수가 TypeError로 즉시 걸린다 —
+    "런타임에 조용히 넓어지는 권한"보다 "호출 시점의 시끄러운 실패"가 낫다.
+    """
+    import inspect
+
+    for store_class in (PgVectorStore, QdrantStore):
+        sig = inspect.signature(store_class.search)
+        assert "principal" in sig.parameters, f"{store_class.__name__}.search에 principal이 없다"
+        assert sig.parameters["principal"].default is inspect.Parameter.empty, (
+            f"{store_class.__name__}.search의 principal에 기본값이 있다 — 빼먹을 수 있게 된다"
+        )

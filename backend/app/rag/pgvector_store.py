@@ -16,6 +16,7 @@ from sqlalchemy import delete, select
 
 from app.db.session import SessionLocal
 from app.models.chunk import DocumentChunk
+from app.rag.access import Principal
 from app.rag.base import TOP_K, Chunk, RetrievedChunk
 
 
@@ -43,6 +44,8 @@ class PgVectorStore:
                         content=c.content,
                         heading_path=c.heading_path,
                         token_count=c.token_count,
+                        tenant_id=c.tenant_id,
+                        allowed_roles=c.allowed_roles,
                         embedding=v,
                     )
                     for c, v in zip(chunks, vectors, strict=True)
@@ -51,7 +54,23 @@ class PgVectorStore:
             db.commit()
         return deleted
 
-    def search(self, query_vector: list[float], top_k: int = TOP_K) -> list[RetrievedChunk]:
+    @staticmethod
+    def _access_clause(principal: Principal):
+        """★ 이 한 함수가 유출을 막는 전부다 ★
+
+        `overlap`은 Postgres 배열의 && 연산자다 - "allowed_roles와 내 역할 목록에
+        겹치는 원소가 하나라도 있나". 공개 청크는 allowed_roles=["*"]이고
+        role_filter_values가 항상 "*"를 포함하므로 자동으로 통과한다.
+
+        tenant_id는 AND로 무조건 걸린다. 역할이 아무리 많아도 남의 테넌트는 못 본다.
+        """
+        return (DocumentChunk.tenant_id == principal.tenant_id) & (
+            DocumentChunk.allowed_roles.overlap(principal.role_filter_values)
+        )
+
+    def search(
+        self, query_vector: list[float], principal: Principal, top_k: int = TOP_K
+    ) -> list[RetrievedChunk]:
         # pgvector의 코사인 거리 연산자 <=> 로 정렬한다. SQL로는:
         #   SELECT *, embedding <=> :v AS distance
         #   FROM document_chunks ORDER BY distance LIMIT :k
@@ -62,7 +81,14 @@ class PgVectorStore:
         # 차이가 3-4 비교에서 다시 나온다.
         distance = DocumentChunk.embedding.cosine_distance(query_vector).label("distance")
         with SessionLocal() as db:
-            stmt = select(DocumentChunk, distance).order_by(distance).limit(top_k)
+            # ★ 필터를 WHERE로 건다 = DB가 거른다 ★ 검색 후 애플리케이션에서
+            # 버리는 방식이면 top-k를 못 채운다(5개 뽑아 3개 버리면 2개만 남는다).
+            stmt = (
+                select(DocumentChunk, distance)
+                .where(self._access_clause(principal))
+                .order_by(distance)
+                .limit(top_k)
+            )
             rows = db.execute(stmt).all()
             # ★ 리스트 조립을 with 블록 "안"에서 한다 ★ rows의 원소는 ORM 객체를
             # 품은 Row라, 세션이 닫힌 뒤 건드리면 DetachedInstanceError 위험이 있다.
@@ -75,6 +101,8 @@ class PgVectorStore:
                     content=row.DocumentChunk.content,
                     distance=row.distance,
                     heading_path=row.DocumentChunk.heading_path,
+                    tenant_id=row.DocumentChunk.tenant_id,
+                    allowed_roles=list(row.DocumentChunk.allowed_roles),
                 )
                 for row in rows
             ]

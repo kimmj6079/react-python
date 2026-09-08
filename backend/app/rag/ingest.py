@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 from app.core.config import settings
+from app.rag.access import DEFAULT_ALLOWED_ROLES, DEFAULT_TENANT_ID
 from app.rag.base import Chunk, HybridStore, VectorStore
 from app.rag.chunking import MAX_TOKENS, OVERLAP_TOKENS, split_markdown
 from app.rag.embedding import embed_passages, embed_sparse_passages
@@ -47,6 +48,8 @@ def ingest_text(
     overlap_tokens: int = OVERLAP_TOKENS,
     strip_headers: bool = False,
     embed_heading_path: bool = False,
+    tenant_id: str = DEFAULT_TENANT_ID,
+    allowed_roles: list[str] | None = None,
 ) -> tuple[int, int, list[int]]:
     """청킹 → 임베딩 → 업서트. (청크 수, 삭제 수, 청크별 토큰 수)를 돌려준다.
 
@@ -94,6 +97,13 @@ def ingest_text(
         if embed_heading_path and c.heading_path:
             return f"{c.heading_path}\n\n{c.content}"
         return c.content
+
+    # ★ M12: 청크에 권한을 새긴다 ★ 인입 시점에 정해지고, 검색은 그걸 필터로만 본다.
+    # 인입할 때 안 붙이면 나중에 붙일 방법이 없다 - 전부 재인입해야 한다.
+    roles = allowed_roles or list(DEFAULT_ALLOWED_ROLES)
+    for chunk in chunks:
+        chunk.tenant_id = tenant_id
+        chunk.allowed_roles = list(roles)
 
     texts = [embed_text(c) for c in chunks]
 

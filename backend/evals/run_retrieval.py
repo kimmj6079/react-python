@@ -23,6 +23,7 @@ from datetime import datetime
 from pathlib import Path
 
 from app.core.config import settings
+from app.rag.access import Principal
 from app.rag.base import HybridStore, RetrievedChunk
 from app.rag.chunking import MAX_TOKENS, OVERLAP_TOKENS
 from app.rag.embedding import MODEL_NAME
@@ -45,6 +46,10 @@ RESULTS_DIR = EVALS_DIR / "results"
 # M6~M8의 케이스는 전부 단발 질문이라 **대화형 실패를 한 번도 잡아내지 못했다.**
 # "그거 프로덕션에서는?"을 그대로 임베딩하면 검색이 완전히 실패하는데, 그 실패가
 # 지표에 안 나타나면 없는 문제처럼 보인다.
+# 평가는 기본 테넌트로 돈다. 골든셋 문서가 전부 공개(allowed_roles=['*'])라
+# 필터가 결과를 바꾸지 않는다 - 즉 M12 이전 숫자와 그대로 비교된다.
+PRINCIPAL = Principal()
+
 KINDS = ["normal", "keyword", "unanswerable", "multiturn"]
 
 
@@ -233,10 +238,12 @@ def main() -> None:
             # ★ 리랭킹은 프로덕션과 같은 2단이어야 한다 ★ 넉넉히 뽑아서 다시 정렬한다.
             # top_k만 뽑아 리랭킹하면 "순서만 바꾸기"라 hit@5가 절대 안 오른다 —
             # 재현율은 1단이 담당한다는 역할 분담이 여기서도 그대로다.
-            pool = retrieve(store, question, settings.rerank_candidates, hybrid=not args.dense)
+            pool = retrieve(
+                store, question, PRINCIPAL, settings.rerank_candidates, hybrid=not args.dense
+            )
             chunks = asyncio.run(rerank(question, pool, args.top_k))
         else:
-            chunks = retrieve(store, question, args.top_k, hybrid=not args.dense)
+            chunks = retrieve(store, question, PRINCIPAL, args.top_k, hybrid=not args.dense)
         if args.shuffle:
             rng.shuffle(chunks)
         rows.append(

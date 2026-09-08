@@ -19,6 +19,7 @@
 import sys
 import time
 
+from app.rag.access import Principal
 from app.rag.base import TOP_K
 from app.rag.embedding import embed_query
 from app.rag.factory import get_store
@@ -60,7 +61,7 @@ def main() -> None:
         elapsed = {}
         for name, store in stores.items():
             started = time.perf_counter()
-            results[name] = store.search(vector)
+            results[name] = store.search(vector, Principal())
             elapsed[name] = (time.perf_counter() - started) * 1000
 
         pg, qd = results["pgvector"], results["qdrant"]

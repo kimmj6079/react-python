@@ -10,12 +10,16 @@
 #   2) 자연 키를 못 쓴다              → uuid5로 결정론적 id를 만든다 (_point_id)
 #   3) 트랜잭션이 없다                → 삭제와 삽입 사이에 빈 창이 생긴다 (upsert_document)
 #   4) 거리가 아니라 점수를 준다       → 1 - score로 변환한다 (search)
+import logging
 import uuid
 
 from qdrant_client import QdrantClient, models
 
 from app.core.config import settings
+from app.rag.access import Principal
 from app.rag.base import (
+    DEFAULT_ALLOWED_ROLES,
+    DEFAULT_TENANT_ID,
     EMBEDDING_DIM,
     HYBRID_CANDIDATES,
     TOP_K,
@@ -29,6 +33,8 @@ from app.rag.base import (
 # graph.py의 retrieve 노드는 asyncio.to_thread로 도는데, 여기서 무한정 매달리면
 # 스레드 풀이 통째로 막혀서 3-2b가 이벤트 루프를 지키려고 만든 방어가 무력해진다.
 # 즉 "느린 Qdrant"가 "챗봇 전체 정지"로 번지는 경로가 이 상수 하나로 끊긴다.
+logger = logging.getLogger(__name__)
+
 TIMEOUT_SECONDS = 5
 
 # 결정론적 UUID를 만들 때 쓰는 네임스페이스. 값 자체는 아무거나 상관없지만
@@ -88,7 +94,37 @@ class QdrantStore:
                     SPARSE_NAME: models.SparseVectorParams(modifier=models.Modifier.IDF)
                 },
             )
+        # ★ 인덱스 생성을 create_collection **밖**에 둔다 ★
+        # 안에 두면 "이미 있는 컬렉션"에는 영원히 안 붙는다. 실제로 그렇게 짰다가
+        # payload_schema가 비어 있는 것을 보고 고쳤다 — 그리고 이건 **에러가 안 나는
+        # 종류의 실패**다(인덱스 없이도 필터는 동작한다). M12를 처음부터 새로 만든
+        # 환경에서만 인덱스가 생기고, 기존 배포에는 안 생기는 상태가 됐을 것이다.
+        # _ensure_collection은 프로세스당 한 번만 도니 비용도 무시할 만하다.
+        self._create_access_indexes()
         self._collection_ready = True
+
+    def _create_access_indexes(self) -> None:
+        """★ M12: 필터 대상 필드에 payload 인덱스를 만든다 ★
+
+        인덱스가 없어도 필터는 "동작한다" - 그래서 빼먹기 쉽다. 문제는 성능이 아니라
+        **정확성**이다: 필터를 걸면 HNSW 그래프 탐색이 조건을 만족하는 이웃을 못 찾아
+        **top-k가 조용히 비거나 줄어든다.** 에러는 안 나고 결과만 비는 종류라
+        "왜 검색이 안 되지"로만 보인다.
+
+        (지금 말뭉치는 138청크라 Qdrant가 전수 스캔으로 처리해서 이 증상이 안 난다.
+        데이터가 커져 HNSW가 실제로 쓰이기 시작하는 순간 터지는 종류의 버그라,
+        **지금 안 넣으면 나중에 원인을 못 찾는다.**)
+        """
+        for field in ("tenant_id", "allowed_roles"):
+            try:
+                self._client.create_payload_index(
+                    collection_name=self._collection,
+                    field_name=field,
+                    field_schema=models.PayloadSchemaType.KEYWORD,
+                )
+            except Exception:
+                # 이미 있으면 실패한다 - 멱등하게 넘어간다.
+                logger.debug("payload 인덱스가 이미 있다: %s", field)
 
     @staticmethod
     def _point_id(source: str, chunk_index: int) -> str:
@@ -174,6 +210,9 @@ class QdrantStore:
                         # 읽는 쪽이 .get()으로 방어해야 한다(아래 search 참고).
                         "heading_path": chunk.heading_path,
                         "token_count": chunk.token_count,
+                        # ★ M12: 권한 필드 ★ payload 필터의 대상이 된다.
+                        "tenant_id": chunk.tenant_id,
+                        "allowed_roles": chunk.allowed_roles,
                     },
                 )
                 for chunk, vector, sparse in zip(chunks, vectors, sparse_list, strict=True)
@@ -189,7 +228,29 @@ class QdrantStore:
             payload[SPARSE_NAME] = models.SparseVector(indices=indices, values=values)
         return payload
 
-    def search(self, query_vector: list[float], top_k: int = TOP_K) -> list[RetrievedChunk]:
+    @staticmethod
+    def _access_filter(principal: Principal) -> models.Filter:
+        """★ 이 필터가 유출을 막는 전부다 ★
+
+        must는 AND다 - 테넌트가 다르면 역할이 아무리 많아도 안 보인다.
+        MatchAny는 "allowed_roles 배열에 이 값들 중 하나라도 있나"이고,
+        role_filter_values가 항상 "*"를 포함하므로 공개 청크는 자동 통과한다.
+        """
+        return models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="tenant_id", match=models.MatchValue(value=principal.tenant_id)
+                ),
+                models.FieldCondition(
+                    key="allowed_roles",
+                    match=models.MatchAny(any=principal.role_filter_values),
+                ),
+            ]
+        )
+
+    def search(
+        self, query_vector: list[float], principal: Principal, top_k: int = TOP_K
+    ) -> list[RetrievedChunk]:
         self._ensure_collection()
 
         # 실측 ⑤: 반환은 리스트가 아니라 QueryResponse다. .points를 꺼내야
@@ -202,6 +263,7 @@ class QdrantStore:
             # ★ M8에서 늘었다 ★ 벡터에 이름이 생겼으므로 "어느 벡터로 찾을지"를
             # 지목해야 한다. 안 주면 이름 없는 기본 벡터를 찾다가 실패한다.
             using=DENSE_NAME,
+            query_filter=self._access_filter(principal),
             limit=top_k,
             with_payload=True,
         )
@@ -211,6 +273,7 @@ class QdrantStore:
         self,
         query_vector: list[float],
         query_sparse: SparseVector,
+        principal: Principal,
         top_k: int = TOP_K,
         candidates: int = HYBRID_CANDIDATES,
     ) -> list[RetrievedChunk]:
@@ -225,20 +288,29 @@ class QdrantStore:
         """
         self._ensure_collection()
         indices, values = query_sparse
+        access = self._access_filter(principal)
 
         response = self._client.query_points(
             collection_name=self._collection,
             # prefetch = "융합하기 전에 각각 이만큼 뽑아둬라". 재현율 담당이라
             # top_k보다 훨씬 넉넉하게(기본 30) 뽑는다.
+            # ★ 필터를 prefetch 양쪽 모두에 건다 ★ 융합 뒤에 한 번 거는 것으로는
+            # 부족하다 - dense 30개와 sparse 30개를 뽑는 단계에서 이미 남의 청크가
+            # 자리를 차지하면, 융합 후 걸러봐야 top-k가 비어버린다.
+            # "필터는 가장 이른 단계에서"가 원칙이고 여기서는 그게 prefetch다.
             prefetch=[
-                models.Prefetch(query=query_vector, using=DENSE_NAME, limit=candidates),
+                models.Prefetch(
+                    query=query_vector, using=DENSE_NAME, filter=access, limit=candidates
+                ),
                 models.Prefetch(
                     query=models.SparseVector(indices=indices, values=values),
                     using=SPARSE_NAME,
+                    filter=access,
                     limit=candidates,
                 ),
             ],
             query=models.FusionQuery(fusion=models.Fusion.RRF),
+            query_filter=access,
             limit=top_k,
             with_payload=True,
         )
@@ -256,6 +328,8 @@ class QdrantStore:
                 # 스키마가 없어서 "없는 키"가 그대로 KeyError가 된다 - 스키마 없는
                 # 저장소의 편함이 그대로 대가가 되는 지점이다.
                 heading_path=point.payload.get("heading_path", ""),
+                tenant_id=point.payload.get("tenant_id", DEFAULT_TENANT_ID),
+                allowed_roles=list(point.payload.get("allowed_roles", DEFAULT_ALLOWED_ROLES)),
                 # ★ 실측 ⑤가 강제한 변환 ★ Qdrant의 score는 "유사도"(높을수록 가깝다)라
                 # pgvector의 cosine_distance와 방향이 반대다. 코사인에서는
                 # distance = 1 - score 가 정확히 성립한다(probe에서 손계산과 대조 확인).

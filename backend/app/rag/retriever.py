@@ -11,6 +11,7 @@
 import sys
 
 from app.core.config import settings
+from app.rag.access import Principal
 from app.rag.base import TOP_K, HybridStore, RetrievedChunk, VectorStore
 from app.rag.embedding import embed_query, embed_sparse_query
 from app.rag.factory import get_store, pop_store_arg
@@ -19,10 +20,19 @@ from app.rag.factory import get_store, pop_store_arg
 def retrieve(
     store: VectorStore,
     query: str,
+    principal: Principal,
     top_k: int = TOP_K,
     *,
     hybrid: bool | None = None,
 ) -> list[RetrievedChunk]:
+    """★ M12: principal이 세 번째 **필수** 인자다 ★
+
+    기본값을 주지 않은 것이 이 마일스톤의 핵심이다. `principal=None`이면 언젠가
+    누가 안 넘기고, 그 호출만 조용히 전체 문서를 보게 된다 - 유출은 그렇게 난다.
+    필수로 두면 새 호출 지점이 생길 때마다 **TypeError로 즉시** 걸린다.
+    (실제로 이 변경 하나로 retriever/deps/evals/judge 네 곳이 전부 컴파일 에러가 났고,
+    그게 정확히 "권한을 지나가는 경로가 넷"이라는 뜻이었다.)
+    """
     # store를 인자로 받는 이유는 build_graph가 model·checkpointer·retrieve_fn을
     # 인자로 받는 것과 완전히 같다 — 이 함수가 어느 저장소인지 몰라야 3-4에서
     # 설정 한 줄로 갈아끼워진다. 타입을 PgVectorStore가 아니라 VectorStore로 잡은 것도
@@ -35,8 +45,8 @@ def retrieve(
     # (runtime_checkable Protocol) — pgvector 구현이 base.py를 몰라도 되는 이유다.
     use_hybrid = settings.hybrid_search if hybrid is None else hybrid
     if use_hybrid and isinstance(store, HybridStore):
-        return store.search_hybrid(embed_query(query), embed_sparse_query(query), top_k)
-    return store.search(embed_query(query), top_k)
+        return store.search_hybrid(embed_query(query), embed_sparse_query(query), principal, top_k)
+    return store.search(embed_query(query), principal, top_k)
 
 
 def main() -> None:
@@ -61,7 +71,8 @@ def main() -> None:
     store = get_store(store_name)
     mode = "hybrid" if (settings.hybrid_search and isinstance(store, HybridStore)) else "dense"
     print(f"[저장소: {store_name or settings.vector_store} · 검색: {mode}]")
-    results = retrieve(store, query)
+    # CLI는 기본 테넌트로 조회한다. 실제 사용자 요청은 헤더에서 온다(deps.py).
+    results = retrieve(store, query, Principal())
 
     if not results:
         print("검색 결과 없음 - 저장소가 비어 있을 수 있다 (먼저 app.rag.ingest로 인입)")

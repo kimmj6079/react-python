@@ -26,6 +26,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from app.core.config import settings
 from app.core.tracing import get_langfuse_client
 from app.graph import build_graph
+from app.rag.access import Principal
 from app.rag.embedding import embed_query
 from app.rag.factory import get_store
 from evals.judge import judge
@@ -72,7 +73,7 @@ def build_task(graph):
         """
         question = item.input["question"]
         state = await graph.ainvoke(
-            {"messages": [{"role": "user", "content": question}]},
+            {"messages": [{"role": "user", "content": question}], "principal": Principal()},
             {"configurable": {"thread_id": f"lf-eval-{item.id}"}},
         )
         return {
@@ -92,7 +93,7 @@ def build_retrieval_evaluator(store):
             # unanswerable은 정답 청크가 없어서 hit@k도 MRR도 정의되지 않는다.
             # 0점으로 기록하면 "검색이 나쁘다"로 오해되므로 아예 점수를 남기지 않는다.
             return []
-        chunks = store.search(embed_query(input["question"]))
+        chunks = store.search(embed_query(input["question"]), Principal())
         relevance = [any(s in c.content for s in substrings) for c in chunks]
         return [
             Evaluation(name="hit@5", value=float(hit_at_k(relevance, 5)), data_type="NUMERIC"),
@@ -153,7 +154,7 @@ def run_experiment() -> None:
     )
     graph = build_graph(
         model,
-        retrieve_fn=lambda q: store.search(embed_query(q)),
+        retrieve_fn=lambda q, principal=None: store.search(embed_query(q), Principal()),
         checkpointer=InMemorySaver(),
     )
     anthropic_client = AsyncAnthropic(api_key=settings.anthropic_api_key)

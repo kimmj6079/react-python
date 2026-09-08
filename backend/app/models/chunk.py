@@ -6,10 +6,11 @@
 from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import DateTime, Integer, String, Text, func
+from sqlalchemy import ARRAY, JSON, DateTime, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
+from app.rag.access import DEFAULT_TENANT_ID
 from app.rag.base import EMBEDDING_DIM
 
 # ★ 3-3c에서 EMBEDDING_DIM이 이 파일을 떠났다 ★
@@ -49,6 +50,22 @@ class DocumentChunk(Base):
     # "청크가 한도에 붙어 있나 / 너무 잘게 쪼개졌나"를 SQL로 볼 수 있어야
     # M7의 청킹 파라미터를 숫자로 조정할 수 있다.
     token_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+
+    # ★ M12: 권한 필드 ★ 검색 시 WHERE로 걸러진다. 애플리케이션에서 사후 필터링하지
+    # 않는 이유: 5개 뽑아서 3개를 버리면 2개만 남는다 — top-k를 채우지 못한다.
+    tenant_id: Mapped[str] = mapped_column(
+        String(100), nullable=False, server_default=DEFAULT_TENANT_ID, index=True
+    )
+    # Postgres 배열. && (overlap) 연산자로 "내 역할 중 하나라도 겹치나"를 한 번에 본다.
+    # ★ 방언별 변형 ★ Postgres는 ARRAY(+ && overlap 연산자), SQLite는 JSON을 쓴다.
+    # pytest가 SQLite 인메모리로 도는데 SQLite에는 ARRAY 타입이 없어서
+    # Base.metadata.create_all이 CompileError로 죽는다.
+    # pgvector 저장소는 Postgres에서만 돌므로 실제 쿼리(overlap)는 늘 ARRAY 쪽이고,
+    # SQLite 변형은 "테이블이 만들어지게" 하는 용도다 - 테스트가 이 테이블을
+    # 검색에 쓰지는 않는다(챗봇 테스트는 그래프를 통째로 가짜로 바꾼다).
+    allowed_roles: Mapped[list[str]] = mapped_column(
+        ARRAY(String(100)).with_variant(JSON, "sqlite"), nullable=False, server_default="{*}"
+    )
 
     # 임베딩 벡터. Postgres에는 vector(1024) 타입으로 저장된다.
     embedding: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIM), nullable=False)

@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 
 from app.core.config import settings
 from app.graph import build_graph
+from app.rag.access import Principal
 from app.rag.embedding import embed_query
 from app.rag.factory import get_store
 from app.rag.ingest import REPO_ROOT
@@ -94,7 +95,7 @@ async def generate(case: Case, graph) -> tuple[str, str]:
     뒤 질문의 답에 섞인다(2b의 스레드 격리를 평가에서도 지켜야 한다).
     """
     state = await graph.ainvoke(
-        {"messages": [{"role": "user", "content": case.question}]},
+        {"messages": [{"role": "user", "content": case.question}], "principal": Principal()},
         {"configurable": {"thread_id": f"eval-{case.id}"}},
     )
     answer = state["messages"][-1].text
@@ -136,7 +137,7 @@ async def run(limit: int | None, store_name: str | None) -> list[dict]:
     )
     graph = build_graph(
         model,
-        retrieve_fn=lambda q: store.search(embed_query(q)),
+        retrieve_fn=lambda q, principal=None: store.search(embed_query(q), Principal()),
         checkpointer=InMemorySaver(),
     )
     client = AsyncAnthropic(api_key=settings.anthropic_api_key)

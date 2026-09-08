@@ -8,8 +8,10 @@
 #
 # 이 파일은 app.db도 qdrant_client도 import하지 않는다. 그게 "계약"이라는 말의 실체다 —
 # 계약 파일이 구현을 import하는 순간, 계약을 읽는 사람이 구현을 같이 읽게 된다.
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
+
+from app.rag.access import DEFAULT_ALLOWED_ROLES, DEFAULT_TENANT_ID, Principal
 
 # 희소(sparse) 벡터 하나. BM25가 만드는 "어떤 토큰이 얼마나 중요한가"의 목록이다.
 # dense 벡터가 1024개 실수를 빽빽이 채우는 것과 달리, 문서에 등장한 토큰만 (인덱스, 값)
@@ -63,6 +65,15 @@ class Chunk:
     chunk_index: int
     token_count: int
 
+    # ★ M12: 권한 필드 ★ 청크 자체가 "누구 것인가"를 들고 다닌다. 별도 테이블로
+    # 조인하지 않는 이유: 벡터 검색은 저장소 안에서 필터와 함께 한 번에 끝나야 하고,
+    # 검색 후 애플리케이션이 걸러내는 방식은 **top-k를 채우지 못한다**
+    # (5개 뽑아서 3개를 버리면 2개만 남는다).
+    tenant_id: str = DEFAULT_TENANT_ID
+    # ["*"]는 "이 테넌트 안에서 모두에게 공개". 빈 리스트를 쓰지 않는 이유는
+    # access.py의 PUBLIC_ROLE 주석 참고.
+    allowed_roles: list[str] = field(default_factory=lambda: list(DEFAULT_ALLOWED_ROLES))
+
 
 @dataclass
 class RetrievedChunk:
@@ -86,6 +97,13 @@ class RetrievedChunk:
     # payload)에는 이 필드가 없다 (b) dataclass는 기본값 있는 필드가 없는 필드보다
     # 앞에 오면 TypeError를 낸다 — 그래서 새 필드는 맨 뒤에 붙인다.
     heading_path: str = ""
+
+    # ★ M12에서 늘었다 ★ 검색 결과가 어느 테넌트/역할의 것인지 그대로 들고 온다.
+    # 필터가 이미 걸러줬는데도 실어 보내는 이유는 **디버깅과 감사(audit)** 다 —
+    # "왜 이게 보였지"를 물을 때 결과 자체에 답이 있어야 한다. 필터를 잘못 짜서
+    # 남의 것이 섞였을 때, 결과에 tenant_id가 없으면 그 사실조차 알 수 없다.
+    tenant_id: str = DEFAULT_TENANT_ID
+    allowed_roles: list[str] = field(default_factory=lambda: list(DEFAULT_ALLOWED_ROLES))
 
 
 @runtime_checkable
@@ -135,8 +153,17 @@ class VectorStore(Protocol):
         "이걸 못 하는 구현도 계약을 지킨다"는 성질은 유지했다.
         """
 
-    def search(self, query_vector: list[float], top_k: int = TOP_K) -> list[RetrievedChunk]:
-        """질문 벡터와 가장 가까운 청크 top_k개를 distance 오름차순으로 돌려준다."""
+    def search(
+        self, query_vector: list[float], principal: Principal, top_k: int = TOP_K
+    ) -> list[RetrievedChunk]:
+        """질문 벡터와 가장 가까운 청크 top_k개를 distance 오름차순으로 돌려준다.
+
+        ★ M12: principal이 **필수 인자**다 ★ 기본값을 주지 않았다.
+        `search(vector, filter=None)`처럼 옵션으로 두면 언젠가 누가 빼먹고, 그 순간이
+        유출 사고다. 필수로 두면 빼먹는 것이 **TypeError로 즉시** 걸린다 —
+        런타임에 조용히 넓어지는 권한보다 컴파일 시점의 시끄러운 실패가 낫다.
+        (retrieve_fn에만 기본값을 안 준 3-2b의 판단과 같은 종류의 결정이다.)
+        """
 
 
 @runtime_checkable
@@ -161,6 +188,7 @@ class HybridStore(Protocol):
         self,
         query_vector: list[float],
         query_sparse: SparseVector,
+        principal: Principal,
         top_k: int = TOP_K,
         candidates: int = HYBRID_CANDIDATES,
     ) -> list[RetrievedChunk]:

@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessageChunk
 
-from app.api.deps import Graph
+from app.api.deps import CurrentPrincipal, Graph
 from app.core.ai_sdk import (
     UI_MESSAGE_STREAM_HEADERS,
     latest_user_text,
@@ -25,7 +25,9 @@ def chat_health() -> dict[str, str]:
 
 
 @router.post("/chat")
-async def chat(payload: ChatRequest, graph: Graph) -> StreamingResponse:
+async def chat(
+    payload: ChatRequest, graph: Graph, principal: CurrentPrincipal
+) -> StreamingResponse:
     # 2a에서는 여기서 히스토리 전체를 변환했다. 이제는 이번 턴의 새 발화 하나만
     # 뽑는다 — 나머지는 체크포인터가 이미 갖고 있다.
     text = latest_user_text(payload.messages)
@@ -84,7 +86,10 @@ async def chat(payload: ChatRequest, graph: Graph) -> StreamingResponse:
         # 다른 모드: "values"(매 스텝 State 전체), "updates"(노드가 반환한 것만),
         # "custom"(노드가 직접 써넣은 값). 우리한테 필요한 건 토큰 단위라 "messages"다.
         async for chunk, _meta in graph.astream(
-            {"messages": [{"role": "user", "content": text}]},
+            # ★ M12: principal을 그래프 입력에 실는다 ★ config가 아니라 입력인 이유는
+            # State 주석 참고. 체크포인터가 State를 저장하므로 이 값도 함께 저장되는데,
+            # 매 턴 덮어써지고 리스트처럼 쌓이지 않아 문제되지 않는다.
+            {"messages": [{"role": "user", "content": text}], "principal": principal},
             config,
             stream_mode="messages",
         ):

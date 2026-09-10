@@ -85,3 +85,27 @@ def _langfuse_off(monkeypatch):
     monkeypatch.setattr(tracing, "_client", None)
     yield
     tracing._client = None
+
+
+@pytest.fixture(autouse=True)
+def _timings_off(monkeypatch):
+    """★ 테스트에서는 지연 계측을 응답에 싣지 않는다 ★ (M13-b)
+
+    이 fixture가 없으면 finish 프레임이 이렇게 나간다:
+
+        data: {"type":"finish","finishReason":"stop","messageMetadata":{"timings":{...}}}
+
+    그리고 그 숫자는 **실행할 때마다 다르다.** 이 저장소의 중심 테스트인
+    `test_stream_matches_ai_sdk_wire_format`은 M1-1b에서 캡처한 바이트와 `==` 하나로
+    비교하는데, 비결정적인 값이 한 글자라도 섞이는 순간 그 방식이 통째로 무너진다.
+
+    ★ 왜 "테스트를 느슨하게" 고치지 않았나 ★
+    정규식으로 timings만 지우거나 부분 문자열 비교로 바꿀 수도 있다. 그러면 **그 뒤로
+    영원히 와이어 전체를 못 지킨다** — 나중에 누가 프레임 순서를 바꿔도 테스트가 안 잡는다.
+    비결정성은 **테스트가 아니라 입력에서** 제거하는 것이 원칙이다. 시각·랜덤 id를
+    다룰 때와 같은 판단이고, autouse로 두어 각 테스트의 예의에 맡기지 않는다.
+
+    켜진 쪽을 보고 싶은 테스트는 스스로 켠다(test_chat.py의 timings_on fixture) —
+    위 _langfuse_off와 정확히 같은 구조다.
+    """
+    monkeypatch.setattr(settings, "timings_in_response", False, raising=False)

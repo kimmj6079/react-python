@@ -72,7 +72,7 @@ def latest_user_text(messages: list[UIMessage]) -> str:
 # ---------------------------------------------------------------------------
 # 내보내기
 # ---------------------------------------------------------------------------
-def sse(payload: dict[str, str]) -> str:
+def sse(payload: dict[str, Any]) -> str:
     # separators로 공백을 없애는 이유: 파이썬 json.dumps 기본값은 '{"a": 1}'인데
     # JS의 JSON.stringify는 '{"a":1}'다(1b 캡처가 후자). 기능 차이는 없지만,
     # 캡처한 바이트와 == 하나로 비교할 수 있게 맞춰둔다.
@@ -122,6 +122,7 @@ def source_part(chunk) -> dict[str, str]:
 async def ui_message_stream(
     deltas: AsyncIterable[str],
     sources_fn: Callable[[], list[dict[str, str]]] | None = None,
+    metadata_fn: Callable[[], dict[str, Any]] | None = None,
     *,
     text_id: str = "0",
 ) -> AsyncIterator[str]:
@@ -162,7 +163,25 @@ async def ui_message_stream(
     # 정답이므로 그대로 쓴다. M1은 항상 "stop"으로 고정한다 — max_tokens에 걸린
     # 경우를 구분하려면 stream.get_final_message()의 stop_reason을 봐야 하는데,
     # 그러면 스트림을 끝까지 소비한 뒤에야 알 수 있어 구조가 복잡해진다.
-    yield sse({"type": "finish", "finishReason": "stop"})
+    #
+    # ★ M13: 메시지 메타데이터가 여기에 얹힌다 ★
+    # 실측(frontend/scripts/capture-metadata-wire.mjs): 메타데이터는 별도 파트가
+    # 아니라 **finish 프레임 안의 messageMetadata 필드**로 나가고, 프론트에서는
+    # message.metadata로 도착한다. 출처(source)처럼 새 이벤트를 끼워 넣는 게 아니라
+    # 기존 이벤트에 필드가 하나 붙는 형태라, 파서 입장에서 순서 문제가 없다.
+    #
+    # ★ sources_fn과 똑같이 "함수"로 받는다 ★ trace_id는 그래프가 돌기 시작해야
+    # 생기는 값인데 이 제너레이터는 그보다 먼저 만들어진다. 값을 받으면 항상 None이고,
+    # 그러면 **에러 없이 피드백 버튼만 안 나오는** 종류의 버그가 된다.
+    #
+    # 값이 없으면 키 자체를 넣지 않는다. 빈 dict를 실어 보내면 프론트에서
+    # metadata가 truthy가 되어 "traceId 없는 피드백 버튼"이 그려진다.
+    finish: dict[str, Any] = {"type": "finish", "finishReason": "stop"}
+    if metadata_fn is not None:
+        metadata = metadata_fn()
+        if metadata:
+            finish["messageMetadata"] = metadata
+    yield sse(finish)
 
     # 종료 센티넬. JSON이 아니라 리터럴이라 sse()를 통과시키지 않는 유일한 항목.
     yield DONE

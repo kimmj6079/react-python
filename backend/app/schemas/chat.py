@@ -43,3 +43,29 @@ class ChatRequest(BaseModel):
     # 재생성 대상 메시지 id. 새 메시지일 때 JS 쪽 값이 undefined이고
     # JSON.stringify가 그런 키를 통째로 빼므로 "없을 수 있는 값"이어야 한다.
     message_id: str | None = Field(default=None, alias="messageId")
+
+
+class FeedbackRequest(BaseModel):
+    """👍/👎 한 번. (M13)
+
+    ★ 프론트가 traceId를 되돌려 보내는 구조다 ★ 서버가 "마지막 트레이스"를 기억해뒀다가
+    쓰는 방법도 있지만, 그러면 사용자가 세 턴 전 답변에 엄지를 누를 때 엉뚱한 트레이스에
+    점수가 붙는다. **어느 답변에 대한 피드백인지는 화면만 알고 있다** — 그래서 화면이
+    말해줘야 한다. finish 프레임에 traceId를 실어 보낸 이유가 이것이다.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    # 32자리 hex. Langfuse가 만든 값이고 우리는 그대로 돌려받기만 한다.
+    # 형식을 여기서 정규식으로 검증하지 않는 이유: 검증해서 얻는 것이 "422가 조금 더
+    # 빨리 난다"뿐이고, 대신 Langfuse가 id 형식을 바꾸면 우리가 먼저 깨진다.
+    trace_id: str = Field(alias="traceId", min_length=1)
+
+    # ★ Literal로 좁게 받는다 ★ bool로 받으면 나중에 "그저 그럼"이나 별점을 넣고 싶을 때
+    # 와이어 포맷이 통째로 바뀐다. 문자열 유니온이면 값을 하나 더 늘리는 것으로 끝난다.
+    value: Literal["up", "down"]
+
+    # 자유 텍스트 사유(선택). max_length가 없으면 브라우저가 10MB를 보내도 그대로
+    # Langfuse로 흘러간다 — **외부로 나가는 값에는 항상 상한을 건다**(M11의 업로드
+    # 크기 제한과 같은 규칙).
+    comment: str | None = Field(default=None, max_length=1000)

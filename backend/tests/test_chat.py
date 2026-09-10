@@ -10,7 +10,7 @@
 from typing import Any
 
 import pytest
-from langchain_core.callbacks import AsyncCallbackManagerForLLMRun
+from langchain_core.callbacks import AsyncCallbackManagerForLLMRun, BaseCallbackHandler
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessageChunk, BaseMessage, ToolMessage
 from langchain_core.outputs import ChatGenerationChunk, ChatResult
@@ -18,6 +18,8 @@ from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
 
 from app.api.deps import get_graph
+from app.api.routes import chat as chat_routes
+from app.core.config import settings
 from app.graph import build_graph
 from app.main import app
 from app.rag.base import RetrievedChunk
@@ -716,5 +718,200 @@ def test_duplicate_sources_are_collapsed(client):
     try:
         body = client.post("/api/v1/chat", json=_wire(_msg("m1", "user", "질문"))).text
         assert len(_source_parts(body)) == 1
+    finally:
+        del app.dependency_overrides[get_graph]
+
+
+# ---------------------------------------------------------------------------
+# M13 — 피드백 루프: 응답에 손잡이(traceId)를 실어 보내고, 그 손잡이로 점수를 받는다
+# ---------------------------------------------------------------------------
+class FakeHandler(BaseCallbackHandler):
+    """Langfuse CallbackHandler의 대역. 우리가 읽는 표면은 last_trace_id 하나뿐이다.
+
+    ★ 진짜 핸들러를 쓰지 않는 이유 ★ 만드는 순간 Langfuse 클라이언트가 붙고,
+    conftest의 _langfuse_off가 지키는 "pytest는 절대 실제 Langfuse로 보내지 않는다"가
+    무너진다.
+
+    ★ 그런데 BaseCallbackHandler를 상속해야 했다 (테스트가 잡아낸 것) ★
+    처음엔 last_trace_id만 가진 맨 클래스로 썼더니
+        AttributeError: 'FakeHandler' object has no attribute 'run_inline'
+    로 죽었다. 이 대역은 "우리가 값을 읽는 객체"이기만 한 게 아니라 **RunnableConfig의
+    callbacks에 실제로 꽂혀 LangChain 콜백 매니저가 순회하는 객체**다(manager.py:471).
+    즉 우리 코드가 쓰는 표면과 프레임워크가 요구하는 표면이 다르고, 대역은 **둘 다**
+    만족해야 한다. 부모를 상속하면 나머지 표면은 공짜로 따라온다.
+    """
+
+    def __init__(self, trace_id=None):
+        self.last_trace_id = trace_id
+
+
+def test_finish_frame_carries_the_trace_id(client, fake_graph, monkeypatch):
+    """★ 실측한 와이어 모양 그대로인지 (frontend/scripts/capture-metadata-wire.mjs) ★
+
+    메타데이터는 별도 파트가 아니라 finish 프레임 **안의** messageMetadata 필드다.
+    별도 파트로 내보내면 useChat이 message.metadata에 넣어주지 않아서, 에러 없이
+    피드백 버튼만 안 나오는 종류의 실패가 된다.
+    """
+    monkeypatch.setattr(chat_routes, "get_callbacks", lambda: [FakeHandler("abc123")])
+
+    body = client.post("/api/v1/chat", json=_wire(_msg("m1", "user", "안녕?"))).text
+
+    assert (
+        'data: {"type":"finish","finishReason":"stop","messageMetadata":{"traceId":"abc123"}}'
+        in body
+    )
+
+
+def test_no_trace_id_means_no_metadata_field(client, fake_graph):
+    """트레이싱이 꺼져 있으면 messageMetadata 키 자체가 없어야 한다.
+
+    ★ 빈 dict를 실어 보내면 안 된다 ★ 프론트에서 message.metadata가 truthy가 되어
+    "traceId 없는 피드백 버튼"이 그려지고, 누르면 422가 난다. **"저장할 곳이 없으면
+    버튼도 없다"** 가 와이어 계층에서부터 성립해야 한다.
+    (conftest의 _langfuse_off가 키를 비워두므로 get_callbacks()가 빈 리스트다.)
+    """
+    body = client.post("/api/v1/chat", json=_wire(_msg("m1", "user", "안녕?"))).text
+
+    assert "messageMetadata" not in body
+    assert body == EXPECTED_SSE  # M1 캡처와 완전히 같다
+
+
+@pytest.fixture
+def feedback_calls(monkeypatch):
+    """record_feedback을 대역으로 갈아끼우고 호출 인자를 모은다.
+
+    라우터의 관심사는 "무엇을 어떤 모양으로 넘기는가"이지 Langfuse 전송이 아니다.
+    전송까지 검증하려 들면 네트워크가 필요해지고, 그건 이 저장소가 CI에서 금지한 것이다.
+    """
+    calls = []
+    monkeypatch.setattr(settings, "langfuse_public_key", "pk-lf-test", raising=False)
+    monkeypatch.setattr(settings, "langfuse_secret_key", "sk-lf-test", raising=False)
+    monkeypatch.setattr(chat_routes, "record_feedback", lambda *a, **kw: calls.append((a, kw)))
+    return calls
+
+
+def test_thumbs_up_becomes_a_positive_score(client, feedback_calls):
+    response = client.post(
+        "/api/v1/chat/feedback",
+        json={"traceId": "abc123", "value": "up"},
+    )
+
+    # 202 Accepted — 큐에 넣었을 뿐 아직 전송되지 않았다. 200은 거짓말이다.
+    assert response.status_code == 202
+    assert feedback_calls == [(("abc123",), {"positive": True, "comment": None})]
+
+
+def test_thumbs_down_carries_the_comment(client, feedback_calls):
+    response = client.post(
+        "/api/v1/chat/feedback",
+        json={"traceId": "abc123", "value": "down", "comment": "문서에 있는 내용인데 모른대요"},
+    )
+
+    assert response.status_code == 202
+    assert feedback_calls[0][1] == {
+        "positive": False,
+        "comment": "문서에 있는 내용인데 모른대요",
+    }
+
+
+def test_feedback_without_tracing_is_503_not_a_silent_200(client):
+    """★ 저장할 곳이 없으면 그렇다고 말한다 ★
+
+    조용히 200을 주면 사용자는 피드백이 쌓이는 줄 알고, 우리는 왜 데이터가 없는지
+    모른다. M11에서 "인입 실패를 조용히 삼키면 최악"을 배운 것과 같은 실패 형태다.
+    (conftest의 _langfuse_off가 키를 비워둔 상태 그대로 부른다.)
+    """
+    response = client.post("/api/v1/chat/feedback", json={"traceId": "abc", "value": "up"})
+
+    assert response.status_code == 503
+    assert "LANGFUSE" in response.json()["detail"]
+
+
+def test_unknown_feedback_value_is_rejected(client, feedback_calls):
+    # Literal["up","down"]로 좁게 받은 값. "좋아요"나 5 같은 값이 조용히 통과해
+    # Langfuse에 이상한 score가 쌓이는 것을 막는다.
+    response = client.post("/api/v1/chat/feedback", json={"traceId": "abc", "value": "meh"})
+
+    assert response.status_code == 422
+    assert feedback_calls == []
+
+
+def test_overlong_comment_is_rejected(client, feedback_calls):
+    # 외부(Langfuse)로 나가는 값에는 항상 상한을 건다 — M11의 업로드 크기 제한과 같은 규칙.
+    response = client.post(
+        "/api/v1/chat/feedback",
+        json={"traceId": "abc", "value": "down", "comment": "가" * 1001},
+    )
+
+    assert response.status_code == 422
+    assert feedback_calls == []
+
+
+# ---------------------------------------------------------------------------
+# M13-b — 단계별 지연 계측
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def timings_on(monkeypatch):
+    # conftest의 _timings_off(autouse)를 이 테스트에서만 되돌린다.
+    monkeypatch.setattr(settings, "timings_in_response", True, raising=False)
+
+
+def _finish_frame(body: str) -> dict:
+    import json
+
+    line = next(ln for ln in body.splitlines() if '"type":"finish"' in ln)
+    return json.loads(line[6:])
+
+
+def test_timings_ride_on_the_same_finish_frame_as_the_trace_id(client, fake_graph, timings_on):
+    """★ 13-a에서 뚫어둔 통로에 13-b가 그대로 얹힌다 ★
+
+    새 엔드포인트도 새 SSE 파트도 만들지 않았다. "응답에 꼬리표를 붙이는 자리"를
+    한 번 만들어두면 두 번째 꼬리표는 필드 하나라는 것을 이 테스트가 지킨다.
+    """
+    body = client.post("/api/v1/chat", json=_wire(_msg("m1", "user", "안녕?"))).text
+    timings = _finish_frame(body)["messageMetadata"]["timings"]
+
+    # generate는 가짜 모델이라도 실제로 await되므로 반드시 잡힌다.
+    assert "generate" in timings
+    # 첫 토큰까지의 시간과 전체 시간. 값은 실행마다 다르므로 "존재"와 "타입"만 본다 —
+    # 숫자 자체를 단언하면 느린 CI에서 깨지는 플래키 테스트가 된다.
+    assert isinstance(timings["ttft"], int)
+    assert timings["total"] >= timings["ttft"]
+
+
+def test_timings_are_off_by_default_in_tests(client, fake_graph):
+    """conftest의 autouse fixture가 실제로 와이어를 결정론적으로 유지하는지."""
+    body = client.post("/api/v1/chat", json=_wire(_msg("m1", "user", "안녕?"))).text
+
+    assert "timings" not in body
+    assert body == EXPECTED_SSE
+
+
+def test_search_stages_are_measured(client, timings_on):
+    """검색 층이 단계별로 쪼개져 잡히는지. (임베딩 / 검색을 따로 재는 것이 요점)"""
+    CALLS.clear()
+
+    def slow_retrieve(*_):
+        # 진짜 임베딩·Qdrant 대신 대역. stage()는 retriever.py 안에 있으므로
+        # 여기서는 "그래프 바깥에서 잰 단계도 합쳐진다"를 대신 확인한다.
+        from app.core.timing import stage
+
+        with stage("embed"):
+            pass
+        with stage("search"):
+            pass
+        return []
+
+    graph = build_graph(FakeChatModel(), retrieve_fn=slow_retrieve, checkpointer=InMemorySaver())
+    app.dependency_overrides[get_graph] = lambda: graph
+    try:
+        body = client.post("/api/v1/chat", json=_wire(_msg("m1", "user", "질문"))).text
+        timings = _finish_frame(body)["messageMetadata"]["timings"]
+        # ★ 이 단언이 지키는 것은 "ContextVar가 스레드를 건너 살아남는다"이다 ★
+        # 실제 경로에서 retrieve는 asyncio.to_thread로 다른 스레드에서 돈다.
+        # 단계마다 ContextVar.set()을 하는 설계였다면 여기서 값이 사라졌을 것이다.
+        assert "embed" in timings
+        assert "search" in timings
     finally:
         del app.dependency_overrides[get_graph]

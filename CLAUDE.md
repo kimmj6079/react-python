@@ -132,7 +132,14 @@ uv run python -m app.rag.ingest ../CLAUDE.md ../SETUP.md ../DEPLOYMENT.md   # �
 uv run python -m app.rag.ingest --store qdrant ../CLAUDE.md                 # Qdrant에 인입
 uv run python -m app.rag.retriever "파이썬 버전은 어떻게 관리해?"            # 챗봇 없이 검색만 확인
 uv run python scripts/compare_stores.py                                     # 두 저장소 나란히 비교
+uv run python scripts/measure_latency.py --repeat 3                         # 단계별 지연 예산 (LLM 없이)
+uv run python scripts/probe_prompt_cache.py                                 # 프롬프트 캐싱 가능 여부 실측
 ```
+
+**재인입은 임베딩 캐시가 받쳐준다**(M13-c). 같은 청크는 두 번 임베딩하지 않으므로
+문서를 고치고 다시 넣을 때 **바뀐 청크만** 계산한다(실측: 138청크 재인입 107초 → 11초).
+캐시는 `backend/.cache/embeddings.sqlite3`(gitignore)이고 **지워도 안전하다** — 다시
+계산될 뿐이다. 캐시가 의심스러우면 `EMBEDDING_CACHE_ENABLED=false`로 끄고 비교한다.
 
 **저장소는 `VECTOR_STORE` 하나로 갈아끼운다**(`pgvector` | `qdrant`, 기본 `pgvector`).
 같은 문서를 양쪽에 각각 인입해야 하고, 한쪽에만 넣은 채 전환하면 챗봇이 "문서를 못 찾는다"고

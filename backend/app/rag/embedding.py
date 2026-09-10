@@ -4,9 +4,13 @@
 # 규칙"을 써야 한다. 다르면 에러가 아니라 검색 품질 붕괴로 나타난다 — 서로 다른
 # 모델이 만든 벡터는 같은 의미 공간에 있지 않아서, 유사도 숫자는 멀쩡히 나오는데
 # 순위가 무작위에 가까워진다. 그래서 모델 이름을 여기 한 곳에만 적고 양쪽이 import한다.
+import logging
+
 from fastembed import SparseTextEmbedding, TextEmbedding
 
 from app.rag.base import EMBEDDING_DIM, SparseVector
+
+logger = logging.getLogger(__name__)
 
 # scripts/probe_embedding.py 실측으로 정한 모델. 한국어 포함 다국어 + 1024차원.
 # e5 계열은 질문에 "query: ", 문서에 "passage: "를 붙여 학습된 비대칭 모델이라,
@@ -33,13 +37,59 @@ def get_model() -> TextEmbedding:
     return _model
 
 
-def embed_passages(texts: list[str]) -> list[list[float]]:
+def _compute_passages(texts: list[str]) -> list[list[float]]:
     # 저장할 문서 조각용. fastembed가 "passage: " 접두어를 자동으로 붙인다.
     # 반환은 넘파이 배열 제너레이터라 list로 소진하고, pgvector 컬럼과
     # Mapped[list[float]] 타입에 맞게 파이썬 리스트로 바꾼다.
     vectors = [v.tolist() for v in get_model().passage_embed(texts)]
     _check_dim(vectors)
     return vectors
+
+
+def embed_passages(texts: list[str]) -> list[list[float]]:
+    """문서 조각 임베딩. 캐시를 먼저 보고, 없는 것만 계산한다. (M13-c)
+
+    ★ 캐시를 호출자가 아니라 여기에 둔 이유 ★ 인입 경로가 둘이다 — CLI(`ingest.py`)와
+    업로드(`documents.py` → M11). 호출자마다 캐시를 붙이면 둘이 어긋나고, 세 번째 경로가
+    생기는 날 그 경로만 캐시가 없다. "임베딩 모델을 한 곳에서 관리한다"는 이 파일의
+    역할에 캐시도 포함시키면 호출자는 아무것도 몰라도 된다 —
+    실제로 ingest.py도 documents.py도 **한 글자도 안 바뀌었다.**
+
+    ★ 캐시 키에 모델 이름이 들어간다 ★ MODEL_NAME을 바꾸면 옛 벡터는 자동으로 미스가
+    된다. 이게 없으면 모델 교체 후 **다른 의미 공간의 벡터를 캐시가 되살려주고**,
+    에러 없이 검색 품질만 무너진다 — 이 파일 머리 주석이 경고하는 바로 그 실패다.
+    """
+    from app.core.config import settings
+
+    if not settings.embedding_cache_enabled:
+        return _compute_passages(texts)
+
+    from app.rag.embedding_cache import get_cache
+
+    # 순서를 유지하며 중복 제거. 같은 문서 안에 같은 조각이 두 번 나오는 일이 실제로
+    # 있고(반복되는 표 머리글 등), 그걸 두 번 임베딩할 이유가 없다.
+    unique = list(dict.fromkeys(texts))
+    cache = get_cache()
+    vectors_by_text = cache.get_many(MODEL_NAME, unique)
+
+    missing = [t for t in unique if t not in vectors_by_text]
+    if missing:
+        computed = _compute_passages(missing)
+        cache.put_many(MODEL_NAME, zip(missing, computed, strict=True))
+        vectors_by_text.update(zip(missing, computed, strict=True))
+
+    logger.info(
+        "임베딩 캐시: %d/%d 적중 (%d개 새로 계산)",
+        len(unique) - len(missing),
+        len(unique),
+        len(missing),
+    )
+
+    result = [vectors_by_text[t] for t in texts]
+    # 캐시에서 온 벡터도 차원을 검증한다. 캐시 파일이 다른 차원의 모델 시절 것이라면
+    # 여기서 시끄럽게 죽는 편이 낫다 — 저장소가 거부할 때까지 가면 메시지가 불친절하다.
+    _check_dim(result)
+    return result
 
 
 def embed_query(text: str) -> list[float]:

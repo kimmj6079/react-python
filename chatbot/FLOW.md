@@ -3,8 +3,8 @@
 > 메시지 하나가 브라우저에서 출발해 화면에 글자로 돌아오기까지, **어느 파일의 어느 줄을 지나는지**
 > 정리한 문서다. 스터디 중 "이건 어디서 하는 거지?"가 생길 때 여기서 찾는다.
 >
-> **기준 시점: M4 코드 완료 (2026-09-07)** — 마일스톤이 끝날 때마다 갱신한다.
-> (M4는 Langfuse 키 등록·대시보드 육안 확인만 남았고 배선은 끝났다.)
+> **기준 시점: M13-b 완료 (2026-09-10)** — 마일스톤이 끝날 때마다 갱신한다.
+> (M4~M12의 노드·필터·인용이 이미 이 그림 안에 들어와 있다.)
 > 진행 순서와 각 단계의 결정·함정 기록은 [README.md](./README.md)에 있다.
 
 ---
@@ -129,13 +129,18 @@ POST /chat ── config = { configurable, callbacks, metadata } ──▶ graph
 | [core/config.py](../backend/app/core/config.py) | 설정 · 시크릿 단일 소스 | `vector_store`, `hybrid_search`, `rerank_enabled`, `query_rewrite_enabled`, `grounding_max_distance`, `langfuse_enabled` | 모델 교체 · 기능 on/off · 새 시크릿 |
 | [core/tracing.py](../backend/app/core/tracing.py) | **관측성** 배선 (M4) | `get_langfuse_client`:32, `get_callbacks`:49, `trace_metadata`:72 | 트레이싱 대상 · 꼬리표가 바뀔 때 |
 
+> `app/core/timing.py`(M13-b, 단계별 지연 계측)는 이 표의 어느 층에도 속하지 않는다 —
+> 모든 층을 가로지르며 `stage()`로 감싸기만 한다. 계측 문맥 밖에서는 아무 일도 안 하므로
+> CLI·평가 스크립트·pytest는 영향을 받지 않는다.
+
 ### RAG — `app/rag/` (M3에서 생긴 층)
 
 | 파일 | 한 줄 역할 | 핵심 심볼 | 무엇을 아는가 |
 |---|---|---|---|
 | [rag/base.py](../backend/app/rag/base.py) | **계약**. import가 없다 | `EMBEDDING_DIM`:35, `TOP_K`:42, `HYBRID_CANDIDATES`:48, `Chunk`:52, `RetrievedChunk`:79, `VectorStore`:110, `HybridStore`:170 | 아무것도 |
 | [rag/access.py](../backend/app/rag/access.py) | **누가 요청했나** (M12) | `PUBLIC_ROLE`:18, `Principal`:25 | 권한 모델이 바뀔 때 |
-| [rag/embedding.py](../backend/app/rag/embedding.py) | 임베딩 모델 단일 소스 (dense + sparse) | `MODEL_NAME`:18, `embed_passages`:36, `embed_query`:45, `SPARSE_MODEL_NAME`:72, `embed_sparse_query`:94 | fastembed |
+| [rag/embedding.py](../backend/app/rag/embedding.py) | 임베딩 모델 단일 소스 (dense + sparse) + **캐시 배선** | `MODEL_NAME`:22, `_compute_passages`:40, `embed_passages`:49, `embed_query`:95 | fastembed |
+| [rag/embedding_cache.py](../backend/app/rag/embedding_cache.py) | **같은 청크를 두 번 임베딩하지 않는다** (M13-c) | `EmbeddingCache`:55, `get_cache`:152 | sqlite 파일 하나 |
 | [rag/chunking.py](../backend/app/rag/chunking.py) | **구조 인식 청킹** (M7) | `MAX_TOKENS`:41, `MIN_TOKENS`:51, `token_length`:89, `heading_path_of`:94, `split_markdown`:131 | 청킹 전략이 바뀔 때 |
 | [rag/factory.py](../backend/app/rag/factory.py) | **어느 저장소인가**를 정하는 유일한 곳 | `_BUILDERS`:18, `get_store`:24, `pop_store_arg`:38 | 구현 둘 다 |
 | [rag/pgvector_store.py](../backend/app/rag/pgvector_store.py) | Postgres 구현 | `upsert_document`:28, `search`:71 | SQLAlchemy |
@@ -145,6 +150,10 @@ POST /chat ── config = { configurable, callbacks, metadata } ──▶ graph
 | [rag/rewrite.py](../backend/app/rag/rewrite.py) | 대화형 질문 → **홀로 서는 질문** (M9) | `Rewritten`:24, `format_history`:50, `rewrite_query`:55 | 대화 맥락 처리 |
 | [rag/ingest.py](../backend/app/rag/ingest.py) | 파일 → 청킹 → 임베딩 → store | `REPO_ROOT`:25, `ingest_text`:42, `insert_file`:129 | 계약만 |
 | [rag/documents.py](../backend/app/rag/documents.py) | 업로드 **파싱 · 멱등 업서트** (M11) | `ALLOWED_SUFFIXES`:23, `parse`:26, `content_hash`:74, `run_ingest`:78, `upsert_record`:113 | 새 파일 형식 |
+
+**★ 캐시는 인입 경로에만 있다 ★** `embed_passages`(문서)는 캐시를 보고 `embed_query`(질문)는
+안 본다. 이유 둘: 질문 문자열이 정확히 일치할 확률이 낮고, 무엇보다 **계측 대상 경로에
+캐시를 넣으면 `measure_latency.py`가 거짓말을 하기 시작한다**(13-b의 `embed` 항목).
 
 **저장소를 아는 파일은 정확히 셋이다** — `pgvector_store.py`(Postgres를 안다),
 `qdrant_store.py`(Qdrant를 안다), `factory.py`(둘을 안다). 나머지 전부는 계약만 본다.
@@ -267,12 +276,40 @@ DB가 죽었을 때 예외를 그대로 올리면 정확히 저 진단 불가능
 | # | 위치 | 하는 일 |
 |---|---|---|
 | 31 | **`InMemorySaver`** | 갱신된 대화 저장 (도구 왕복까지 통째로, **컨텍스트는 제외**) |
-| 32 | `ai_sdk.py:111~118` | `text-end` → `finish-step` → `finish` → `[DONE]` |
-| 33 | `useChat` 파서 | `messages[].parts` 갱신 → 리렌더 |
-| 34 | `Chat.tsx:168` | assistant면 `ReactMarkdown`, user면 문자열 그대로 |
+| 32 | `ai_sdk.py:179` (M13) | `finish` 프레임을 조립하며 **`metadata_fn()` 호출** |
+| 33 | `chat.py:140` `metadata()` | `trace_id_of(callbacks)` → `{"traceId": ...}` + `timings`(M13-b) · 로그에 `지연 예산: ...` 한 줄 |
+| 34 | `ai_sdk.py:184` | `text-end` → `finish-step` → `finish{,messageMetadata}` → `[DONE]` |
+| 35 | `useChat` 파서 | `parts[]` 갱신 + **`message.metadata`** 채움 → 리렌더 |
+| 36 | `Chat.tsx:168` | assistant면 `ReactMarkdown`, user면 문자열 그대로 |
+| 37 | `Chat.tsx:187` → `Feedback.tsx:52` (M13) | `traceId`가 있을 때만 👍/👎를 그린다 |
 
 **경로 B에서 모델을 두 번 부른다** — 토큰 비용도 지연도 대략 두 배다. 도구를 붙이는 것이
 공짜가 아니라는 뜻이고, M13의 지연 예산 표에서 이 비용을 실제로 계측한다.
+
+### 경로 C — 사용자가 👍/👎를 누른다 (M13, 위 흐름과 별개의 짧은 요청)
+
+| # | 위치 | 하는 일 | 실패하면 |
+|---|---|---|---|
+| 1 | `Feedback.tsx:70` | `POST /api/v1/chat/feedback {traceId, value}` | 버튼에 "보내지 못했어요" |
+| 2 | `schemas/chat.py` `FeedbackRequest` | `value`는 `Literal["up","down"]`, `comment`는 1000자 제한 | **422** |
+| 3 | `chat.py:163` 가드 | `settings.langfuse_enabled`가 아니면 **거절** | **503** (조용한 200 금지) |
+| 4 | `tracing.py:125` `record_feedback` | `create_score(name="user-feedback", BOOLEAN, score_id=trace_id)` | — |
+| 5 | Langfuse 백그라운드 스레드 | 배치로 전송 (**요청은 기다리지 않는다** → 202 Accepted) | 다음 배치에 재시도 |
+
+**★ 이 경로에 `graph`도 `db`도 없다 ★** 피드백은 대화 상태를 건드리지 않고, 저장소도 새로
+만들지 않았다(Langfuse score가 곧 저장소다). 그래서 라우터 함수가 `async`조차 아니다 —
+하는 일이 "큐에 넣기" 하나라 이벤트 루프를 잡을 이유가 없다.
+
+**★ 계측(M13-b)은 이 표 어디에도 새 단계를 만들지 않는다 ★**
+`app/core/timing.py`의 `stage()`가 기존 단계를 감싸기만 한다 — 15·17·20·22·23번(재작성 ·
+검색 · 임베딩 · 융합 · 리랭킹)과 26번(생성)이 각각 자기 이름으로 기록되고, 31~34번의
+`finish` 프레임에 `timings`로 실려 나간다. 계측 문맥은 **스트림 제너레이터 안에서** 열린다
+(`chat.py`의 `timed_stream`) — 라우터 본문에서 열면 스트리밍이 시작되기 전에 닫혀
+**측정치가 전부 빈 채로 나온다.** 아래 "손잡이" 문단과 같은 뿌리의 함정이다.
+
+**★ 손잡이(traceId)는 어디서 왔나 ★** 위 "공통 — 마무리"의 32~35번이다. 서버가 만들어
+`finish` 프레임에 실어 보낸 값을 브라우저가 **그대로 되돌려준다.** 프론트가 계산하는 값이
+하나도 없다는 점이 M10의 `sourceId`와 같다 — 화면은 서버가 준 식별자를 나르기만 한다.
 
 ---
 
@@ -294,6 +331,7 @@ DB가 죽었을 때 예외를 그대로 올리면 정확히 저 진단 불가능
 | 스트림 청크 | `(AIMessageChunk \| ToolMessage, metadata)` | `astream(stream_mode="messages")` |
 | 델타 | `str` | `chunk.text` |
 | 와이어 | `data: {...}\n\n` | `ai_sdk.py:75` |
+| **응답 꼬리표** | `finish` 프레임의 `messageMetadata: {traceId}` → `message.metadata` | `ai_sdk.py:179` |
 | 화면 | `parts[]` → JSX | `Chat.tsx:168` |
 
 **"브라우저 상태"와 "HTTP 본문"이 어긋난다**(2b). 화면에는 대화 전체가 있지만 서버로는 마지막

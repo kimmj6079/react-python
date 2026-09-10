@@ -17,6 +17,7 @@ from anthropic import AsyncAnthropic
 from pydantic import BaseModel, Field
 
 from app.core.config import settings
+from app.core.timing import stage
 
 logger = logging.getLogger(__name__)
 
@@ -73,17 +74,23 @@ async def rewrite_query(
 
     client = client or AsyncAnthropic(api_key=settings.anthropic_api_key)
     try:
-        response = await client.messages.parse(
-            model=settings.anthropic_rewrite_model,
-            max_tokens=256,
-            messages=[
-                {
-                    "role": "user",
-                    "content": PROMPT.format(history=format_history(history), question=question),
-                }
-            ],
-            output_format=Rewritten,
-        )
+        # ★ 이 단계는 사용자가 기다리는 경로의 **맨 앞**이다 ★ 여기서 쓴 시간은
+        # 100% TTFT에 더해진다. 그래서 "첫 턴이면 아예 안 부른다"(위 early return)가
+        # 가장 싼 최적화이고, 계측은 그게 실제로 0이 되는지 확인하는 수단이다.
+        with stage("rewrite"):
+            response = await client.messages.parse(
+                model=settings.anthropic_rewrite_model,
+                max_tokens=256,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": PROMPT.format(
+                            history=format_history(history), question=question
+                        ),
+                    }
+                ],
+                output_format=Rewritten,
+            )
         rewritten = response.parsed_output.question.strip()
     except Exception:
         logger.exception("질의 재작성 실패 - 원문으로 검색한다")

@@ -12,6 +12,7 @@ import logging
 import sys
 
 from app.core.config import settings
+from app.core.timing import stage
 from app.rag.access import Principal
 from app.rag.base import TOP_K, HybridStore, RetrievedChunk, VectorStore
 from app.rag.embedding import embed_query, embed_sparse_query
@@ -50,7 +51,13 @@ def retrieve(
     # ★ M10: 임베딩을 이 함수 안에서 한 번만 계산한다 ★ 아래 그라운딩 게이트가
     # 벡터를 한 번 더 필요로 하는데, 게이트를 호출자(deps.py)에 두면 embed_query가
     # 두 번 돌아 100ms를 그냥 버린다. 게이트를 여기 둔 이유의 절반이 이것이다.
-    vector = embed_query(query)
+    # ★ M13-b: 단계마다 stage()로 감싼다 ★ 계측 문맥(요청) 밖에서는 아무 일도 안 하므로
+    # CLI(`python -m app.rag.retriever`)나 평가 스크립트는 지금과 완전히 같이 돈다.
+    # 임베딩을 따로 재는 이유: 이건 **네트워크가 아니라 CPU**다(fastembed 로컬 추론).
+    # 검색이 느린 것과 임베딩이 느린 것은 처방이 정반대라(캐시 vs 인덱스), 합쳐서 재면
+    # 어느 쪽을 고쳐야 할지 알 수 없다.
+    with stage("embed"):
+        vector = embed_query(query)
 
     # ── 그라운딩 게이트 (M10) ────────────────────────────────
     # ★ 왜 여기서 dense 검색을 한 번 더 하는가 ★
@@ -58,13 +65,24 @@ def retrieve(
     # **유사도가 아니라 순위**다. 실측(BASELINE-M10.md): 답할 수 있는 질문과 없는
     # 질문의 하이브리드 거리가 완전히 겹쳐서 어디를 잘라도 의미가 없다. 반면 dense
     # 코사인 거리는 거의 갈린다. 그래서 "얼마나 관련 있나"를 판정할 때만 dense를
-    # 따로 본다 - top_k=1이라 왕복 한 번(수 ms)이고 임베딩은 위에서 이미 끝났다.
+    # 따로 본다 - top_k=1이라 왕복 한 번이고 임베딩은 위에서 이미 끝났다.
+    #
+    # ★ M13-b 정정: 여기 원래 "(수 ms)"라고 적혀 있었는데 틀렸다 ★
+    # 실측 p50 18~31ms · p95 52~186ms로, 검색 층 합계의 11~12%다(BASELINE-M13.md).
+    # 그래도 게이트는 남는 장사다 — 다만 이유가 "싸서"가 아니라 **"뒤를 크게 아껴서"** 다:
+    # 측정 87건 중 21건(24%)이 여기서 걸렸고, 걸린 요청은 리랭킹 LLM 20회가 통째로
+    # 사라진다. 18ms를 내고 수천 ms를 아낀다.
+    # (추정으로 쓴 주석은 계측이 생기는 날 반드시 한 번 틀린다. 그래서 계측 값을 문서에
+    #  되먹이는 것까지가 한 세트다.)
     #
     # max_distance가 None이면 게이트 자체가 없다(=M9까지와 동일). 평가 스크립트가
     # 기본적으로 게이트 없이 도는 이유다 - 게이트가 켜지면 hit@k·MRR이 "검색 품질"이
     # 아니라 "게이트 성능"을 재게 되어 이전 숫자와 비교가 안 된다.
     if max_distance is not None:
-        nearest = store.search(vector, principal, top_k=1)
+        # 게이트는 top_k=1짜리 dense 검색 한 번이다. "싸다"고 적어뒀는데 실제로 몇 ms인지
+        # 재본 적이 없다 — 그래서 따로 잰다. 재보고 비싸면 그때 판단을 바꾸면 된다.
+        with stage("gate"):
+            nearest = store.search(vector, principal, top_k=1)
         if not nearest or nearest[0].distance > max_distance:
             # 빈 리스트를 돌려준다 = "근거가 없다". 거절 문구를 여기서 만들지 않는
             # 이유: 이 모듈은 검색만 안다. 그 사실을 어떻게 말할지는 프롬프트의
@@ -79,8 +97,14 @@ def retrieve(
 
     use_hybrid = settings.hybrid_search if hybrid is None else hybrid
     if use_hybrid and isinstance(store, HybridStore):
-        return store.search_hybrid(vector, embed_sparse_query(query), principal, top_k)
-    return store.search(vector, principal, top_k)
+        # sparse 임베딩(BM25)은 dense와 다른 모델이라 따로 잰다. M8에서 하이브리드를
+        # 켜며 "지연은 M13에서 계측한다"고 미뤄뒀던 값이 정확히 이 두 줄이다.
+        with stage("embed_sparse"):
+            sparse = embed_sparse_query(query)
+        with stage("search"):
+            return store.search_hybrid(vector, sparse, principal, top_k)
+    with stage("search"):
+        return store.search(vector, principal, top_k)
 
 
 def main() -> None:

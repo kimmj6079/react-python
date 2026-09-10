@@ -90,3 +90,21 @@ export function listDocuments(): Promise<DocumentOut[]> {
 export function getUploadLimits(): Promise<{ max_bytes: number; allowed_suffixes: string[] }> {
   return request('/api/v1/documents/meta/limits')
 }
+
+// ─── M13: 응답 피드백 (👍/👎) ───
+
+// POST /api/v1/chat/feedback
+// traceId는 백엔드가 스트림의 finish 프레임에 실어 보낸 값을 그대로 돌려주는 것이다
+// (실측: scripts/capture-metadata-wire.mjs → useChat이 message.metadata에 넣어준다).
+// 우리가 만들지 않고 되돌려주기만 하므로, 프론트에 "어느 트레이스인가"를 계산하는
+// 로직이 생기지 않는다 — 인용 카드(M10)에서 sourceId를 다룬 것과 같은 규칙이다.
+export function sendChatFeedback(payload: {
+  traceId: string
+  value: 'up' | 'down'
+  comment?: string
+}): Promise<{ status: string }> {
+  return request<{ status: string }>('/api/v1/chat/feedback', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}

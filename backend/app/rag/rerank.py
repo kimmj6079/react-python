@@ -13,6 +13,7 @@ from anthropic import AsyncAnthropic
 from pydantic import BaseModel, Field
 
 from app.core.config import settings
+from app.core.timing import stage
 from app.rag.base import TOP_K, RetrievedChunk
 
 logger = logging.getLogger(__name__)
@@ -94,7 +95,12 @@ async def rerank(
 
     client = client or AsyncAnthropic(api_key=settings.anthropic_api_key)
     try:
-        scores = await asyncio.gather(*(_score(client, question, c) for c in chunks))
+        # ★ 여기가 지연 예산에서 가장 클 것으로 예상되는 지점이다 ★ 후보 20개에
+        # Haiku를 병렬로 부른다 — 벽시계로는 "가장 느린 한 번"이지만, 그 한 번이
+        # 끝나야 생성이 시작된다. M8에서 "M1의 체감 속도를 일부 잃는다"고 적어둔 값을
+        # 여기서 처음으로 숫자로 본다.
+        with stage("rerank"):
+            scores = await asyncio.gather(*(_score(client, question, c) for c in chunks))
     except Exception:
         logger.exception("리랭킹 전체 실패 - 검색 순서를 그대로 쓴다")
         return chunks[:top_k]

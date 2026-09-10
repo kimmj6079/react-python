@@ -448,3 +448,54 @@
   white-space: nowrap;
   color: var(--muted, #71717a);
 }
+
+/* ─── M13: 응답 피드백 (👍/👎) ─────────────────────────────────────────── */
+/* ★ 눈에 덜 띄게 만드는 것이 의도다 ★ 피드백 버튼이 답변만큼 도드라지면
+   대화의 리듬을 끊는다. 평소에는 흐리게 두고 마우스를 올렸을 때만 또렷해지는 것이
+   실무 챗봇들의 공통된 처리다(ChatGPT·Claude·Gemini 모두). */
+.fb {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  margin-top: 0.4rem;
+}
+
+.fb__btn {
+  padding: 0.15rem 0.35rem;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: none;
+  font-size: 0.85rem;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.45;
+  transition:
+    opacity 0.15s,
+    background 0.15s;
+}
+
+.fb__btn:hover:not(:disabled) {
+  opacity: 1;
+  background: var(--surface, #fafafa);
+}
+
+/* 이미 보낸 뒤에는 잠기지만, 고른 쪽은 또렷하게 남긴다 —
+   disabled의 기본 흐림을 그대로 두면 "내가 뭘 눌렀는지"가 사라진다. */
+.fb__btn:disabled {
+  cursor: default;
+}
+
+.fb__btn--on {
+  opacity: 1;
+  border-color: var(--border, #d4d4d8);
+  background: var(--surface, #fafafa);
+}
+
+.fb__note {
+  font-size: 0.72rem;
+  color: var(--muted, #71717a);
+}
+
+.fb__note--error {
+  color: #b91c1c;
+}

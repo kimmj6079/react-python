@@ -76,3 +76,78 @@ def test_metadata_uses_the_exact_key_langfuse_reads():
     # 대시보드 Sessions 뷰에서 대화가 안 묶이는 것으로만 드러나므로, 실측으로 확인한
     # 문자열(CallbackHandler.py:496)을 테스트로 못 박는다.
     assert tracing.trace_metadata("t-123") == {"langfuse_session_id": "t-123"}
+
+
+# ---------------------------------------------------------------------------
+# M13 — 피드백 루프
+# ---------------------------------------------------------------------------
+class _FakeHandler:
+    def __init__(self, trace_id=None):
+        self.last_trace_id = trace_id
+
+
+class _FakeClient:
+    """create_score 호출을 붙잡는 대역. 네트워크로 나가지 않는다."""
+
+    def __init__(self):
+        self.scores = []
+
+    def create_score(self, **kwargs):
+        self.scores.append(kwargs)
+
+
+def test_trace_id_is_none_when_tracing_is_off():
+    # 키가 없으면 get_callbacks()가 빈 리스트라 물어볼 핸들러 자체가 없다.
+    # 이 None이 결국 "피드백 버튼을 그리지 않는다"까지 이어진다.
+    assert tracing.trace_id_of([]) is None
+
+
+def test_trace_id_comes_from_the_handler():
+    # ★ 속성 이름을 여기서 못 박는다 ★ last_trace_id는 Langfuse SDK 내부 속성이라
+    # 버전이 올라가면 바뀔 수 있다. 바뀌면 이 테스트가 먼저 깨져야 한다 —
+    # 안 그러면 "피드백 버튼이 조용히 사라진" 상태로 배포된다.
+    assert tracing.trace_id_of([_FakeHandler("deadbeef")]) == "deadbeef"
+
+
+def test_trace_id_skips_handlers_that_have_not_started():
+    # 핸들러는 있는데 아직 관측이 시작 전이면 None이다. 그런 핸들러를 만나도
+    # 멈추지 않고 다음을 본다.
+    assert tracing.trace_id_of([_FakeHandler(None), _FakeHandler("abc")]) == "abc"
+
+
+def test_record_feedback_refuses_when_tracing_is_off():
+    # ★ 조용한 no-op 금지 ★ create_score()는 꺼져 있으면 아무 말 없이 return한다.
+    # 그대로 두면 "버튼은 눌리는데 아무 데도 안 쌓이는" 상태가 되므로 여기서 막는다.
+    with pytest.raises(RuntimeError):
+        tracing.record_feedback("abc", positive=True)
+
+
+def test_thumbs_up_is_a_boolean_score_of_one(langfuse_keys, monkeypatch):
+    fake = _FakeClient()
+    monkeypatch.setattr(tracing, "get_langfuse_client", lambda: fake)
+
+    tracing.record_feedback("trace-1", positive=True, comment="정확했음")
+
+    assert fake.scores == [
+        {
+            "name": "user-feedback",
+            "value": 1,
+            "data_type": "BOOLEAN",
+            "trace_id": "trace-1",
+            "comment": "정확했음",
+            # 트레이스당 하나 — 엄지 두 번이 점수 두 개가 되지 않게 하는 열쇠다.
+            "score_id": "trace-1",
+        }
+    ]
+
+
+def test_thumbs_down_is_zero(langfuse_keys, monkeypatch):
+    fake = _FakeClient()
+    monkeypatch.setattr(tracing, "get_langfuse_client", lambda: fake)
+
+    tracing.record_feedback("trace-2", positive=False)
+
+    assert fake.scores[0]["value"] == 0
+    # ★ 이름을 문자열로 못 박는다 ★ 대시보드 필터와 골든셋 편입 스크립트가 이
+    # 이름으로 score를 찾는다. 오타는 에러가 아니라 "필터에 안 걸림"으로만 드러난다.
+    assert fake.scores[0]["name"] == tracing.FEEDBACK_SCORE_NAME

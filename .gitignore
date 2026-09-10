@@ -5,6 +5,8 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
+# M13-c 임베딩 캐시 (sqlite). 지워도 다시 계산될 뿐이다.
+.cache/
 
 # --- Node / frontend ---
 node_modules/

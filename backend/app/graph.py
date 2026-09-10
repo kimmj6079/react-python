@@ -28,6 +28,7 @@ from langgraph.graph.message import add_messages
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
+from app.core.timing import stage
 from app.rag.base import RetrievedChunk
 from app.tools import TOOLS
 
@@ -276,7 +277,14 @@ def build_graph(
         prompt = SYSTEM_PROMPT_TEMPLATE.format(context=context) if context else NO_CONTEXT_PROMPT
         messages = [SystemMessage(content=prompt), *messages]
 
-        response = await model_with_tools.ainvoke(messages)
+        # ★ M13-b: 생성 단계 계측 ★ 이건 "전체 생성 시간"이지 TTFT가 아니다.
+        # 사용자가 체감하는 것은 첫 글자까지의 시간이고 그건 chat.py에서 따로 잰다 —
+        # **두 숫자가 크게 다르면 스트리밍이 제 일을 하고 있다는 뜻**이다.
+        #
+        # 도구를 부르는 턴에서는 이 노드가 두 번 돌아 stage.calls가 2가 된다.
+        # FLOW.md에 "경로 B는 모델을 두 번 부른다"고 적어둔 것을 숫자로 확인하는 자리다.
+        with stage("generate"):
+            response = await model_with_tools.ainvoke(messages)
         return {"messages": [response]}
 
     builder = StateGraph(State)

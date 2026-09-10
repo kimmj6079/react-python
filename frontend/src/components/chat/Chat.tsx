@@ -10,8 +10,8 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { chatTransport } from './transport'
 import { Citations } from './Citations'
+import { Feedback } from './Feedback'
 import './Chat.css'
-
 
 // 빈 화면에 띄울 예시 질문. 컴포넌트 밖 상수라 렌더마다 새로 만들어지지 않는다.
 const SUGGESTIONS = [
@@ -43,7 +43,7 @@ export function Chat() {
   // 같이 비워진다 — 우리가 setMessages([])를 부를 필요가 없어졌다.
   const { messages, sendMessage, status, error, clearError, stop } = useChat({
     id: chatId,
-    transport : chatTransport,
+    transport: chatTransport,
   })
 
   // status는 4상태다: submitted | streaming | ready | error.
@@ -178,6 +178,13 @@ export function Chat() {
                       본문 아래에 두는 이유: 백엔드가 text-end 뒤에 출처를 보내므로
                       (실측 순서) 글이 다 그려진 뒤 카드가 붙는다 — 화면이 덜컹거리지 않는다. */}
                   {message.role === 'assistant' && <Citations parts={message.parts} />}
+                  {/* ★ M13 ★ 인용 카드 아래에 👍/👎. 순서에 뜻이 있다 —
+                      사용자가 "근거"를 보고 나서 판단하게 두는 것이다.
+                      metadata를 통째로 넘긴다: 무엇이 들어 있는지(traceId)는
+                      와이어를 아는 Feedback이 판단한다. traceId가 없으면 아무것도
+                      안 그리므로, 스트리밍 중이거나 트레이싱이 꺼진 환경에서는
+                      여기서 조건을 따로 걸지 않아도 버튼이 나타나지 않는다. */}
+                  {message.role === 'assistant' && <Feedback metadata={message.metadata} />}
                 </div>
               </article>
             ))}

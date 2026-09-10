@@ -1,5 +1,6 @@
 # FastAPI 라우터에서 공통으로 쓰는 의존성(dependency)을 모아두는 파일.
 import asyncio
+import logging
 from functools import partial
 from typing import Annotated
 
@@ -18,6 +19,8 @@ from app.rag.factory import get_store
 from app.rag.rerank import rerank
 from app.rag.retriever import retrieve
 from app.rag.rewrite import rewrite_query
+
+logger = logging.getLogger(__name__)
 
 # DbSession이라는 타입 별칭을 만들어두면, 라우터 함수 파라미터에서
 # `db: DbSession`이라고만 써도 FastAPI가 자동으로 get_db()를 호출해 세션을 주입해준다.
@@ -136,7 +139,21 @@ async def _retrieve(query: str, principal: Principal) -> list[RetrievedChunk]:
         )
     )
     if not candidates:
+        # 게이트가 걸렸거나 필터가 전부 걸러냈다. **여기서 이미 LLM 20번을 아낀다** —
+        # M10에서 "게이트는 리랭킹 앞"이라고 위치를 고른 값이 지연 예산에서 회수된다.
         return []
+
+    # ★ M13-b: 스킵 조건 ★ 후보가 top_k보다 많지 않으면 순서를 바로잡을 이유가 적다.
+    # 조용히 넘어가지 않고 로그를 남긴다 — "리랭킹이 켜져 있는데 왜 리랭킹 로그가 없지?"를
+    # 나중에 추적하는 것보다, 발동 사실을 그때 찍어두는 편이 항상 싸다.
+    if len(candidates) < settings.rerank_min_candidates:
+        logger.info(
+            "리랭킹 스킵: 후보 %d개 < %d개",
+            len(candidates),
+            settings.rerank_min_candidates,
+        )
+        return candidates[:TOP_K]
+
     return await rerank(query, candidates, TOP_K)
 
 

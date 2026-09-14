@@ -10,10 +10,10 @@
 import pytest
 
 from app.rag.access import Principal
-from app.rag.base import VectorStore
+from app.rag.base import RetrievedChunk, VectorStore
 from app.rag.factory import get_store, pop_store_arg
 from app.rag.pgvector_store import PgVectorStore
-from app.rag.qdrant_store import QdrantStore
+from app.rag.qdrant_store import QdrantStore, stable_order
 
 
 @pytest.mark.parametrize("store_class", [PgVectorStore, QdrantStore])
@@ -154,3 +154,69 @@ def test_search_requires_a_principal():
         assert sig.parameters["principal"].default is inspect.Parameter.empty, (
             f"{store_class.__name__}.search의 principal에 기본값이 있다 — 빼먹을 수 있게 된다"
         )
+
+
+# ---------------------------------------------------------------------------
+# 하이브리드 검색의 동점 처리 (M5에서 발견한 버그)
+# ---------------------------------------------------------------------------
+# ★ 왜 이 테스트가 생겼나 ★ M13-d의 회귀 게이트를 만들고 "검색 평가는 결정론적이라
+# 플래키하지 않다"고 적어뒀는데, 기준선을 기록하고 바로 --check를 돌렸더니 **숫자가
+# 달랐다.** 아무것도 안 바꿨는데.
+#
+# 실측으로 좁혔다: dense-only는 10회 모두 같은 결과였고, 하이브리드만 29개 질문 중
+# **19개**가 실행마다 다른 top-5를 돌려줬다. 원인은 RRF다 — 점수가 1/(k+순위)라
+# "dense에서 3등"과 "sparse에서 3등"이 **완전히 같은 점수**를 받는다. 그 동점을
+# 누가 앞에 둘지는 Qdrant의 세그먼트 순회 순서가 정하고, 그건 실행마다 다르다.
+#
+# 지표로는 이렇게 나타났다(10회 실행): overall MRR 0.740~0.764, hit@1 0.667~0.708.
+# **M10에서 정한 노이즈 폭 ±0.02를 넘는다** — 즉 게이트가 아무 변경 없이도 빨간불을
+# 낼 수 있었다. 게이트를 만들면서 게이트를 못 믿게 만들 뻔했다.
+def chunk(source: str, index: int, distance: float) -> RetrievedChunk:
+    return RetrievedChunk(
+        source=source, chunk_index=index, content="", heading_path="", distance=distance
+    )
+
+
+def test_keeps_score_order_when_there_is_no_tie():
+    ordered = stable_order(
+        [chunk("b.md", 1, 0.30), chunk("a.md", 2, 0.10), chunk("c.md", 3, 0.20)], top_k=3
+    )
+
+    # distance는 "작을수록 가깝다"라 오름차순이 곧 점수 내림차순이다.
+    assert [c.source for c in ordered] == ["a.md", "c.md", "b.md"]
+
+
+def test_breaks_ties_by_source_then_chunk_index():
+    ordered = stable_order(
+        [chunk("b.md", 0, 0.5), chunk("a.md", 7, 0.5), chunk("a.md", 2, 0.5)], top_k=3
+    )
+
+    assert [(c.source, c.chunk_index) for c in ordered] == [("a.md", 2), ("a.md", 7), ("b.md", 0)]
+
+
+def test_input_order_does_not_change_the_result():
+    # ★ 이 테스트가 버그의 본체다 ★ Qdrant가 동점인 청크들을 어떤 순서로 돌려주든
+    # 우리가 내보내는 순서는 같아야 한다. 이게 성립해야 "아무것도 안 바꿨는데 지표가
+    # 달라지는" 일이 사라진다.
+    tied = [chunk("c.md", 1, 0.5), chunk("a.md", 1, 0.5), chunk("b.md", 1, 0.5)]
+
+    assert stable_order(tied, top_k=3) == stable_order(list(reversed(tied)), top_k=3)
+
+
+def test_truncates_to_top_k_after_sorting():
+    # 자르기가 정렬 **뒤**여야 한다. 앞에서 자르면 동점 무리 중 일부만 남은 채
+    # 정렬돼서, 결국 Qdrant가 돌려준 순서에 다시 의존하게 된다.
+    ordered = stable_order(
+        [chunk("z.md", 1, 0.9), chunk("a.md", 1, 0.1), chunk("m.md", 1, 0.5)], top_k=2
+    )
+
+    assert [c.source for c in ordered] == ["a.md", "m.md"]
+
+
+def test_treats_negligible_float_differences_as_a_tie():
+    # RRF 점수는 서버에서 계산돼 오므로 같은 동점이면 값도 같아야 하지만, 부동소수점
+    # 연산 한 번(1.0 - score)을 거친다. 1e-12 차이로 동점 처리가 갈리면 결정론이
+    # 다시 깨진다 — 인접 순위의 RRF 점수 차는 1e-4 규모라 이 반올림은 안전하다.
+    ordered = stable_order([chunk("b.md", 1, 0.5), chunk("a.md", 1, 0.5 + 1e-12)], top_k=2)
+
+    assert [c.source for c in ordered] == ["a.md", "b.md"]

@@ -49,6 +49,47 @@ ID_NAMESPACE = uuid.NAMESPACE_URL
 DENSE_NAME = "dense"
 SPARSE_NAME = "bm25"
 
+# ★ M5: RRF 동점을 결정론적으로 깨기 위한 두 상수 ★
+#
+# 발견 경위: M13-d의 회귀 게이트를 만들고 기준선을 기록한 직후 --check를 돌렸더니
+# **아무것도 안 바꿨는데 숫자가 달랐다.** 10회 반복 측정으로 좁힌 결과:
+#   dense-only  10회 전부 동일          ← 결정론적
+#   hybrid      29개 질문 중 19개가 흔들림 ← 여기가 범인
+#   지표 폭: overall MRR 0.740~0.764 · hit@1 0.667~0.708 (노이즈 기준 ±0.02를 넘는다)
+#
+# 원인은 RRF의 정의 자체다. 점수가 **순위의 역수 합**이라 "dense에서 3등"과
+# "sparse에서 3등"이 완전히 같은 점수를 받는다. 그 동점을 누가 앞에 둘지는 Qdrant의
+# 세그먼트 순회 순서가 정하고, 그건 실행마다 다르다. **버그가 아니라 RRF의 성질이다** —
+# 점수 스케일 문제를 없애준 대가로 동점이 훨씬 자주 생긴다.
+#
+# 고치는 방법: 서버에는 top_k보다 넉넉히 달라고 하고, **우리가** 안정적인 키로 다시
+# 정렬한 뒤 자른다. 서버 쪽에서 자르면 동점 무리가 경계에서 잘려 우리가 손쓸 수 없다.
+# top_k의 몇 배를 받아올 것인가. 동점 무리가 top_k 경계를 넘어가도 전부 보이도록 넉넉히.
+TIE_BREAK_OVERFETCH = 4
+
+# 부동소수점 비교용 자릿수. 인접 순위의 RRF 점수 차는 1e-4 규모라 1e-9에서 끊어도
+# 서로 다른 점수가 동점으로 뭉개지지 않는다. 반대로 이걸 안 하면 `1.0 - score` 한 번의
+# 연산 오차(1e-16)로 동점이 갈려 결정론이 다시 깨진다.
+_TIE_PRECISION = 9
+
+
+def stable_order(chunks: list[RetrievedChunk], top_k: int) -> list[RetrievedChunk]:
+    """점수 순으로 정렬하되 동점은 (source, chunk_index)로 깨고 top_k만 남긴다.
+
+    ★ 자르기가 정렬 "뒤"여야 한다 ★ 먼저 자르면 동점 무리 중 일부만 남은 채로
+    정렬돼서, 결국 저장소가 돌려준 순서에 다시 의존하게 된다.
+
+    ★ 동점을 깨는 키는 관련성과 아무 상관이 없다 ★ 파일명 알파벳 순은 "더 좋은 답"을
+    고르는 규칙이 아니다. 이 함수가 사는 목적은 **품질이 아니라 재현성**이다 —
+    같은 입력에 같은 출력이 나와야 M6 하네스로 잰 숫자를 믿을 수 있고, 그래야
+    M13-d의 회귀 게이트가 "코드가 나빠졌다"와 "그냥 다르게 나왔다"를 구분한다.
+    (실측: 이 함수를 넣은 뒤 10회 반복에서 모든 지표의 폭이 정확히 0이 됐다.)
+    """
+    return sorted(
+        chunks,
+        key=lambda c: (round(c.distance, _TIE_PRECISION), c.source, c.chunk_index),
+    )[:top_k]
+
 
 class QdrantStore:
     def __init__(self, url: str | None = None, collection: str | None = None) -> None:
@@ -311,10 +352,15 @@ class QdrantStore:
             ],
             query=models.FusionQuery(fusion=models.Fusion.RRF),
             query_filter=access,
-            limit=top_k,
+            # ★ top_k가 아니라 넉넉히 받아온다 (M5) ★ RRF는 동점이 자주 생기는데,
+            # 서버가 top_k에서 잘라버리면 동점 무리의 일부만 우리 손에 들어온다.
+            # 그러면 아무리 다시 정렬해도 "어느 것이 잘려나갔나"가 실행마다 달라진다.
+            # 넉넉히 받아 우리가 stable_order로 자르는 이유다. 추가 비용은 payload
+            # 몇 개 더 받는 것뿐이고(수십 KB), 얻는 것은 **재현 가능한 검색**이다.
+            limit=top_k * TIE_BREAK_OVERFETCH,
             with_payload=True,
         )
-        return self._to_chunks(response)
+        return stable_order(self._to_chunks(response), top_k)
 
     @staticmethod
     def _to_chunks(response) -> list[RetrievedChunk]:

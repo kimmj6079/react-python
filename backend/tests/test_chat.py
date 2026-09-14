@@ -265,11 +265,16 @@ class ConfigCapturingGraph:
         self._inner = inner
         self.configs = []
 
-    def get_state(self, config):
-        # ★ M10에서 늘었다 ★ chat.py가 스트림이 끝난 뒤 "무엇을 근거로 답했나"를
-        # 물어보므로 대역도 그 질문에 답할 수 있어야 한다. 위임만 한다 —
-        # 이 대역의 관심사는 config를 붙잡는 것 하나뿐이고, 나머지는 진짜가 한다.
-        return self._inner.get_state(config)
+    async def aget_state(self, config):
+        # ★ M10에서 늘었고 M5-2에서 비동기가 됐다 ★ chat.py가 스트림이 끝난 뒤
+        # "무엇을 근거로 답했나"를 물어보므로 대역도 그 질문에 답할 수 있어야 한다.
+        # 위임만 한다 — 이 대역의 관심사는 config를 붙잡는 것 하나뿐이다.
+        #
+        # ★ 대역이 프로덕션 계약을 따라가야 하는 이유를 또 만났다 ★ M13-a에서
+        # FakeHandler가 `BaseCallbackHandler`를 상속해야 했던 것과 같은 종류다:
+        # 저장소를 Postgres로 바꿨을 뿐인데 **호출 규약(동기→비동기)이 바뀌었고**,
+        # 대역이 안 따라오면 테스트만 AttributeError로 깨진다. 실제로 깨져서 알았다.
+        return await self._inner.aget_state(config)
 
     def astream(self, *args, **kwargs):
         # chat.py는 config를 2번째 "위치" 인자로 넘긴다(실측한 시그니처).
@@ -463,9 +468,48 @@ def test_real_graph_has_a_checkpointer():
     # 위와 같은 종류의 회귀 방어다. checkpointer를 빼먹어도 앱은 정상 기동하고
     # 응답도 정상이다 — 다만 매 턴이 첫 턴처럼 행동해서 "가끔 기억을 못 하는 것
     # 같다"는 모호한 제보로만 드러난다. 배선 자체를 못 박는다.
+    #
+    # ★ M5-2에서 확인 방법이 바뀌었다 ★ 예전에는 `deps._graph.checkpointer is
+    # deps._checkpointer`였다. 둘 다 모듈 전역이었기 때문인데, 이제 그래프는
+    # lifespan이 만들고 체크포인터는 커넥션 풀을 물고 있어 모듈 전역에 있을 수 없다.
+    # 그래서 **"넘긴 것이 그대로 붙는가"** 를 직접 확인한다 — 오히려 이쪽이
+    # 전역 변수의 정체성이 아니라 배선 자체를 보는 테스트다.
+    from langgraph.checkpoint.memory import InMemorySaver
+
     from app.api import deps
 
-    assert deps._graph.checkpointer is deps._checkpointer
+    sentinel = InMemorySaver()
+
+    graph = deps.build_app_graph(sentinel)
+
+    assert graph.checkpointer is sentinel
+
+
+def test_lifespan_builds_a_graph_and_clears_it_on_shutdown(monkeypatch):
+    """lifespan이 실제로 그래프를 꽂고 빼는지. (M5-2)
+
+    ★ memory 모드로 돌린다 ★ 이 테스트의 관심사는 "수명 관리"이지 Postgres가 아니다.
+    `checkpointer_scope`가 memory에서 DB를 안 건드린다는 것은 test_checkpointer.py가
+    따로 못 박아뒀으므로, 여기서는 그 위에 얹힌 배선만 본다.
+
+    ★ `with TestClient(app)` 형태여야 lifespan이 돈다 ★ conftest의 client fixture는
+    `TestClient(app)`을 그냥 돌려주므로 **lifespan이 실행되지 않는다** — 그래서 다른
+    테스트들이 dependency_overrides로 가짜 그래프를 꽂아 쓸 수 있고, 진짜 Postgres에
+    붙는 일이 없다. 그 성질이 의도된 것임을 여기서 함께 못 박는다.
+    """
+    from fastapi.testclient import TestClient
+
+    from app.core.config import settings
+    from app.main import app as real_app
+
+    monkeypatch.setattr(settings, "checkpointer", "memory", raising=False)
+
+    assert getattr(real_app.state, "graph", None) is None
+
+    with TestClient(real_app):
+        assert real_app.state.graph is not None
+
+    assert real_app.state.graph is None
 
 
 def test_empty_messages_returns_400(client, fake_graph):

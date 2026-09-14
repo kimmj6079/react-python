@@ -167,6 +167,28 @@ class Settings(BaseSettings):
     # .gitignore에 들어 있고, 지워도 아무것도 잃지 않는다 — 다시 계산될 뿐이다.
     embedding_cache_path: str = ".cache/embeddings.sqlite3"
 
+    # --- 대화 체크포인터 (M5-2) ---
+    # "postgres" | "memory". 대화 상태(LangGraph 체크포인트)를 어디에 둘 것인가.
+    #
+    # ★ 기본값이 postgres인 이유 ★ memory는 **프로세스 메모리**다. k8s에서 backend
+    # replicas가 2라, 같은 사용자의 두 번째 질문이 다른 파드로 가면 앱이 첫 턴처럼
+    # 행동한다. 에러가 아니라 "가끔 기억을 못 하는 챗봇"으로만 보여서 배포해두고도
+    # 한참 모른다. 로컬 --reload도 소스를 고칠 때마다 대화가 날아간다.
+    #
+    # memory로 두는 것이 맞는 때: Postgres 없이 챗봇 배선만 만져볼 때, 그리고
+    # Windows에서 uvicorn을 --reload 없이 띄울 때(psycopg 비동기가 기본 이벤트 루프에서
+    # 동작하지 않는다 - app/core/checkpointer.py의 ensure_loop_supports_psycopg 참고).
+    #
+    # ★ 테이블은 자동으로 안 생긴다 ★ `python -m app.db.checkpointer_setup`을 한 번
+    # 돌려야 한다. alembic과 같은 이유로 명시적 단계다.
+    checkpointer: str = "postgres"
+
+    # 체크포인터 전용 커넥션 풀 크기. SQLAlchemy 풀(items CRUD용)과 **별개**다 -
+    # 같은 DB를 보지만 드라이버도 수명도 다르다. 둘을 합치려 들면 sync/async 경계가
+    # 섞여서 더 비싸진다. Postgres의 max_connections(기본 100)를 파드 수 x (두 풀의
+    # 합)이 넘지 않는지는 replicas를 올릴 때 반드시 확인할 값이다.
+    checkpointer_pool_size: int = 5
+
     # --- 관측성 (Langfuse, M4) ---
     # 트레이싱은 "있으면 좋은 것"이지 앱의 필수 경로가 아니다. 그래서 기본값이 빈
     # 문자열이고, 비어 있으면 core/tracing.py가 아예 핸들러를 안 만든다(no-op).

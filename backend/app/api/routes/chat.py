@@ -12,6 +12,7 @@ from app.core.ai_sdk import (
     UI_MESSAGE_STREAM_HEADERS,
     latest_user_text,
     source_part,
+    to_ui_messages,
     ui_message_stream,
 )
 from app.core.config import settings
@@ -126,17 +127,24 @@ async def chat(
                 mark("ttft")
                 yield chunk.text
 
-    def sources() -> list[dict[str, str]]:
+    async def sources() -> list[dict[str, str]]:
         """스트림이 끝난 뒤 "무엇을 근거로 답했나"를 그래프 상태에서 꺼낸다. (M10)
 
         ★ 함수로 넘기는 이유 ★ ui_message_stream은 응답을 만들기 시작할 때 생성되는데,
         그 시점에는 아직 검색이 안 끝났다. 값을 넘기면 항상 빈 리스트가 된다 —
         에러 없이 인용 카드만 안 나오는, 찾기 어려운 종류의 버그다.
 
-        get_state는 체크포인터에서 이번 턴의 최종 State를 읽는다. 2b에서 상태의
+        aget_state는 체크포인터에서 이번 턴의 최종 State를 읽는다. 2b에서 상태의
         주인을 서버로 옮겨둔 덕에 "방금 그 턴이 무엇을 봤는지"를 물어볼 곳이 있다.
+
+        ★ M5-2에서 동기 get_state → 비동기 aget_state로 바뀌었다 ★
+        체크포인터가 AsyncPostgresSaver가 되면서, **동기 get_state를 이벤트 루프에서
+        부르면 `asyncio.InvalidStateError`가 난다**(실측. SDK가 "다른 스레드에서만
+        동기 호출이 허용된다"고 명시적으로 막는다). 저장소를 바꿨을 뿐인데 호출 규약이
+        바뀌는 자리이고, **에러 메시지를 안 봤으면 원인을 검색으로 찾기 어려웠을** 종류다.
+        ai_sdk.ui_message_stream이 코루틴 콜백도 받도록 한 겹 넓혔다.
         """
-        snapshot = graph.get_state(config)
+        snapshot = await graph.aget_state(config)
         chunks = snapshot.values.get("retrieved") or []
         # ★ 중복 제거 ★ 같은 문서의 여러 청크가 top-5에 들어오는 일이 흔하다.
         # 인용 카드에 같은 파일이 세 번 뜨면 사용자에게는 잡음이다.
@@ -206,6 +214,45 @@ async def chat(
         media_type="text/event-stream",
         headers=UI_MESSAGE_STREAM_HEADERS,
     )
+
+
+@router.get("/chat/{chat_id}/messages")
+async def chat_history(chat_id: str, graph: Graph) -> dict[str, list[dict]]:
+    """이 스레드의 대화를 통째로 돌려준다. (M5-3)
+
+    ★ M5-2가 만든 값을 화면이 쓰게 하는 엔드포인트다 ★ 체크포인터를 Postgres로
+    옮겨 대화가 재시작을 넘어 살아남게 됐는데, **브라우저는 그 사실을 몰랐다.**
+    새로고침하면 화면이 비고, 사용자에게는 대화가 사라진 것과 똑같다.
+    저장소를 durable하게 만드는 것과 사용자가 그 durability를 체감하는 것은
+    다른 일이고, 후자를 안 하면 전자는 아무도 모르는 개선으로 끝난다.
+
+    ★★ 이 엔드포인트는 "읽기" 통로라 위험의 종류가 다르다 ★★
+    chat.py는 원래도 인증이 없어서 남의 `thread_id`를 알면 **남의 대화에 이어 쓸 수**
+    있었다(위 chat()의 주석). 여기서는 한 걸음 더 나가 **남의 대화 내용을 통째로 읽을 수**
+    있게 된다. 쓰기보다 읽기가 나쁜 이유는 피해가 조용하기 때문이다 — 이어 쓰면 상대
+    화면에 흔적이 남지만, 읽는 것은 아무 흔적도 남기지 않는다.
+
+    지금 이 앱을 지켜주는 것은 **thread_id가 추측하기 어렵다는 사실 하나뿐**이다
+    (프론트의 `generateId()`가 만드는 난수). 그건 접근 제어가 아니라 "URL을 모르면
+    못 본다"는 성질이고, 로그·리퍼러·공유 링크로 새는 순간 끝난다.
+    실무라면 여기에 반드시 둘이 들어간다:
+      1. `deps.get_principal`이 진짜 토큰을 검증하고
+      2. **이 함수가 "이 스레드가 그 사람 것인가"를 확인한다**
+    (2)를 위해서는 thread_id를 서버가 발급하고 소유자를 어딘가에 적어둬야 한다 —
+    즉 이 기능을 제대로 하려면 테이블이 하나 더 필요하다. 학습 범위 밖이라 안 했고,
+    **안 했다는 사실을 코드 옆에 남겨두는 것**까지가 이번 작업이다.
+
+    ★ 404를 쓰지 않는다 ★ 서버는 "아직 아무 말도 안 한 새 대화"와 "없는 대화"를
+    구분할 수 없다. 그리고 새 대화는 정상 상태다 — 브라우저가 새 id로 처음 접속할
+    때마다 404를 받으면 프론트가 그걸 에러로 다뤄야 하고, 정상 흐름에 에러 처리가 섞인다.
+    """
+    snapshot = await graph.aget_state({"configurable": {"thread_id": chat_id}})
+
+    # 체크포인트가 없으면 values가 빈 dict다(예외가 아니다 — 실측).
+    messages = snapshot.values.get("messages") or []
+    retrieved = snapshot.values.get("retrieved") or []
+
+    return {"messages": to_ui_messages(messages, sources=retrieved)}
 
 
 @router.post("/chat/feedback", status_code=202)

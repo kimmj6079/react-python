@@ -1,4 +1,5 @@
 // 백엔드 API를 호출하는 함수들을 모아둔 파일. 컴포넌트는 fetch를 직접 쓰지 않고 이 함수들을 사용한다.
+import type { UIMessage } from 'ai'
 import type { Item, ItemCreate } from '../types/item'
 
 // VITE_API_URL은 빌드 타임에 정적으로 번들에 박히는 값(CLAUDE.md 참고).
@@ -89,6 +90,24 @@ export function listDocuments(): Promise<DocumentOut[]> {
 // 같은 숫자를 프론트에 하드코딩하면 서버가 제한을 바꿀 때 두 곳이 어긋난다.
 export function getUploadLimits(): Promise<{ max_bytes: number; allowed_suffixes: string[] }> {
   return request('/api/v1/documents/meta/limits')
+}
+
+// ─── M5-3: 대화 복원 ───
+
+// GET /api/v1/chat/{chatId}/messages
+// ★ 서버가 이미 갖고 있는 것을 가져올 뿐이다 ★ M5-2에서 대화를 Postgres로 옮겼는데
+// 브라우저는 그 주소(thread_id)를 새로고침 때 잊어버려서, 데이터는 남았는데 가리킬
+// 손잡이가 없는 상태였다. session.ts가 손잡이를 유지하고 이 함수가 내용을 가져온다.
+//
+// 없는 스레드도 200 + 빈 배열이다(404가 아니다). 새 대화는 정상 상태이므로
+// 프론트가 그걸 에러로 다루면 정상 흐름에 에러 처리가 섞인다 — 백엔드 주석 참고.
+export function fetchChatHistory(chatId: string): Promise<{ messages: UIMessage[] }> {
+  // encodeURIComponent: id는 generateId()가 만든 난수라 보통 안전하지만, 경로에
+  // 그대로 끼워 넣는 값은 예외 없이 이스케이프한다 — "지금 값은 안전하다"는
+  // 앞으로도 그럴 것이라는 뜻이 아니다.
+  return request<{ messages: UIMessage[] }>(
+    `/api/v1/chat/${encodeURIComponent(chatId)}/messages`,
+  )
 }
 
 // ─── M13: 응답 피드백 (👍/👎) ───

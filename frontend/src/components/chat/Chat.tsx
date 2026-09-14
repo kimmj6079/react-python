@@ -5,7 +5,8 @@
 // ai@7.0.79 / @ai-sdk/react@4.0.82 기준이고, 버전을 올리면 .d.ts를 다시 봐야 한다.
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react'
 import { useChat } from '@ai-sdk/react'
-import { generateId } from 'ai'
+import { fetchChatHistory } from '../../api/client'
+import { loadChatId, newChatId } from './session'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { chatTransport } from './transport'
@@ -34,20 +35,59 @@ export function Chat() {
   // 전자는 렌더마다 generateId()를 호출한다(반환값은 첫 번째만 쓰이고 나머지는
   // 버려진다). lazy initializer를 쓰면 최초 1회만 실행된다.
   //
-  // 새로고침하면 새 id가 생긴다 = 서버에도 새 스레드다. 화면도 비어 있으니
-  // 앞뒤가 맞는다. localStorage에 넣어 유지하지 않는 이유는 아래 ③ 참고.
-  const [chatId, setChatId] = useState(() => generateId())
+  // ★★ M5-3에서 이 줄의 전제가 바뀌었다 ★★
+  // 여기에는 원래 이렇게 적혀 있었다: *"새로고침하면 새 id가 생긴다 = 서버에도 새
+  // 스레드다. 화면도 비어 있으니 앞뒤가 맞는다."* **그때는 정말로 앞뒤가 맞았다** —
+  // 체크포인터가 InMemorySaver라 서버 쪽 대화도 프로세스와 함께 사라졌으니까.
+  //
+  // M5-2에서 대화가 Postgres로 옮겨가면서 그 전제가 깨졌다. 서버는 대화를 계속 갖고
+  // 있는데 브라우저만 주소를 잊는다 — **데이터는 남았는데 가리킬 손잡이를 잃는** 상태다.
+  // 그래서 id를 localStorage에 유지한다(session.ts). 유지의 대가와 한계는 그 파일 주석 참고.
+  const [chatId, setChatId] = useState(loadChatId)
 
   // id를 넘기면 useChat이 이 값으로 Chat 인스턴스를 만든다. 그리고 id가 바뀌면
   // 인스턴스를 통째로 새로 만든다(실측: shouldRecreateChat). 그래서 messages도
   // 같이 비워진다 — 우리가 setMessages([])를 부를 필요가 없어졌다.
-  const { messages, sendMessage, status, error, clearError, stop } = useChat({
+  const { messages, setMessages, sendMessage, status, error, clearError, stop } = useChat({
     id: chatId,
     transport: chatTransport,
   })
 
   // status는 4상태다: submitted | streaming | ready | error.
   const isBusy = status === 'submitted' || status === 'streaming'
+
+  // --- 대화 복원 (M5-3) --------------------------------------------------
+  // 마운트할 때(그리고 chatId가 바뀔 때) 서버가 갖고 있는 대화를 가져와 화면에 채운다.
+  //
+  // ★ useChat의 `messages` 초기값으로 못 넘긴다 ★ 그 옵션은 Chat 인스턴스를 **만들 때**
+  //   한 번 읽힌다(실측: ChatInit.messages). 우리는 네트워크를 다녀와야 알 수 있는 값이라
+  //   그 시점에 없다 — 값으로 넘기면 항상 빈 배열이다. 그래서 `setMessages`로 나중에 채운다.
+  //   **백엔드에서 sources_fn·metadata_fn을 "값이 아니라 함수"로 넘겨야 했던 것과 같은
+  //   종류의 함정이다: 필요한 값이 생기는 시점이 쓰는 시점보다 늦다.**
+  //
+  // ★ cancelled 플래그가 있어야 하는 이유 ★ 응답이 오기 전에 사용자가 "새 대화"를 누르면
+  //   chatId가 바뀌고 effect가 다시 돈다. 그때 먼저 떠났던 요청이 늦게 도착해서
+  //   `setMessages`를 부르면 **방금 비운 화면에 옛 대화가 되살아난다.**
+  //   에러도 안 나고 재현도 어려운(네트워크가 느릴 때만 보이는) 종류라, 구조로 막는다.
+  useEffect(() => {
+    let cancelled = false
+    fetchChatHistory(chatId)
+      .then((data) => {
+        if (cancelled) return
+        // 빈 배열이면 굳이 상태를 건드리지 않는다. 새 대화가 대부분이고,
+        // 불필요한 setState는 예시 질문 화면을 한 번 깜빡이게 만든다.
+        if (data.messages.length > 0) setMessages(data.messages)
+      })
+      .catch(() => {
+        // ★ 조용히 넘어가는 것이 맞는 유일한 자리 ★ 복원 실패는 "이전 대화를 못
+        // 불러왔다"일 뿐이고, 사용자는 지금부터 새로 대화할 수 있다. 여기서 에러
+        // 배너를 띄우면 **백엔드가 잠깐 느린 것 때문에 멀쩡한 화면이 빨개진다.**
+        // (반대로 전송 실패는 사용자가 한 일이 사라지는 것이라 반드시 보여준다.)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [chatId, setMessages])
 
   // --- 자동 스크롤 -------------------------------------------------------
   // 목록 맨 끝에 빈 div를 두고 거기로 스크롤한다. scrollTop을 직접 계산하는 것보다
@@ -125,7 +165,10 @@ export function Chat() {
           // 이제는 id를 새로 발급한다. useChat이 인스턴스를 재생성하면서
           // messages도 비우고, 다음 요청은 서버의 새 thread_id로 나간다.
           // "화면 비우기"와 "서버 스레드 바꾸기"가 한 동작이 된다.
-          onClick={() => setChatId(generateId())}
+          // ★ M5-3: generateId()가 아니라 newChatId()다 ★ 새 id를 만들면서
+          // localStorage에도 적는다. 안 그러면 "새 대화"를 누른 뒤 새로고침했을 때
+          // **방금 버린 이전 대화로 되돌아간다** — 버튼이 한 일이 취소되는 셈이다.
+          onClick={() => setChatId(newChatId())}
           disabled={messages.length === 0 || isBusy}
         >
           새 대화

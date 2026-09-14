@@ -4,6 +4,7 @@
 #               latest_user_text)
 # 토큰을 "누가" 만들었는지(지금은 Anthropic 직접, M2에서는 LangGraph)와 무관하게
 # "어떤 모양으로 주고받는가"만 담당한다 — 그래서 라우터(api/routes/chat.py)와 분리한다.
+import inspect
 import json
 from collections.abc import AsyncIterable, AsyncIterator, Callable
 from typing import Any
@@ -38,6 +39,59 @@ def text_from_parts(parts: list[dict[str, Any]]) -> str:
     # 구분자 없이 ""로 붙이는 이유: 파트 경계는 스트리밍 분할 지점일 뿐 단어
     # 경계가 아니다. " "로 붙이면 단어 중간에 공백이 끼어든다.
     return "".join(p.get("text", "") for p in parts if p.get("type") == "text")
+
+
+def to_ui_messages(lc_messages, sources=None) -> list[dict[str, Any]]:
+    """체크포인터가 복원한 LangChain 메시지를 useChat이 그릴 수 있는 모양으로. (M5-3)
+
+    ★ 방향이 하나 늘었다 ★ 이 파일은 지금까지 두 방향만 다뤘다:
+      - 받기: useChat이 보낸 UIMessage → 텍스트 (`latest_user_text`)
+      - 내보내기: 텍스트 델타 → SSE (`ui_message_stream`)
+    여기에 **"서버가 갖고 있는 대화 전체 → UIMessage 배열"** 이 붙는다.
+    스트리밍이 아니라 한 번에 주는 형태라 SSE가 아니라 평범한 JSON이다.
+
+    ★ 화면에 보여줄 것만 남긴다 ★ System/Tool 메시지와 "도구를 부르기로 한"
+    빈 AIMessage는 뺀다. `chat.py`의 스트림이 `AIMessageChunk`만 통과시키는 것과
+    같은 규칙인데, **지금 그 규칙이 두 경로에 따로 구현돼 있다**(스트리밍 · 복원).
+    한쪽만 고치면 "새로고침하면 없던 말풍선이 나타나는" 형태로 어긋난다 —
+    tests/test_chat_history.py가 그 어긋남을 잡는다.
+
+    ★ sources는 마지막 assistant 메시지에만 붙는다 ★ State의 `retrieved`는 매 턴
+    덮어써지므로, 체크포인터에 남아 있는 것은 **가장 최근 턴이 무엇을 봤는지**뿐이다.
+    그걸 이전 턴들에 뿌리면 "3턴 전 답변에 방금 검색한 출처가 붙는" 거짓말이 된다.
+    즉 복원된 대화에서 인용 카드는 **마지막 답변에만** 보인다 — 기능 부족이 아니라
+    우리가 그만큼만 알고 있기 때문이고, 그 한계를 UI가 아니라 여기서 정직하게 끊는다.
+    """
+    ui: list[dict[str, Any]] = []
+    for index, message in enumerate(lc_messages or []):
+        role = {"human": "user", "ai": "assistant"}.get(getattr(message, "type", ""))
+        if role is None:
+            continue  # system · tool 등 사용자에게 보여줄 것이 아닌 메시지
+        text = message.text
+        if not text:
+            # 본문이 빈 AIMessage = 도구 호출만 담은 턴. 그대로 넣으면 화면에
+            # 빈 말풍선이 생긴다(에러가 아니라 "이상한 UI"라 배포까지 간다).
+            continue
+        ui.append(
+            {
+                # ★ id가 없으면 만들어 준다 ★ LangChain 메시지의 id는 Optional이다.
+                # 없으면 React가 리스트 key로 쓸 값이 없어져 렌더가 어긋난다 —
+                # 콘솔 경고만 나고 화면은 조용히 이상해지는 종류다.
+                "id": getattr(message, "id", None) or f"restored-{index}",
+                "role": role,
+                "parts": [{"type": "text", "text": text}],
+            }
+        )
+
+    if sources and ui and ui[-1]["role"] == "assistant":
+        seen: set[str] = set()
+        for chunk in sources:
+            part = source_part(chunk)
+            if part["sourceId"] in seen:
+                continue
+            seen.add(part["sourceId"])
+            ui[-1]["parts"].append(part)
+    return ui
 
 
 def latest_user_text(messages: list[UIMessage]) -> str:
@@ -155,7 +209,19 @@ async def ui_message_stream(
     # 알 수 있는데, 이 제너레이터는 그 시점보다 먼저 만들어진다. 값을 받으면
     # 비어 있고, 함수를 받으면 여기 도달했을 때(=델타를 다 소진한 뒤) 부른다.
     if sources_fn is not None:
-        for source in sources_fn():
+        # ★ M5-2: 코루틴도 받는다 ★ AsyncPostgresSaver를 쓰면 `graph.get_state()`를
+        # 이벤트 루프에서 부를 수 없어(InvalidStateError) chat.py의 sources()가
+        # `await graph.aget_state()`를 쓰는 코루틴 함수가 됐다.
+        #
+        # 동기 함수도 계속 받는다. 둘 중 하나로 강제하지 않는 이유는 이 함수가
+        # **와이어 포맷을 아는 유일한 모듈**이라서다 — 호출자가 동기냐 비동기냐는
+        # 와이어와 아무 상관이 없는데, 그 사정 때문에 호출자들을 전부 바꾸게 하면
+        # 관심사가 거꾸로 흐른다. `inspect.isawaitable`은 결과를 보고 판단하므로
+        # "코루틴 함수인가"를 미리 알 필요도 없다.
+        result = sources_fn()
+        if inspect.isawaitable(result):
+            result = await result
+        for source in result:
             yield sse(source)
     yield sse({"type": "finish-step"})
 

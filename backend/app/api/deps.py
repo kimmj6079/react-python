@@ -4,9 +4,8 @@ import logging
 from functools import partial
 from typing import Annotated
 
-from fastapi import Depends, Header
+from fastapi import Depends, Header, Request
 from langchain_anthropic import ChatAnthropic
-from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph.state import CompiledStateGraph
 from sqlalchemy.orm import Session
 
@@ -69,25 +68,19 @@ _model = ChatAnthropic(
     streaming=True,
 )
 
-# ★ 2b: 대화 상태의 저장소 ★
-# 이 객체 하나가 "모든 스레드의 모든 대화"를 들고 있다. 모듈 레벨에 두는 게
-# 필수다 — 요청마다 새로 만들면 매번 빈 저장소라 아무것도 기억하지 못한다.
-# (그런데도 에러는 안 난다. "매번 첫 턴처럼 행동"할 뿐이다.)
+# ★★ M5-2: 체크포인터가 모듈 레벨에서 사라졌다 ★★
+# 2b부터 여기에 `_checkpointer = InMemorySaver()` 한 줄이 있었고, 그 아래에
+# "실무에서는 AsyncPostgresSaver를 쓴다. 전환 비용은 (a) 의존성 (b) 여기 한 줄
+# (c) setup() 뿐이다"라고 적어뒀었다. **(b)가 한 줄이 아니었다.**
 #
-# ★ InMemorySaver의 한계를 알고 쓴다 ★ 이름 그대로 파이썬 프로세스 메모리다.
-#   1) --reload가 소스 변경을 감지해 재시작하면 전 대화가 사라진다.
-#      개발 중에 "왜 갑자기 기억을 못 하지?"의 90%가 이것이다.
-#   2) uvicorn --workers 2 이상이면 요청이 워커에 흩어지는데 워커마다 별도
-#      메모리라 대화가 뒤죽박죽 된다. k8s에서 replicas를 2로 올려도 같다.
-#      → 즉 이 상태로는 절대 스케일아웃할 수 없다.
-#   3) 지우는 코드가 없어서 스레드가 쌓이기만 한다. 프로세스가 오래 살면 누수다.
+# 커넥션 풀은 (1) 이벤트 루프가 있어야 열 수 있고 (2) 닫을 자리가 있어야 한다.
+# 모듈 import 시점에는 둘 다 없다. 그래서 체크포인터도, 그것을 물고 있는 그래프도
+# **lifespan으로 옮겼다**(app/main.py). 옛 주석이 낙관적이었던 것을 기록으로 남긴다 —
+# "한 줄이면 된다"는 추정은 그 줄을 실제로 써볼 때까지만 유효하다.
 #
-# 실무에서는 langgraph-checkpoint-postgres의 AsyncPostgresSaver를 쓴다. 이
-# 저장소에는 이미 Postgres가 있으니 전환 비용은 (a) 의존성 추가 (b) 여기 한 줄
-# (c) 체크포인터 테이블 생성(setup()) 뿐이다 — build_graph도 chat.py도 안 바뀐다.
-# 학습 단계에서 InMemorySaver로 시작하는 이유는 "체크포인터 개념"과 "DB 스키마
-# 마이그레이션"이라는 미지수 두 개를 동시에 열지 않기 위해서다.
-_checkpointer = InMemorySaver()
+# 옮긴 값: 앱이 살아 있는 동안만 풀이 열려 있고, 종료할 때 정확히 닫힌다.
+# 잃은 것: `from app.api.deps import _graph`처럼 import만으로 그래프를 얻을 수 없다.
+# (그래도 되는 이유 — 그래프가 필요한 곳은 라우터뿐이고, 라우터는 Depends로 받는다.)
 
 
 # ★ 3-4: 예고한 대로 이 한 줄만 바뀌었다 ★
@@ -166,19 +159,36 @@ async def _rewrite(question: str, history: list[dict[str, str]]) -> str:
     return await rewrite_query(question, history)
 
 
-_graph = build_graph(
-    _model,
-    retrieve_fn=_retrieve,
-    checkpointer=_checkpointer,
-    rewrite_fn=_rewrite,
-)
+def build_app_graph(checkpointer) -> CompiledStateGraph:
+    """이 앱이 쓰는 그래프를 만든다. lifespan이 딱 한 번 부른다. (M5-2)
+
+    ★ 체크포인터만 인자로 받는다 ★ 모델·검색·재작성은 여전히 이 파일이 고른다.
+    lifespan에게 넘긴 것은 "언제 만들고 언제 버릴지"뿐이고, "무엇으로 만들지"는
+    그대로 deps.py의 책임이다 — main.py가 ChatAnthropic을 알아야 할 이유가 없다.
+    """
+    return build_graph(
+        _model,
+        retrieve_fn=_retrieve,
+        checkpointer=checkpointer,
+        rewrite_fn=_rewrite,
+    )
 
 
-def get_graph() -> CompiledStateGraph:
+def get_graph(request: Request) -> CompiledStateGraph:
     # 함수로 한 겹 감싸는 이유는 M1의 get_anthropic_client()와 같다:
     # pytest에서 app.dependency_overrides로 가짜 그래프로 교체하기 위함이다.
-    # 라우터가 _graph를 직접 import하면 그 교체가 불가능해진다.
-    return _graph
+    # (M5-2에서 인자가 하나 생겼지만 교체 방식은 그대로다 — dependency_overrides는
+    #  원래 시그니처를 보지 않으므로 `lambda: fake_graph`가 계속 통한다.)
+    graph = getattr(request.app.state, "graph", None)
+    if graph is None:
+        # ★ 조용히 None을 주지 않는다 ★ 그러면 라우터 안쪽 깊은 곳에서
+        # AttributeError로 만나고, 원인이 "lifespan을 안 거쳤다"라는 것을 알아보기 어렵다.
+        # 가장 흔한 원인: TestClient를 `with` 없이 쓰면 lifespan이 안 돈다.
+        raise RuntimeError(
+            "그래프가 없다 — lifespan이 실행되지 않았다. "
+            "TestClient는 `with TestClient(app) as c:` 형태여야 lifespan이 돈다."
+        )
+    return graph
 
 
 Graph = Annotated[CompiledStateGraph, Depends(get_graph)]

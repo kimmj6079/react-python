@@ -19,7 +19,16 @@ spec:
     spec:
       containers:
         - name: postgres
-          image: postgres:16-alpine   # 공식 이미지를 그대로 사용 (커스텀 Dockerfile 없음)
+          # ★ M5에서 공식 postgres → pgvector 이미지로 바꿨다 ★
+          # M3의 document_chunks 마이그레이션이 `CREATE EXTENSION IF NOT EXISTS vector`로
+          # 시작하는데, 공식 postgres 이미지에는 그 확장 파일이 없어서 migrate Job이
+          # "extension \"vector\" is not available"로 죽는다. `IF NOT EXISTS`는
+          # "이미 있으면 넘어가라"이지 "설치가 안 돼 있으면 넘어가라"가 아니다.
+          # 로컬 docker-compose는 postgres/Dockerfile(FROM pgvector/pgvector:pg16)을
+          # 빌드해 써서 멀쩡했고, 그래서 **로컬만 보면 안 보이던 고장**이다.
+          #
+          # 주의: alpine이 아니라 debian 기반이라 이미지가 커진다(로컬 compose와 동일한 대가).
+          image: pgvector/pgvector:pg16
           ports:
             - containerPort: 5432
           envFrom:

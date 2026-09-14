@@ -19,7 +19,17 @@ jobs:
     # localhost:5432로 바로 접근 가능하다 (docker-compose의 서비스명 접근과는 다름).
     services:
       postgres:
-        image: postgres:16-alpine
+        # ★ 공식 postgres 이미지가 아니라 pgvector 이미지여야 한다 (M5에서 고침) ★
+        # M3에서 document_chunks 마이그레이션에 `CREATE EXTENSION IF NOT EXISTS vector`가
+        # 들어갔는데, 공식 postgres 이미지에는 그 확장 파일이 **없다.**
+        # `IF NOT EXISTS`는 "이미 만들어져 있으면 넘어가라"이지 "설치돼 있지 않으면
+        # 넘어가라"가 아니다 — 실측하면 이렇게 죽는다:
+        #   ERROR: extension "vector" is not available
+        #   DETAIL: Could not open extension control file ".../vector.control"
+        # 즉 M3 이후 이 job의 "Apply migrations" 스텝은 계속 실패하고 있었다.
+        # 로컬 docker-compose는 postgres/Dockerfile(FROM pgvector/pgvector:pg16)을
+        # 빌드해 써서 이 문제를 안 겪었고, 그래서 로컬만 보면 안 보이는 종류의 고장이었다.
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres

@@ -32,6 +32,7 @@ from app.rag.ingest import REPO_ROOT
 from app.rag.rerank import rerank
 from app.rag.retriever import retrieve
 from app.rag.rewrite import rewrite_query
+from evals import gate
 from evals.metrics import hit_at_k, mean, reciprocal_rank
 
 EVALS_DIR = Path(__file__).resolve().parent
@@ -201,7 +202,34 @@ def main() -> None:
         action="store_true",
         help="★ 하네스 검증용 ★ 검색 결과 순서를 무작위로 섞는다 (지표가 떨어져야 정상)",
     )
+    # ★ M13-d: 회귀 게이트 ★ 위의 --gate(그라운딩)와 이름이 비슷하지만 완전히 다른 것이다.
+    # --gate는 "이 검색 결과를 근거로 쓸 만한가"(런타임 동작)이고,
+    # --check는 "이번 코드가 예전보다 나빠졌는가"(CI 판정)다.
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="★ M13-d ★ 기록된 기준선(evals/thresholds.json)과 비교해 떨어졌으면 exit 1",
+    )
+    parser.add_argument(
+        "--write-baseline",
+        action="store_true",
+        help="이번 실행의 지표를 기준선으로 기록한다 (이미 있으면 --force 필요)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="--write-baseline이 기존 기준선을 덮어쓰도록 허용한다",
+    )
     args = parser.parse_args()
+
+    if args.check and args.write_baseline:
+        # 같은 실행으로 재면서 그 값을 기준선으로 삼으면 게이트는 **항상** 통과한다.
+        # "시험 문제를 내가 내고 내가 채점한다"와 같은 구조라 아예 막는다.
+        raise SystemExit("--check와 --write-baseline은 함께 쓸 수 없다")
+    if args.shuffle and (args.check or args.write_baseline):
+        # --shuffle은 "일부러 나쁜 설정"이다. 그 값을 기준선으로 굳히거나 게이트에
+        # 통과시키면 하네스 검증용 장치가 회귀 판정을 오염시킨다.
+        raise SystemExit("--shuffle은 게이트(--check/--write-baseline)와 함께 쓸 수 없다")
 
     # ★ 기본값이 None = 게이트 없음이다 ★ M9까지의 숫자와 그대로 비교되어야
     # "게이트가 무엇을 바꿨는가"를 말할 수 있다. 게이트를 기본으로 켜면 이후
@@ -300,6 +328,70 @@ def main() -> None:
         out.write_text(report, encoding="utf-8")
         print(f"\n저장: {out.relative_to(REPO_ROOT)}")
 
+    # ★ M13-d: 회귀 게이트 ★ 설정을 함께 기록하는 것이 핵심이다 — 기준선은 "숫자"가
+    # 아니라 "이 설정에서의 숫자"이기 때문이다. top_k만 올려도 hit@k는 올라간다.
+    run_config = {"store": store_name, "mode": mode, "top_k": args.top_k}
+    metrics = compute_metrics(rows, args.top_k)
+
+    if args.write_baseline:
+        _write_baseline(metrics, run_config, force=args.force)
+    if args.check:
+        _run_gate(metrics, run_config)
+
+
+def _write_baseline(metrics: dict, run_config: dict, *, force: bool) -> None:
+    """이번 실행의 지표를 기준선으로 굳힌다.
+
+    ★ 덮어쓰기에 --force를 요구하는 이유 ★ 기준선을 다시 기록하는 것은 **"지표가
+    떨어졌다"를 지우는 가장 쉬운 방법**이다. CI가 빨개졌을 때 코드를 고치는 대신
+    기준선을 낮추면 게이트는 영원히 초록이 되고, 그때부터 이 장치는 비용만 남는다.
+    막을 수는 없고(정당하게 낮춰야 할 때도 있다) **의도적인 행위로 만들 수는 있다** —
+    플래그 하나와 커밋 diff가 그 역할을 한다.
+    """
+    existing = gate.load()
+    if existing.floors and not force:
+        raise SystemExit(
+            "이미 기준선이 기록돼 있다. 덮어쓰려면 --force를 준다.\n"
+            "  기준선을 낮추는 것은 회귀를 '고치는' 것이 아니라 '지우는' 것이다 — "
+            "커밋 메시지에 왜 낮추는지 남긴다."
+        )
+    gate.save(
+        gate.Thresholds(
+            # ★ 기록일은 config가 아니라 옆자리다 ★ config는 매 실행 비교되는 값이라,
+            # 날짜를 섞으면 --check가 "recorded가 다르다"로 항상 실패한다.
+            recorded=datetime.now().strftime("%Y-%m-%d"),
+            config=run_config,
+            tolerance=existing.tolerance,
+            floors=metrics,
+        )
+    )
+    print(f"\n기준선 기록: {gate.THRESHOLDS.relative_to(REPO_ROOT)}")
+    print("★ 이 파일을 커밋해야 게이트가 동작한다 ★")
+
+
+def _run_gate(metrics: dict, run_config: dict) -> None:
+    """기준선과 비교하고, 떨어졌으면 exit 1로 CI를 빨갛게 만든다."""
+    thresholds = gate.load()
+
+    problems = gate.config_mismatches(run_config, thresholds.config)
+    if problems:
+        # ★ 설정이 다르면 "통과"도 "실패"도 말하지 않는다 ★ 비교 자체가 성립하지
+        # 않는데 초록을 주면 게이트가 거짓말을 시작한다.
+        print("\n설정이 기준선과 달라 비교할 수 없다:")
+        for problem in problems:
+            print(f"  - {problem}")
+        raise SystemExit(1)
+
+    try:
+        violations = gate.check(metrics, thresholds.floors, thresholds.tolerance)
+    except gate.BaselineNotRecorded as exc:
+        raise SystemExit(f"\n{exc}") from exc
+
+    print()
+    print(gate.format_report(metrics, thresholds.floors, thresholds.tolerance, violations))
+    if violations:
+        raise SystemExit(1)
+
 
 def build_report(
     rows: list[dict], store_name: str, top_k: int, shuffled: bool = False, mode: str = "dense"
@@ -370,20 +462,47 @@ def build_report(
     return "\n".join(lines)
 
 
-def _metric_row(label: str, subset: list[dict], top_k: int) -> str:
-    def score(key: str) -> tuple[float, float, float]:
-        rel = [r[key] for r in subset]
-        return (
-            mean([float(hit_at_k(x, 1)) for x in rel]),
-            mean([float(hit_at_k(x, top_k)) for x in rel]),
-            mean([reciprocal_rank(x) for x in rel]),
-        )
+def _scores(subset: list[dict], key: str, top_k: int) -> dict[str, float]:
+    """한 그룹의 점수 네 개. key는 "by_source"(느슨) 또는 "by_content"(엄격)."""
+    rel = [r[key] for r in subset]
+    return {
+        "n": len(subset),
+        "hit@1": mean([float(hit_at_k(x, 1)) for x in rel]),
+        "hit@k": mean([float(hit_at_k(x, top_k)) for x in rel]),
+        "mrr": mean([reciprocal_rank(x) for x in rel]),
+    }
 
-    s1, s5, smrr = score("by_source")
-    c1, c5, cmrr = score("by_content")
+
+def compute_metrics(rows: list[dict], top_k: int) -> dict[str, dict[str, float]]:
+    """게이트가 비교할 숫자를 만든다. (M13-d)
+
+    ★ 표와 게이트가 같은 함수를 본다 ★ 판정 로직을 따로 구현하면 "화면의 표는
+    초록인데 CI는 빨강"이 언젠가 반드시 생기고, 그 순간 아무도 게이트를 안 믿는다.
+
+    ★ 엄격 판정(by_content)만 내보낸다 ★ by_source는 "정답 문서에서 왔나"인데
+    문서가 3개뿐이라 찍어도 33%가 맞는다. 그런 숫자에 임계값을 걸면 게이트가
+    통과는 잘 하고 회귀는 못 잡는다.
+
+    ★ 케이스가 0건인 종류는 키 자체를 만들지 않는다 ★ 0.0으로 채워 내보내면
+    "지표가 0으로 떨어졌다"가 되어, 원인이 코드인지 골든셋인지 구분할 수 없다.
+    키가 없으면 gate.check()가 **"측정 안 됨"** 이라는 다른 이름의 실패로 잡는다.
+    """
+    answerable = [r for r in rows if r["case"].answerable]
+    metrics: dict[str, dict[str, float]] = {}
+    for kind in KINDS:
+        subset = [r for r in answerable if r["case"].kind == kind]
+        if subset:
+            metrics[kind] = _scores(subset, "by_content", top_k)
+    metrics["overall"] = _scores(answerable, "by_content", top_k)
+    return metrics
+
+
+def _metric_row(label: str, subset: list[dict], top_k: int) -> str:
+    src = _scores(subset, "by_source", top_k)
+    cnt = _scores(subset, "by_content", top_k)
     return (
-        f"| {label} | {len(subset)} | {s1:.2f} | {s5:.2f} | {smrr:.3f} "
-        f"| {c1:.2f} | {c5:.2f} | {cmrr:.3f} |"
+        f"| {label} | {len(subset)} | {src['hit@1']:.2f} | {src['hit@k']:.2f} | {src['mrr']:.3f} "
+        f"| {cnt['hit@1']:.2f} | {cnt['hit@k']:.2f} | {cnt['mrr']:.3f} |"
     )
 
 

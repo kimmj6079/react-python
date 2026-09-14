@@ -15,3 +15,33 @@ data:
   # 맞춰두기 위해 남겨둔 것. overlays/prod는 이 값을 VM 공인 IP 기반
   # 주소로 patch한다.
   BACKEND_CORS_ORIGINS: "http://app.127.0.0.1.nip.io"
+
+  # --- 챗봇 RAG (M5에서 추가) ---
+  # ★ 여기 없으면 backend가 app/core/config.py의 기본값을 쓴다 ★ 그 기본값은
+  # `qdrant_url = "http://localhost:6333"` = **파드 자기 자신**이라, 클러스터에서는
+  # 반드시 서비스명으로 덮어써야 한다. 안 덮어쓰면 연결 실패가 나고 챗봇은
+  # "문서를 찾을 수 없다"고 **그럴듯하게** 답한다 — 에러 로그보다 찾기 어려운 고장이다.
+  VECTOR_STORE: "qdrant"
+  QDRANT_URL: "http://qdrant:6333"   # qdrant-service.yaml의 Service 이름(DNS)
+  QDRANT_COLLECTION: "document_chunks"
+
+  # 임베딩 모델 캐시 위치. backend-deployment.yaml이 이 경로에 볼륨을 붙인다.
+  # 기본값(컨테이너의 임시 디렉터리)에 두면 컨테이너가 재시작할 때마다 2.24GB를
+  # 다시 받는다 — 그 대가를 볼륨 하나로 없앤다.
+  FASTEMBED_CACHE_PATH: "/var/cache/fastembed"
+
+  # ★ 배포 전에 끈다 ★ 단계별 지연을 SSE finish 프레임에 실어 보내는 값이다(M13-b).
+  # 학습 중에는 브라우저에서 바로 보여 편하지만, 내부 구조와 성능 특성을 클라이언트에
+  # 그대로 노출한다 — 공격자에게는 "어디를 때리면 되는지"의 힌트고 일반 사용자에게는
+  # 아무 의미가 없다. config.py의 주석이 "이 주석을 근거로 배포 전에 끈다"고 적어둔 그 자리다.
+  TIMINGS_IN_RESPONSE: "false"
+
+  # ★ 대화 영속화 (M5-2) ★ "postgres" | "memory".
+  # memory면 파드마다 별도 메모리라, backend replicas가 2인 이 배포에서는
+  # 같은 사용자의 두 번째 질문이 다른 파드로 갈 때 앱이 첫 턴처럼 행동한다.
+  # 에러가 아니라 "가끔 기억을 못 하는 챗봇"으로만 보인다.
+  # ★ 테이블은 migrate Job이 만든다 ★ 파드 기동 시점에 DDL을 돌리지 않는다.
+  CHECKPOINTER: "postgres"
+
+  # Langfuse는 self-host로 옮길 때 이 한 줄만 바꾼다. 키(PUBLIC/SECRET)는 Secret 쪽에 있다.
+  LANGFUSE_HOST: "https://cloud.langfuse.com"

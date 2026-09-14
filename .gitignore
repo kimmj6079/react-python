@@ -7,6 +7,13 @@ __pycache__/
 .ruff_cache/
 # M13-c 임베딩 캐시 (sqlite). 지워도 다시 계산될 뿐이다.
 .cache/
+# M13-d 👎 편입 초안. ★ 커밋하지 않는다 ★ 실제 사용자가 친 질문이 그대로 들어 있어
+# 개인정보가 섞일 수 있고, 무엇보다 이건 "처리할 일 목록"이지 기록이 아니다.
+# 기록으로 남는 것은 사람이 검토해 골든셋(evals/dataset.jsonl)에 옮긴 줄뿐이다.
+backend/evals/inbox/
+
+# 브라우저 자동화(Playwright MCP)가 검증 중 남기는 스냅샷/콘솔 로그. 산출물이 아니다.
+.playwright-mcp/
 
 # --- Node / frontend ---
 node_modules/

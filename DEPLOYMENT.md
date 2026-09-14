@@ -169,6 +169,22 @@ docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
 # 스키마 마이그레이션 적용 - 최초엔 반드시 필요(안 하면 items 테이블이 없어 API가 500)
 docker compose -f docker-compose.prod.yml --env-file .env.prod run --rm backend alembic upgrade head
 
+# ★ 대화 체크포인터 테이블 (M5-2) ★ alembic과 별개다 - 이 테이블들의 스키마는
+# langgraph가 소유하고 자기 버전 테이블로 관리한다. 남의 스키마를 우리 alembic
+# 리비전에 베껴 쓰면 라이브러리를 올리는 날 어긋나므로, 실행 시점만 우리가 정한다.
+# 안 하면 챗봇의 첫 질문에서 "relation \"checkpoints\" does not exist"가 난다.
+# 멱등이라 몇 번을 돌려도 안전하고, langgraph를 올린 뒤에는 다시 돌린다.
+docker compose -f docker-compose.prod.yml --env-file .env.prod run --rm backend python -m app.db.checkpointer_setup
+
+# ★ 챗봇 문서 인입 (M5에서 추가) ★ 마이그레이션과 같은 이유로 자동 실행되지 않는다.
+# 안 하면 배포는 "성공"하고 헬스체크도 초록인데, 벡터 저장소가 비어 있어 챗봇이
+# 모든 질문에 "문서를 찾을 수 없다"고 답한다 - 에러가 아니라 그럴듯한 오답이라
+# 모니터링에 아무것도 안 걸린다.
+# 주의: backend 이미지에는 저장소 루트의 문서(CLAUDE.md 등)가 들어 있지 않다.
+# 3단계에서 함께 scp한 문서를 마운트해서 넣거나, 운영에서는 업로드 API(M11)를 쓴다.
+docker compose -f docker-compose.prod.yml --env-file .env.prod \
+  run --rm -v "$(pwd)/docs:/docs" backend python -m app.rag.ingest /docs/CLAUDE.md
+
 # 매일 03:00 DB 백업이 돌도록 cron 등록 (기존 등록분 제거 후 재등록해 중복 방지)
 (crontab -l 2>/dev/null | grep -v "$(pwd)/backup-db.sh"; \
  echo "0 3 * * * cd $(pwd) && ./backup-db.sh >> backup.log 2>&1") | crontab -
@@ -177,12 +193,42 @@ docker compose -f docker-compose.prod.yml --env-file .env.prod run --rm backend 
 #### 6단계 — 정상 기동 확인
 
 ```bash
-docker compose -f docker-compose.prod.yml --env-file .env.prod ps      # 4개 서비스(db/backend/frontend/nginx) 모두 Up/healthy인지
+docker compose -f docker-compose.prod.yml --env-file .env.prod ps      # 5개 서비스(db/qdrant/backend/frontend/nginx) 모두 Up/healthy인지
 curl -sf http://localhost/                                              # SPA(프론트) 응답 확인
 curl -sf http://localhost/api/v1/items                                  # API 응답 확인 (빈 배열 [] 이면 정상)
 docker compose -f docker-compose.prod.yml --env-file .env.prod logs -f backend   # 문제 있으면 로그 확인
 ```
 브라우저에서는 `http://app.<VM_PUBLIC_IP>.nip.io`(또는 `.env.prod`에 채운 실제 `DOMAIN`)로 접속.
+
+**★ 헬스체크만 보고 끝내지 말 것 — 반드시 채팅을 한 번 쳐본다 ★** (M5에서 배운 것)
+챗봇은 **나머지가 전부 멀쩡한 채로 혼자 실패하는** 방식이 세 가지나 된다:
+
+| 증상 | 원인 | 확인 |
+|---|---|---|
+| 채팅만 401/500 | `ANTHROPIC_API_KEY`가 비었다 | `logs backend`에 인증 오류 |
+| "문서를 찾을 수 없다"만 반복 | 인입을 안 했다 / 저장소를 바꿔놓고 그쪽에 안 넣었다 | `curl localhost:6333/collections/document_chunks`의 `points_count` |
+| 채팅 치면 컨테이너가 재시작 | 메모리 상한 부족(임베딩 모델 2.24GB) | `docker stats`, `docker inspect`의 `OOMKilled` |
+| 👍/👎 버튼이 안 보인다 | `LANGFUSE_*`가 비었다(의도된 동작) | 정상. 피드백 루프를 쓰려면 키를 채운다 |
+| 재배포하면 대화가 사라진다 | 체크포인터 테이블을 안 만들었거나 `CHECKPOINTER=memory` | `\dt`로 `checkpoints` 테이블 확인 |
+
+#### ★ VM 사양 — 챗봇이 들어오면서 기준이 올라갔다
+
+임베딩 모델(`intfloat/multilingual-e5-large`)이 **2.24GB**다. backend 컨테이너가 첫 채팅
+요청에 이 모델을 프로세스로 올리므로, 예전 기준(backend 256MB)으로는 **반드시 OOMKill된다.**
+
+| 서비스 | mem_limit |
+|---|---:|
+| backend | 2.0 GB |
+| db (pgvector) | 512 MB |
+| qdrant | 512 MB |
+| frontend | 128 MB |
+| nginx | 128 MB |
+| **합계** | **약 3.3 GB** |
+
+여유를 포함해 **RAM 4GB 이상**을 권한다. 2GB VM이라면 선택지는 셋이다:
+① `.env.prod`에 `VECTOR_STORE=pgvector`를 넣어 qdrant 서비스를 빼기(대가: M8 하이브리드 검색
+상실, MRR 0.860 → 0.816) · ② 더 작은 임베딩 모델로 교체(`app/rag/embedding.py`의 `MODEL_NAME`,
+바꾸면 **전체 재인입 필요**) · ③ 임베딩을 별도 서비스로 분리.
 
 ------------------------------------------------------------------------------------------------------------------------
 
@@ -254,12 +300,24 @@ ssh <user>@<VM_IP> "kubectl delete job/migrate -n study-app --ignore-not-found"
 sed 's/imagePullPolicy: IfNotPresent/imagePullPolicy: Always/' k8s/base/migrate-job.yaml \
   | ssh <user>@<VM_IP> "kubectl apply -f -"
 ssh <user>@<VM_IP> "kubectl wait --for=condition=complete job/migrate -n study-app --timeout=120s"
+
+# ★ 챗봇 문서 인입 Job (M5에서 추가) ★ 마이그레이션과 완전히 같은 패턴이다.
+# 안 하면 배포는 성공하고 파드도 전부 Running인데 챗봇만 "문서를 찾을 수 없다"고 답한다.
+# 문서는 backend 이미지에 없으므로 ConfigMap으로 넣는다 (ingest-job.yaml 주석 참고).
+kubectl create configmap rag-docs -n study-app \
+  --from-file=CLAUDE.md --from-file=SETUP.md --from-file=DEPLOYMENT.md \
+  --dry-run=client -o yaml | ssh <user>@<VM_IP> "kubectl apply -f -"
+ssh <user>@<VM_IP> "kubectl delete job/ingest -n study-app --ignore-not-found"
+sed 's/imagePullPolicy: IfNotPresent/imagePullPolicy: Always/' k8s/base/ingest-job.yaml \
+  | ssh <user>@<VM_IP> "kubectl apply -f -"
+# 인입은 임베딩 모델(2.24GB) 다운로드가 포함돼 마이그레이션보다 훨씬 오래 걸린다
+ssh <user>@<VM_IP> "kubectl wait --for=condition=complete job/ingest -n study-app --timeout=900s"
 ```
 
 #### 7단계 — 정상 기동 확인
 
 ```bash
-ssh <user>@<VM_IP> "kubectl get pods -n study-app"                      # 전부 Running인지
+ssh <user>@<VM_IP> "kubectl get pods -n study-app"                      # 전부 Running인지 (qdrant 포함 — M5에서 추가됨)
 ssh <user>@<VM_IP> "kubectl get ingress -n study-app"                   # ADDRESS 필드가 채워졌는지
 curl -sf http://app.<VM_PUBLIC_IP>.nip.io/                              # SPA(프론트) 응답 확인
 curl -sf http://app.<VM_PUBLIC_IP>.nip.io/api/v1/items                  # API 응답 확인

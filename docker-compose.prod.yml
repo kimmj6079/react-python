@@ -9,8 +9,12 @@
 #   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
 #   docker compose -f docker-compose.prod.yml --env-file .env.prod run --rm backend alembic upgrade head
 services:	# 이 파일에서 정의할 컨테이너 서비스 목록 시작
-  db:	# PostgreSQL 데이터베이스 서비스 (커스텀 빌드 없이 공식 이미지 그대로 사용)
-    image: postgres:16-alpine	# k8s/base/postgres-statefulset.yaml과 동일한 베이스 이미지
+  db:	# PostgreSQL 데이터베이스 서비스 (커스텀 빌드 없이 공개 이미지 그대로 사용)
+    # ★ M5에서 공식 postgres → pgvector 이미지로 바꿨다 ★ M3의 document_chunks
+    # 마이그레이션이 `CREATE EXTENSION IF NOT EXISTS vector`로 시작하는데 공식
+    # 이미지에는 그 확장이 없어서 `alembic upgrade head`가 죽는다(실측). 로컬
+    # docker-compose.yml은 postgres/Dockerfile을 빌드해 써서 안 겪던 고장이다.
+    image: pgvector/pgvector:pg16	# k8s/base/postgres-statefulset.yaml과 동일한 베이스 이미지
     environment:	# 컨테이너 내부에 주입할 환경변수
       POSTGRES_USER: ${POSTGRES_USER}	# .env.prod에서 주입
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}	# .env.prod에서 주입 (반드시 강한 값)
@@ -31,18 +35,81 @@ services:	# 이 파일에서 정의할 컨테이너 서비스 목록 시작
         max-file: "3"
     restart: unless-stopped	# 운영 환경이므로 컨테이너가 죽으면 자동 재시작
 
+  qdrant:	# 벡터 저장소 (M5에서 추가). k8s/base/qdrant-statefulset.yaml과 짝을 이룬다
+    # ★ 여태 배포 경로에 없었다 ★ M3에서 로컬 docker-compose.yml에만 추가했고
+    # M8에서 VECTOR_STORE 기본값을 qdrant로 바꿨는데, 이 파일은 안 따라왔다.
+    # 그 상태로 배포하면 backend가 localhost:6333으로 붙으려다 실패하고 챗봇이
+    # "문서를 찾을 수 없다"고 답한다 - 에러가 아니라 **그럴듯한 오답**이다.
+    # pgvector로 되돌리려면 이 서비스를 지우고 .env.prod에 VECTOR_STORE=pgvector를 넣는다
+    # (대가: M8 하이브리드 검색을 잃는다. 실측 MRR 0.860 -> 0.816).
+    image: qdrant/qdrant:v1.19.1	# docker-compose.yml/k8s와 같은 고정 태그 - latest는 실측의 유효기간을 없앤다
+    healthcheck:
+      # ★ Qdrant 이미지에는 curl도 wget도 없다(실측) ★ 그래서 HTTP로 /readyz를
+      # 두드릴 수가 없고, bash의 /dev/tcp로 포트가 실제로 열렸는지를 본다.
+      #
+      # `/qdrant/qdrant --version`으로 때우고 싶어지는데, 그건 **바이너리가 있다**는
+      # 사실만 확인한다 - 서버가 요청을 받을 준비가 됐는지는 모른다. 그러면
+      # depends_on: service_healthy가 통과해버려 backend가 먼저 뜬다.
+      # **항상 통과하는 헬스체크는 헬스체크가 없는 것보다 나쁘다** - 오늘 만든
+      # 회귀 게이트에서 "기준선이 없으면 통과가 아니라 고장"이라고 정한 것과 같은 규칙이다.
+      test: ["CMD", "bash", "-c", ":> /dev/tcp/127.0.0.1/6333"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - qdrant-data:/qdrant/storage	# 인입해둔 벡터 영속화 - 지우면 재인입해야 한다
+    # 호스트에 포트를 노출하지 않는다 - backend만 내부 네트워크로 접근한다.
+    # ★ 6333을 호스트에 열지 않는 것이 중요하다 ★ Qdrant에는 기본 인증이 없어서
+    # 공인 IP에 열면 누구나 대시보드로 문서 전문을 읽고 지울 수 있다.
+    mem_limit: 512m	# 벡터 수에 비례해 커진다. 지금 말뭉치(138청크)에는 충분
+    cpus: "0.5"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+
   backend:	# FastAPI 백엔드 서비스 (GHCR 이미지 pull, 로컬 빌드 없음)
     image: ghcr.io/kimmj6079/react-python-backend:${IMAGE_TAG:-latest}	# 기본은 latest, 롤백 시 .env.prod의 IMAGE_TAG를 sha-xxxxxxx로 바꿔 재배포
     environment:	# 백엔드에 주입할 환경변수
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}	# host는 compose 서비스명 db
       BACKEND_CORS_ORIGINS: http://${DOMAIN:-app.${APP_HOST}.nip.io}	# DOMAIN 비어있으면 nip.io 자동 계산, 채워지면 실제 도메인 사용(k8s configmap과 동일 형식)
+      # --- 챗봇 RAG (M5에서 추가) ---
+      VECTOR_STORE: ${VECTOR_STORE:-qdrant}	# pgvector로 되돌리려면 .env.prod에서 이 값만 바꾼다
+      QDRANT_URL: http://qdrant:6333	# 컨테이너 안에서는 localhost가 아니라 서비스명 (로컬 compose와 같은 규칙)
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-document_chunks}
+      FASTEMBED_CACHE_PATH: /var/cache/fastembed	# 아래 model-cache 볼륨과 경로가 반드시 같아야 한다
+      TIMINGS_IN_RESPONSE: "false"	# ★ 배포에서는 끈다 ★ 단계별 지연을 클라이언트에 노출하지 않는다 (M13-b)
+      # ★ 대화 영속화 (M5-2) ★ memory면 컨테이너를 다시 만들 때마다 진행 중이던 대화가 사라진다.
+      # 테이블은 자동 생성되지 않는다 - 배포 절차의 `python -m app.db.checkpointer_setup` 참고.
+      CHECKPOINTER: ${CHECKPOINTER:-postgres}
+      # ★ 시크릿은 이 파일에 값으로 적지 않는다 ★ .env.prod에서 주입한다(gitignore됨).
+      # ANTHROPIC_API_KEY가 비면 앱은 정상적으로 뜨고 items CRUD도 다 도는데
+      # /api/v1/chat만 401을 준다 - 헬스체크만 보면 못 잡는 고장이다.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # 비워도 된다(트레이싱 no-op). 다만 비우면 👍/👎 피드백 버튼이 화면에서 사라진다(M13-a).
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-https://cloud.langfuse.com}
+    volumes:
+      # 임베딩 모델(2.24GB) 캐시. 없으면 컨테이너를 다시 만들 때마다 통째로 다시 받는다.
+      - model-cache:/var/cache/fastembed
     depends_on:	# 시작 순서 의존성
       db:	# db 서비스가 준비된 후 시작
         condition: service_healthy	# db의 헬스체크가 통과해야 시작
+      qdrant:	# 벡터 저장소도 준비된 후 시작
+        condition: service_healthy
     # 호스트에 포트를 노출하지 않는다 - 공유 nginx 서비스를 통해서만 도달 가능
     # (k8s에서 backend Service가 Ingress 없이는 클러스터 밖에 노출되지 않는 것과 동일한 특성)
-    mem_limit: 256m	# k8s/base/backend-deployment.yaml의 limits와 동일한 값
-    cpus: "0.5"
+    #
+    # ★★ M5에서 256m -> 2g로 올렸다. 예전 값이면 챗봇이 반드시 죽는다 ★★
+    # 임베딩 모델(intfloat/multilingual-e5-large)이 2.24GB인데 로딩이 lazy라
+    # **컨테이너는 멀쩡히 뜨고 헬스체크도 통과한다.** 죽는 것은 누군가 첫 채팅을 친
+    # 순간이고, 모양은 500이 아니라 OOMKill 후 재시작이다.
+    # → VM 사양을 먼저 확인한다. 이 스택 전체가 최소 약 3.5GB를 쓴다(DEPLOYMENT.md 참고).
+    mem_limit: 2g	# k8s/base/backend-deployment.yaml의 limits와 동일한 값
+    cpus: "1"	# 임베딩은 CPU 연산이라 0.5코어로 조이면 응답이 눈에 띄게 느려진다
     logging:
       driver: json-file
       options:
@@ -91,4 +158,6 @@ services:	# 이 파일에서 정의할 컨테이너 서비스 목록 시작
     restart: unless-stopped	# 운영 환경이므로 컨테이너가 죽으면 자동 재시작
 
 volumes:	# 명명된 볼륨 정의
+  qdrant-data:	# M5: 인입한 벡터 영속화용 볼륨. 지우면 재인입해야 챗봇이 답한다
+  model-cache:	# M5: 임베딩 모델(2.24GB) 캐시. 지워도 안전하다 - 다시 받을 뿐이다
   db-data:	# postgres 데이터 영속화용 볼륨

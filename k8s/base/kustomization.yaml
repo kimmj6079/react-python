@@ -12,12 +12,15 @@ namespace: study-app   # 여기 나열된 모든 리소스에 이 네임스페�
 # migrate-job.yaml이 없는 이유: k8s Job의 spec은 불변이라 여기 포함시키면
 # 재실행할 때 `kubectl apply -k`가 실패한다. 그래서 delete 후 별도로
 # `kubectl apply -f`하는 방식으로 관리한다 (CLAUDE.md, scripts/deploy-*.* 참고).
+# ingest-job.yaml도 migrate-job.yaml과 같은 이유로 이 목록에 없다 (Job은 불변).
 resources:
   - namespace.yaml
   - configmap.yaml
   - secret.yaml
   - postgres-statefulset.yaml
   - postgres-service.yaml
+  - qdrant-statefulset.yaml   # M5: 벡터 저장소. VECTOR_STORE=pgvector로 쓸 거면 이 두 줄을 빼도 된다
+  - qdrant-service.yaml
   - backend-deployment.yaml
   - backend-service.yaml
   - frontend-deployment.yaml

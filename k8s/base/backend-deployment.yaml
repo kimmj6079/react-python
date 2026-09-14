@@ -27,6 +27,12 @@ spec:
                 name: app-config
             - secretRef:
                 name: app-secret
+          volumeMounts:
+            # ★ M5: 임베딩 모델 캐시 ★ 경로는 configmap.yaml의 FASTEMBED_CACHE_PATH와
+            # 반드시 같아야 한다. 둘이 어긋나면 에러가 아니라 **모델을 매번 다시 받는다** —
+            # 첫 채팅이 몇 분 걸리는 것으로만 드러나는 조용한 고장이다.
+            - name: model-cache
+              mountPath: /var/cache/fastembed
           readinessProbe:   # 통과해야 backend-service.yaml이 이 Pod로 트래픽을 보냄
             httpGet:
               path: /health/ready
@@ -39,10 +45,40 @@ spec:
               port: 8000
             initialDelaySeconds: 10
             periodSeconds: 15
+          # ★★ M5에서 크게 올렸다 — 예전 값(limits 256Mi)이면 챗봇이 반드시 죽는다 ★★
+          # backend는 요청을 받을 때 임베딩 모델(intfloat/multilingual-e5-large)을
+          # 프로세스 안으로 올린다. fastembed 카탈로그가 보고하는 크기가 **2.24GB**다.
+          #
+          # 그런데 로딩이 lazy라(app/rag/embedding.py) 파드는 **정상적으로 뜨고
+          # 헬스체크도 통과한다.** 죽는 것은 누군가 첫 채팅을 친 순간이고, 모양은
+          # 500이 아니라 **OOMKilled → 파드 재시작**이다. "배포 직후엔 초록이었는데
+          # 쓰기 시작하니 계속 재시작되는" 가장 헷갈리는 실패 형태다.
+          #
+          # cpu도 함께 올렸다. 임베딩은 CPU 연산이고(13-b 실측 p50 113ms, 데스크톱 기준)
+          # 0.5코어로 조이면 그 값이 몇 배로 늘어난다 — 사용자가 기다리는 경로의 맨 앞이다.
+          #
+          # ★ 실무라면 여기서 멈추지 않는다 ★ 모델을 앱 프로세스에 올리는 것 자체가
+          # 선택이다. 대안은 (a) 임베딩 전용 서비스로 분리(파드당 2GB를 한 번만 낸다),
+          # (b) 더 작은 다국어 모델, (c) 이미지에 모델을 미리 구워 다운로드를 없애기.
+          # BASELINE-M13.md에 각각의 대가를 표로 남겨뒀다.
           resources:
             requests:   # 스케줄링 시 최소한 이만큼은 확보해달라는 요청량
-              cpu: 100m
-              memory: 128Mi
+              cpu: 200m
+              memory: 512Mi
             limits:   # 이 이상 쓰면 CPU는 스로틀링, 메모리는 OOMKill 대상이 되는 상한선
-              cpu: 500m
-              memory: 256Mi
+              cpu: "1"
+              memory: 2Gi
+      volumes:
+        # ★ emptyDir인 이유와 그 한계 ★ 파드가 사는 동안만 남는 디스크다. 컨테이너가
+        # 재시작해도 모델은 그대로 있지만(그게 목적이다), **파드가 다른 노드로 옮겨가거나
+        # 새 파드가 뜨면 2.24GB를 다시 받는다.** 오토스케일이 일어날 때마다 그 비용을 낸다.
+        #
+        # PVC로 바꾸면 재다운로드가 사라지지만 ReadWriteMany가 필요하다(replicas가 2라
+        # 두 파드가 동시에 읽는다) — 기본 StorageClass가 대개 ReadWriteOnce라 그대로는 안 된다.
+        # **실무에서 가장 흔한 답은 셋 중 하나다**: 이미지에 모델을 굽기(가장 단순,
+        # 이미지가 커짐) · 임베딩 서비스 분리 · ReadWriteMany 스토리지.
+        # 13-b에서 잰 "콜드 스타트 5.5~13초"와 같은 뿌리의 문제이고, 여기서는 한 단계
+        # 더 나간 형태(로딩이 아니라 다운로드)다.
+        - name: model-cache
+          emptyDir:
+            sizeLimit: 4Gi

@@ -60,7 +60,7 @@ FastAPI(백엔드) + React/TypeScript/Vite(프론트엔드) + PostgreSQL 풀스�
 backend/    FastAPI 앱 (app/), Alembic 마이그레이션, pytest
 frontend/   React + TS + Vite, Vitest
 k8s/        Kustomize 매니페스트 (base/ + overlays/dev, prod/)
-.github/workflows/  ci.yml, cd.yml
+.github/workflows/  ci.yml, cd.yml, evals.yml(RAG 평가 — ci.yml과 분리, 야간 스케줄 + 수동 실행)
 scripts/    minikube 배포(deploy-local) + 클라우드 VM 배포(provision-vm, deploy-prod, deploy-prod-compose) 스크립트 (.sh / .ps1)
             + backup-db.sh (docker-compose 운영 배포 시 VM에 전송되어 cron으로 매일 실행되는 DB 백업)
 docker-compose.yml       로컬 통합 개발 환경 (db=pgvector 포함 Postgres, qdrant=벡터 DB, backend, frontend)
@@ -82,6 +82,7 @@ nginx-proxy/ssl/         SSL 인증서/개인키 배치 위치 (실제 파일은
 ```bash
 uv sync                                          # 의존성 설치 (.venv 자동 생성)
 uv run alembic upgrade head                      # 최초 1회 / 마이그레이션 추가 시
+uv run python -m app.db.checkpointer_setup       # 최초 1회 — 대화 체크포인터 테이블 (M5-2, alembic과 별개)
 uv run uvicorn app.main:app --reload             # 개발 서버 (localhost:8000)
 uv run pytest -v                                 # 전체 테스트
 uv run pytest tests/test_items.py::test_create_item -v   # 단일 테스트
@@ -151,6 +152,36 @@ uv run python scripts/probe_prompt_cache.py                                 # �
 
 ------------------------------------------------------------------------------------------------------------------------
 
+### 평가 하네스와 회귀 게이트 (M6 · M13-d)
+
+```bash
+cd backend
+uv run python -m evals.run_retrieval --store qdrant --save          # 검색 평가 (LLM 안 부름 = 0원)
+uv run python -m evals.run_retrieval --no-rewrite --write-baseline  # 기준선 기록 (최초 1회)
+uv run python -m evals.run_retrieval --no-rewrite --check           # 기준선과 비교, 떨어지면 exit 1
+uv run python -m evals.judge --save                                 # 생성 평가 ★ 실제 API 비용 ★
+uv run python -m evals.promote_feedback --days 30                   # 👎 → 골든셋 편입 초안
+```
+
+**검색 평가는 크레딧이 없어도 돈다.** 임베딩이 로컬 fastembed(CPU)라 API를 안 부르고
+결정론적이다. 단 `--no-rewrite`가 필수인데, 질의 재작성만 LLM을 부르기 때문이다(multiturn
+케이스만). 안 끄면 "무료" 실행이 조용히 유료가 된다.
+
+**게이트는 기준선이 없으면 통과가 아니라 실패한다.** `evals/thresholds.json`의 `floors`가
+`null`이면 `--check`가 exit 1을 낸다 — 한 번도 보정 안 한 게이트가 영원히 초록을 내는 것을
+막기 위함이다. 기준선은 **git에 커밋되는 파일**이고, 낮추려면 `--force`가 필요하다.
+
+**`.github/workflows/evals.yml`은 `ci.yml`과 분리돼 있다.** 비용·시크릿·플래키 세 가지
+이유이고, 검색 잡만 야간 스케줄로 자동 실행된다. 생성 평가(LLM-as-judge)는 수동 실행에서
+`run_judge`를 체크했을 때만 돈다.
+
+**👎 편입은 자동이 아니다.** `promote_feedback.py`는 `evals/inbox/`에 초안만 쓰고
+`dataset.jsonl`은 건드리지 않는다 — 골든셋은 측정의 기준자라, 스스로 자라면 어제 잰 값과
+오늘 잰 값을 비교할 수 없다. 초안은 `id`·`kind`가 `TODO`라 검토 없이 붙여넣으면
+`validate_dataset`이 거부한다.
+
+------------------------------------------------------------------------------------------------------------------------
+
 ### Kubernetes (로컬 minikube/kind 기준)
 
 ```bash
@@ -182,6 +213,12 @@ kubectl apply -f k8s/base/migrate-job.yaml
 - 로컬 dev: `http://localhost:8000` (프론트가 백엔드에 절대경로로 요청, 백엔드가 CORS 허용)
 - docker-compose: 마찬가지로 절대경로 + CORS
 - 프로덕션 이미지(k8s와 docker-compose 배포 경로가 공유하는 동일 GHCR 이미지): 기본값이 빈 문자열(`""`)이라 프론트 코드가 이미 갖고 있는 `/api/v1/...` 상대경로가 same-origin으로 나간다. k8s는 Ingress가, docker-compose는 공유 `nginx` 서비스(`nginx-proxy/conf.d/app.conf`)가 각각 이 `/api` 프리픽스를 backend로 라우팅한다. 즉 k8s의 `configmap.yaml`에 `VITE_API_URL`을 넣어도 이미 빌드된 프론트 이미지에는 아무 효과가 없다 — 바꾸려면 이미지를 다시 빌드해야 한다.
+
+**Postgres 이미지는 반드시 pgvector가 들어 있는 것이어야 하고, 네 곳에 흩어져 있다**: `postgres/Dockerfile`(`FROM pgvector/pgvector:pg16`, 로컬 compose가 빌드) · `k8s/base/postgres-statefulset.yaml` · `docker-compose.prod.yml` · `.github/workflows/ci.yml`의 services. M3의 `document_chunks` 마이그레이션이 `CREATE EXTENSION IF NOT EXISTS vector`로 시작하는데, **공식 `postgres:16-alpine`에는 그 확장 파일이 없다** — `IF NOT EXISTS`는 "이미 만들어져 있으면 넘어가라"이지 "설치가 안 돼 있으면 넘어가라"가 아니라서 `extension "vector" is not available`로 죽는다. 로컬 compose만 커스텀 Dockerfile을 쓰고 있어서, M3부터 M5까지 **로컬은 멀쩡한데 CI와 배포 경로만 조용히 깨져 있었다.** 이미지를 바꿀 때는 네 곳을 함께 본다.
+
+**챗봇을 배포하려면 벡터 저장소·시크릿·메모리 상한 셋이 함께 따라가야 한다**(M5): `VECTOR_STORE` 기본값이 `qdrant`라 배포 환경에도 Qdrant가 떠 있어야 하고(`k8s/base/qdrant-*.yaml`, `docker-compose.prod.yml`의 `qdrant` 서비스), `ANTHROPIC_API_KEY`가 없으면 **앱은 정상적으로 뜨고 `/api/v1/chat`만 실패한다**. 그리고 임베딩 모델이 2.24GB라 backend 메모리 상한이 2GB 미만이면 **첫 채팅 요청에 OOMKill된다** — 파드가 뜨는 시점에는 멀쩡하다(로딩이 lazy라서). 문서 인입도 마이그레이션과 같은 이유로 자동 실행되지 않는다(`k8s/base/ingest-job.yaml`). 상세는 [DEPLOYMENT.md](./DEPLOYMENT.md) 참고.
+
+**대화 상태는 Postgres 체크포인터에 남는다**(M5-2). `CHECKPOINTER=postgres`(기본)면 `--reload` 재시작·파드 교체·스케일아웃을 넘어 대화가 이어진다. 테이블은 **`alembic`이 아니라 `python -m app.db.checkpointer_setup`이 만든다** — 그 스키마는 langgraph가 소유하고 자기 버전 테이블로 관리하므로, 남의 스키마를 우리 리비전에 베껴 쓰지 않고 실행 시점만 우리가 정한다(k8s는 `migrate-job.yaml`이 둘 다 돌린다). ★ Windows 함정 ★ psycopg 비동기는 Windows 기본 이벤트 루프에서 동작하지 않고, **uvicorn은 `--reload`일 때만 Selector 루프를 쓴다** — 즉 `--reload`를 빼면 기동 시점에 명시적 에러로 죽는다. 그때는 `CHECKPOINTER=memory`로 두거나 docker compose로 띄운다.
 
 **마이그레이션은 절대 컨테이너 시작 시 자동 실행되지 않는다.** 로컬은 `alembic upgrade head`를 직접, k8s는 `k8s/base/migrate-job.yaml`(별도 Job)을 통해 명시적으로 실행한다 — 스키마 변경을 감사 가능한 별도 단계로 유지하기 위함.
 

@@ -1,0 +1,23 @@
+# qdrant StatefulSet 앞단의 headless Service. postgres-service.yaml과 완전히 같은
+# 패턴이고 같은 이유다 — StatefulSet의 Pod에 안정적인 DNS 이름을 주기 위한 것이지
+# 부하분산이 목적이 아니다(replicas가 1이라 분산할 것도 없다).
+#
+# backend는 그냥 서비스명으로 접속한다: QDRANT_URL=http://qdrant:6333
+# (configmap.yaml 참고. 로컬 docker-compose가 http://qdrant:6333을 쓰는 것과 같은 모양이라,
+#  "컨테이너 안에서는 localhost가 아니라 서비스명"이라는 규칙이 두 환경에서 동일하다.)
+apiVersion: v1
+kind: Service
+metadata:
+  name: qdrant
+  namespace: study-app
+spec:
+  clusterIP: None   # headless
+  selector:
+    app: qdrant
+  ports:
+    - name: http
+      port: 6333
+      targetPort: 6333
+    - name: grpc
+      port: 6334
+      targetPort: 6334

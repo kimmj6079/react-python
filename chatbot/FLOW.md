@@ -3,7 +3,7 @@
 > 메시지 하나가 브라우저에서 출발해 화면에 글자로 돌아오기까지, **어느 파일의 어느 줄을 지나는지**
 > 정리한 문서다. 스터디 중 "이건 어디서 하는 거지?"가 생길 때 여기서 찾는다.
 >
-> **기준 시점: M13-b 완료 (2026-09-10)** — 마일스톤이 끝날 때마다 갱신한다.
+> **기준 시점: M5-2 완료 (2026-09-14)** — 마일스톤이 끝날 때마다 갱신한다.
 > (M4~M12의 노드·필터·인용이 이미 이 그림 안에 들어와 있다.)
 > 진행 순서와 각 단계의 결정·함정 기록은 [README.md](./README.md)에 있다.
 
@@ -38,7 +38,7 @@ transport.ts
                                     │              │         ├─ retrieved_context(str)│
                                     │              │         └─ retrieved(청크 목록)  │
                                     │    ▲         └─ search_query (재작성본)        │
-                                    │    └─ InMemorySaver (복원 · 저장)              │
+                                    │    └─ AsyncPostgresSaver (복원 · 저장, M5-2)   │
                                     └──────┬───────────────────────┬───────────────┘
                                            │                       │
                                   rag/retriever.py           ChatAnthropic ──▶ Anthropic API
@@ -106,6 +106,9 @@ POST /chat ── config = { configurable, callbacks, metadata } ──▶ graph
 | **M10** | 근거를 **화면에 낸다**(인용 카드) + 근거가 약하면 컨텍스트를 비운다(그라운딩 게이트) |
 | **M11** | 문서 인입이 **API**가 됐다. 업로드 · 멱등 업서트 · 백그라운드 잡 |
 | **M12** | 검색에 **권한 필터**가 필수 인자로 들어간다. `Principal`이 요청부터 저장소까지 관통 |
+| **M13** | 👍/👎 → Langfuse score · 단계별 지연 계측 · 임베딩 캐시 · **회귀 게이트**(evals.yml) |
+| **M5**  | 배포 경로 복구(pgvector 이미지 · Qdrant · 메모리 상한) + RRF 동점 결정론화 |
+| **M5-2** | 대화 저장소가 **프로세스 메모리 → Postgres**. 그래프가 lifespan으로 옮겨졌다 |
 
 ---
 
@@ -115,14 +118,16 @@ POST /chat ── config = { configurable, callbacks, metadata } ──▶ graph
 
 | 파일 | 한 줄 역할 | 핵심 심볼 | 이 파일을 고칠 때 |
 |---|---|---|---|
-| [Chat.tsx](../frontend/src/components/chat/Chat.tsx) | 화면 · 입력 · **세션 id 소유** | `useChat`:44, `submit`:75, `<Citations>`:180 | UI/UX가 바뀔 때 |
+| [Chat.tsx](../frontend/src/components/chat/Chat.tsx) | 화면 · 입력 · **세션 id 소유** + **대화 복원**(M5-3) | `chatId`:46, `useChat`:51, 복원 effect:58, `submit`:110 | UI/UX가 바뀔 때 |
+| [session.ts](../frontend/src/components/chat/session.ts) | `thread_id`를 새로고침 너머로 유지 (M5-3) | `loadChatId`, `newChatId` | 대화 목록·로그인이 생길 때 |
 | [Citations.tsx](../frontend/src/components/chat/Citations.tsx) | **인용 카드** (M10) | `Citations`:17 | 출처를 어떻게 보여줄지 |
 | [transport.ts](../frontend/src/components/chat/transport.ts) | **무엇을 보낼지**(와이어 계약) | `prepareChatRequest`:18, `chatTransport`:44 | 요청 본문이 바뀔 때 |
 | [client.ts](../frontend/src/api/client.ts) | 백엔드 **주소**만 관리 | `CHAT_API_URL`:12 | 엔드포인트가 늘 때 |
-| [main.py](../backend/app/main.py) | CORS + 라우터 등록 | `add_middleware`:15, `include_router`:26 | 라우터 · 허용 오리진 추가 |
+| [main.py](../backend/app/main.py) | **lifespan**(체크포인터·그래프 수명) + CORS + 라우터 | `lifespan`:15, `add_middleware`:48, `include_router`:57 | 앱 수명에 묶이는 자원이 생길 때 |
+| [core/checkpointer.py](../backend/app/core/checkpointer.py) | **대화 저장소** 배선 (M5-2) | `to_psycopg_dsn`:45, `ensure_loop_supports_psycopg`:65, `checkpointer_scope`:94 | 저장소를 바꿀 때 · 풀 설정 |
 | [schemas/chat.py](../backend/app/schemas/chat.py) | 요청 본문의 **모양 계약** | `UIMessage`:12, `ChatRequest`:26 | 프론트 요청 포맷이 바뀔 때 |
-| [api/deps.py](../backend/app/api/deps.py) | 무거운 객체 **1회 생성 + 주입** + **검색 전략 조립** | `get_principal`:27, `_model`:62, `_checkpointer`:87, `_store`:97, `_retrieve`:100, `_rewrite`:143, `get_graph`:160 | 모델 · 저장소 교체, 검색 단계 추가 |
-| [api/routes/chat.py](../backend/app/api/routes/chat.py) | HTTP ↔ 그래프 **접착** + **스트림 필터** | `chat`:29, `text_deltas`:76, `sources`:110 | 무엇을 화면에 내보낼지 바뀔 때 |
+| [api/deps.py](../backend/app/api/deps.py) | 무거운 객체 **1회 생성 + 주입** + **검색 전략 조립** | `get_principal`:29, `_model`:64, `_store`:93, `_retrieve`:96, `_rewrite`:153, `build_app_graph`:162, `get_graph`:177 | 모델 · 저장소 교체, 검색 단계 추가 |
+| [api/routes/chat.py](../backend/app/api/routes/chat.py) | HTTP ↔ 그래프 **접착** + **스트림 필터** | `chat`:37, `text_deltas`:89, `sources`:129 | 무엇을 화면에 내보낼지 바뀔 때 |
 | [graph.py](../backend/app/graph.py) | 대화 **흐름** 정의 | `SYSTEM_PROMPT_TEMPLATE`:53, `NO_CONTEXT_PROMPT`:81, `State`:100, `build_graph`:148, `rewrite`:186, `retrieve`:221, `call_model`:261 | 노드 · 엣지가 늘 때 |
 | [tools.py](../backend/app/tools.py) | 모델이 쓸 수 있는 **능력** | `get_current_time`:14, `TOOLS`:34 | 도구를 추가·수정할 때 |
 | [core/ai_sdk.py](../backend/app/core/ai_sdk.py) | AI SDK **와이어 포맷** | `latest_user_text`:43, `sse`:75, `source_part`:86, `ui_message_stream`:122 | `ai` 패키지 버전이 바뀔 때 |
@@ -311,6 +316,94 @@ DB가 죽었을 때 예외를 그대로 올리면 정확히 저 진단 불가능
 `finish` 프레임에 실어 보낸 값을 브라우저가 **그대로 되돌려준다.** 프론트가 계산하는 값이
 하나도 없다는 점이 M10의 `sourceId`와 같다 — 화면은 서버가 준 식별자를 나르기만 한다.
 
+### 경로 0 — 앱이 뜰 때 (M5-2에서 생긴 단계)
+
+요청 하나가 아니라 **프로세스 하나**의 시작이다. 이 단계가 M5-2 전에는 없었다.
+
+| # | 위치 | 하는 일 | 실패하면 |
+|---|---|---|---|
+| 1 | `main.py` `lifespan` | `checkpointer_scope()` 진입 | 아래 2~4 |
+| 2 | `core/checkpointer.py` `ensure_loop_supports_psycopg` | Windows 기본 루프면 **기동 거부** | 명시적 RuntimeError (첫 채팅까지 미루지 않는다) |
+| 3 | 같은 파일 | `AsyncConnectionPool(..., open=False)` → `open(wait=False)` | DB가 아직 없어도 **앱은 뜬다**. 채팅만 실패 |
+| 4 | `deps.build_app_graph` | 모델·검색·재작성 + 이 체크포인터로 그래프 컴파일 | — |
+| 5 | `app.state.graph` | 라우터가 `get_graph(request)`로 꺼내 쓴다 | lifespan 미실행 시 이름을 담은 RuntimeError |
+| 6 | 종료 시 | `pool.close()` | — |
+
+**★ 테이블은 여기서 안 만든다 ★** `setup()`을 lifespan에서 부르는 예제가 대부분이지만,
+이 저장소는 `python -m app.db.checkpointer_setup`을 **별도 단계**로 둔다 —
+"마이그레이션은 컨테이너 시작 시 자동 실행되지 않는다"와 같은 규칙이다.
+
+**★ pytest는 이 경로를 안 탄다 ★** `conftest.py`의 client fixture가 `TestClient(app)`을
+그냥 돌려주기 때문이다(`with` 없이 쓰면 lifespan이 안 돈다). 그래서 테스트는
+`dependency_overrides`로 가짜 그래프를 꽂아 쓰고, **진짜 Postgres에 붙는 일이 없다.**
+
+### 경로 F — 새로고침하면 대화가 돌아온다 (M5-3)
+
+요청 하나짜리 짧은 경로다. 스트리밍도 그래프 실행도 없다.
+
+| # | 위치 | 하는 일 | 안 하면 |
+|---|---|---|---|
+| 1 | `chat/session.ts` `loadChatId` | localStorage에서 `thread_id`를 꺼낸다(없으면 만들어 저장) | 새로고침마다 새 대화 — **데이터는 남는데 가리킬 손잡이를 잃는다** |
+| 2 | `Chat.tsx`의 복원 effect | `GET /chat/{id}/messages` | — |
+| 3 | `routes/chat.py` `chat_history` | `graph.aget_state`로 체크포인터를 읽는다 | — |
+| 4 | `core/ai_sdk.py` `to_ui_messages` | LangChain 메시지 → UIMessage. system·tool·빈 AI 메시지는 뺀다 | 화면에 빈 말풍선·도구 원문이 나온다 |
+| 5 | 같은 함수 | `retrieved`를 **마지막 assistant 메시지에만** 인용 파트로 붙인다 | 3턴 전 답변에 방금 검색한 출처가 붙는 거짓말 |
+| 6 | `Chat.tsx` `setMessages` | 화면에 채운다 | — |
+
+**★ 초기값으로 못 넘긴다 ★** `useChat`의 `messages` 옵션은 인스턴스를 **만들 때** 한 번
+읽힌다. 우리 값은 네트워크를 다녀와야 알 수 있어 그 시점에 없다 — **`sources_fn`을 값이
+아니라 함수로 넘겨야 했던 것과 같은 함정이고, 이게 세 번째다.**
+
+**★ `cancelled` 플래그 ★** 응답이 오기 전에 "새 대화"를 누르면 늦게 도착한 이전 요청이
+**방금 비운 화면에 옛 대화를 되살린다.** 개발 중에는 StrictMode가 effect를 두 번 돌려
+요청이 실제로 2회 나간다(실측) — 그 플래그 덕에 두 번째 결과만 적용된다.
+
+**★ 이 경로는 "읽기"라 위험의 종류가 다르다 ★** 지금 이 대화를 지켜주는 것은
+`thread_id`가 추측하기 어렵다는 사실 하나뿐이다. 이어 쓰기(경로 A)는 상대 화면에 흔적을
+남기지만 **읽기는 아무 흔적도 남기지 않는다.** 인증이 붙을 자리는 `deps.get_principal`이고,
+소유권 확인이 붙을 자리는 `chat_history` 안이다.
+
+### 경로 D — 그 👎가 골든셋으로 가는 길 (M13-d, 요청이 아니라 **사람이 돌리는 절차**)
+
+위 경로 C에서 Langfuse에 쌓인 score를 며칠 뒤 사람이 긁어간다. 브라우저도 FastAPI도
+관여하지 않는다 — CLI 하나와 **사람의 판단** 한 번이다.
+
+| # | 위치 | 하는 일 | 안 하면 |
+|---|---|---|---|
+| 1 | `evals/promote_feedback.py` `fetch_downvotes` | `scores_v3.get_many_v3(name="user-feedback")` **커서 끝까지** | 첫 페이지만 보고 조용히 끝난다 |
+| 2 | 같은 파일 `_trace_id_of` | `score.subject.id`(v4) 또는 `score.trace_id`(구버전) | 조용히 0건 |
+| 3 | 같은 파일 `_with_trace` | `trace.get(id)` → 질문·답·링크. **실패해도 계속** | 한 건 때문에 절차가 죽고, 죽은 절차는 다시는 안 돌린다 |
+| 4 | 같은 파일 `select_new` | 골든셋(`dataset.jsonl`)에 이미 있는 질문 제거 | 같은 질문이 여러 줄 쌓인다 |
+| 5 | 같은 파일 `to_draft` | `evals/inbox/<날짜>.jsonl`에 **초안**만 쓴다 | — |
+| 6 | **사람** | 트레이스를 열어보고 kind·정답을 채운 뒤 `dataset.jsonl`로 옮긴다 | 초안은 `validate_dataset`이 **거부한다** |
+| 7 | `run_retrieval --write-baseline` | 골든셋이 커졌으니 기준선을 다시 기록 | 모집단이 달라진 값끼리 비교된다 |
+
+**★ 6번이 자동화되지 않은 것이 이 경로의 설계다 ★** 골든셋은 **자(尺)** 다. 자가 스스로
+늘어나면 어제 잰 값과 오늘 잰 값을 비교할 수 없고, 그 비교가 M6을 만든 이유였다.
+초안의 `id`·`kind`에 `TODO`가 박혀 있어 **검토를 건너뛰면 반드시 죽는다.**
+
+### 경로 E — CI가 밤마다 같은 검색을 돌린다 (M13-d, `.github/workflows/evals.yml`)
+
+| # | 위치 | 하는 일 |
+|---|---|---|
+| 1 | `evals.yml` `services.qdrant` | 빈 Qdrant 컨테이너 (컬렉션은 `_ensure_collection`이 만든다) |
+| 2 | `actions/cache` × 2 | 임베딩 **모델**(키=모델명) + 임베딩 **결과**(키=문서 해시, M13-c) |
+| 3 | `app.rag.ingest --store qdrant` | 문서 3개 인입. **자동이 아니라 명시적 단계**(로컬·k8s와 같은 원칙) |
+| 4 | `run_retrieval --no-rewrite --check` | 경로 A의 **검색 층만** 같은 코드로 재현 |
+| 5 | `evals/gate.py` `check` | `thresholds.json`의 기준선과 비교 → 못 넘기면 **exit 1** |
+
+**★ `--no-rewrite`가 이 잡을 무료로 만든다 ★** 파이프라인에서 LLM을 부르는 것은
+재작성·리랭킹·생성 셋인데, `--check` 경로는 그 셋을 다 비껴간다(재작성은 플래그로,
+리랭킹은 `--rerank`를 안 줘서, 생성은 애초에 검색 러너가 안 한다). 남는 것은 로컬
+fastembed뿐이라 **API 키 없이** 돈다.
+
+**★ 결정론은 공짜가 아니었다 (M5에서 고침) ★** 위 4번이 의미를 가지려면 "같은 코드 =
+같은 숫자"가 성립해야 하는데, 처음엔 성립하지 않았다. RRF는 점수가 **순위의 역수 합**이라
+`dense 3등`과 `sparse 3등`이 같은 점수를 받고, 그 순서를 Qdrant의 세그먼트 순회가 정한다.
+실측으로 29개 질문 중 **19개**가 실행마다 다른 top-5를 냈고 지표 폭이 허용 노이즈를 넘었다.
+[qdrant_store.py](../backend/app/rag/qdrant_store.py)의 `stable_order`가 넉넉히 받아
+`(점수, source, chunk_index)`로 다시 정렬해 자른다 — 10회 반복에서 폭이 정확히 0이 됐다.
+
 ---
 
 ## 5. 데이터 모양이 바뀌는 지점
@@ -427,13 +520,31 @@ return "__end__"
 | **M6** 평가 하네스 | `evals/*` 신규 (`app/` 밖) | `app/` 전부 |
 | **M7** 청킹 | `rag/chunking.py` 신규 · `ingest.py` | **`base.py` 계약 · 두 store · `graph.py`** |
 | **M8** 하이브리드 | `rag/hybrid.py`·`rerank.py` · **계약에 sparse가 들어올 수 있다** | `chat.py` · `ai_sdk.py` · 프론트 |
-| **영속 체크포인터** | `deps.py` 한 줄(`AsyncPostgresSaver`) | `graph.py` · `chat.py` · 프론트 |
+| ~~**영속 체크포인터** · `deps.py` 한 줄 · `chat.py` 안 바뀜~~ | ❌ **예측이 틀렸다 (M5-2)** — 아래 참고 | `graph.py` · `rag/*` · 프론트 (이 셋은 맞았다) |
 | **저장소 교체** | `deps.py`는 그대로, **`.env`의 `VECTOR_STORE` 한 줄** | 전부 |
 | **저장소 추가** | `rag/새_store.py` 신규 + `factory.py:18`의 dict 한 줄 | 나머지 전부 |
 | **도구 추가** | `tools.py`의 `TOOLS` 목록 한 줄 | 나머지 전부 |
 
 `ai_sdk.py`가 어느 줄에도 없다. M1-1c에서 `ui_message_stream(deltas: AsyncIterable[str])`로
 "누가 토큰을 만드는가"를 인자로 밀어낸 설계가 M2·M3 내내 값을 했다.
+
+### ★ 이 표에서 틀린 줄이 나왔다 — 그게 이 표의 값이다 (M5-2)
+
+"영속 체크포인터를 넣어도 `chat.py`는 안 바뀐다"고 적어뒀었다. **틀렸다.** 실제로는:
+
+| 예측 | 실제 |
+|---|---|
+| `deps.py` 한 줄 | `deps.py` + `main.py`(lifespan 신규) + `core/checkpointer.py` 신규 |
+| `chat.py` 안 바뀜 | `sources()`가 **코루틴이 됐다**(`get_state` → `aget_state`) |
+| `ai_sdk.py` 안 바뀜 | 콜백이 코루틴이어도 받도록 한 겹 넓어졌다 |
+
+**왜 빗나갔나**: 이 표는 "데이터가 흐르는 층"만 보고 있었다. 체크포인터 교체가 바꾼 것은
+데이터의 모양이 아니라 **호출 규약**(동기 → 비동기)과 **자원 수명**(없음 → 열고 닫아야
+하는 풀)이다. 층 분리는 *무엇이 흐르는가*를 격리해주지만 *어떻게 부르는가*와
+*언제 만들어지는가*까지 격리해주지는 않는다.
+
+`graph.py`·`rag/*`·프론트가 한 줄도 안 바뀐 것은 예측대로였다 — 그 셋은 정말로 데이터만
+주고받는다. **맞은 절반과 틀린 절반의 경계가 정확히 "부수효과가 있느냐"에 있다.**
 
 **M3에서 프론트가 한 줄도 안 바뀌었다.** 2b가 프론트까지 번진 유일한 단계였고, 그건 클라이언트와
 서버의 역할 분담 자체를 바꿨기 때문이다. RAG는 서버 안쪽의 일이라 밖으로 새지 않는다.

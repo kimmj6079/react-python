@@ -3,15 +3,21 @@
 main {
   flex: 1;
   display: flex;
+  /* ★ 탭이 왼쪽에 붙어 있던 원인 ★ display:flex의 기본 방향은 row(가로)다.
+     M1에서 main 안에 Chat 하나만 있을 때는 방향이 무엇이든 티가 안 났는데,
+     M11에서 <nav>가 Chat의 형제로 들어오자 둘이 가로로 나란히 놓여
+     nav가 "왼쪽 세로 열"이 됐다. 위→아래로 쌓으려면 column을 명시해야 한다. */
+  flex-direction: column;
   /* flex 자식의 min-height 기본값은 auto(=내용만큼은 커진다)라서,
      이걸 0으로 눌러야 안쪽 overflow-y:auto가 실제로 스크롤된다.
      flexbox 스크롤 문제의 대부분이 이 한 줄이다. */
   min-height: 0;
 }
 
-/* ── M11: 상단 탭 + 문서 화면 ────────────────────────────────
-   Chat.css를 컴포넌트 옆에 둔 것과 달리 여기 있는 이유: topnav는 App.tsx의
-   것이고 .docs는 그 안에 사는 화면이라, 둘 다 App의 레이아웃 책임이다.
+/* ── M11: 상단 탭 ──────────────────────────────────────────────
+   topnav는 App.tsx의 것이라 여기 둔다. 문서 화면(.docs)은 처음엔 여기 함께 있었지만
+   드롭존·상태 칩이 붙으며 화면 하나 분량이 되어 components/DocumentUpload.css로
+   옮겼다 — Chat.css처럼 "컴포넌트 옆에 그 컴포넌트의 CSS"가 이 저장소의 관례다.
    색은 전부 index.css의 CSS 변수를 쓰므로 다크모드가 공짜다. */
 
 .topnav {
@@ -19,6 +25,9 @@ main {
   gap: 8px;
   padding: 8px 12px;
   border-bottom: 1px solid var(--border, #e5e7eb);
+  /* column 안에서 Chat이 flex:1로 남은 높이를 전부 가져가므로, 탭 바는
+     자기 내용 높이만 지키고 절대 눌리지 않아야 한다(.chat__header와 같은 이유). */
+  flex-shrink: 0;
 }
 .topnav__btn {
   padding: 6px 14px;
@@ -36,34 +45,3 @@ main {
   color: #fff;
   border-color: transparent;
 }
-
-.docs {
-  max-width: 720px;
-  margin: 0 auto;
-  padding: 20px 16px;
-  text-align: left;
-}
-.docs__title { margin: 0 0 4px; font-size: 18px; }
-.docs__hint { margin: 0 0 16px; opacity: 0.7; font-size: 13px; }
-.docs__busy { margin-left: 8px; font-size: 13px; opacity: 0.7; }
-.docs__error { color: #dc2626; font-size: 13px; }
-.docs__notice { color: var(--accent, #2563eb); font-size: 13px; }
-
-.docs__list { list-style: none; padding: 0; margin: 16px 0 0; }
-.docs__item {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 10px;
-  padding: 10px 0;
-  border-bottom: 1px solid var(--border, #e5e7eb);
-  font-size: 14px;
-}
-.docs__name { font-weight: 600; }
-.docs__status { font-size: 12px; opacity: 0.75; }
-.docs__meta { font-size: 12px; opacity: 0.6; }
-/* 실패 이유는 눈에 띄어야 한다 — 조용히 두면 "올렸는데 왜 답을 못 하지"가 된다. */
-.docs__errmsg { flex-basis: 100%; color: #dc2626; font-size: 12px; }
-.docs__item--failed .docs__status { color: #dc2626; }
-.docs__item--done .docs__status { color: #16a34a; }
-.docs__empty { padding: 10px 0; opacity: 0.6; font-size: 14px; }
